@@ -1,0 +1,90 @@
+# =============================================================================
+# EASM Pipeline - Docker Compose
+# =============================================================================
+# Usage:
+#   docker compose build
+#   docker compose run --rm easm-pipeline          # full pipeline
+#   docker compose run --rm easm-pipeline --stage dns    # single stage
+#   docker compose up gowitness                     # screenshot gallery
+# =============================================================================
+
+services:
+  # -------------------------------------------------------------------------
+  # Main EASM pipeline runner
+  # -------------------------------------------------------------------------
+  easm-pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        RUNTIME_BASE: ${RUNTIME_BASE:-debian:bookworm-slim}
+    container_name: easm-pipeline
+    env_file:
+      - config/pipeline.env
+    volumes:
+      - ./data:/easm/data
+      - ./logs:/easm/logs
+      - ./config:/easm/config:ro
+    # SYN scanning requires NET_ADMIN + NET_RAW
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    # Chromium needs /dev/shm
+    shm_size: "2gb"
+    networks:
+      - easm-net
+    profiles:
+      - pipeline
+
+  # -------------------------------------------------------------------------
+  # gowitness v3 - screenshot gallery & API
+  # -------------------------------------------------------------------------
+  gowitness:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        RUNTIME_BASE: ${RUNTIME_BASE:-debian:bookworm-slim}
+    container_name: easm-gowitness
+    entrypoint: ["gowitness"]
+    command:
+      - "report"
+      - "server"
+      - "--db-uri"
+      - "sqlite:///easm/data/output/gowitness.sqlite3"
+      - "--screenshot-path"
+      - "/easm/data/screenshots"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "7171"
+    ports:
+      - "7171:7171"
+    volumes:
+      - ./data:/easm/data
+    networks:
+      - easm-net
+    profiles:
+      - gallery
+
+  # -------------------------------------------------------------------------
+  # DuckDB CLI for ad-hoc queries
+  # -------------------------------------------------------------------------
+  duckdb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        RUNTIME_BASE: ${RUNTIME_BASE:-debian:bookworm-slim}
+    container_name: easm-duckdb
+    entrypoint: ["python3", "-c", "import duckdb; db = duckdb.connect('/easm/data/output/easm.duckdb'); print('DuckDB connected. Use db.sql() to query.'); import code; code.interact(local=locals())"]
+    volumes:
+      - ./data:/easm/data
+    networks:
+      - easm-net
+    profiles:
+      - query
+
+networks:
+  easm-net:
+    driver: bridge

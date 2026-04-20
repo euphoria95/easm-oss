@@ -1,0 +1,39 @@
+# EASM Pipeline outputs
+data/output/
+data/screenshots/
+data/cache/
+logs/
+oss_data/
+data/smoke/
+
+# DuckDB
+*.duckdb
+*.duckdb.wal
+*.sqlite
+*.sqlite3
+
+# Parquet
+*.parquet
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+
+# Local tool cache
+.tools/
+
+# Local config overrides
+config/pipeline.env.local
+
+# Secrets/env files
+.env
+.env.*

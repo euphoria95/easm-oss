@@ -1,0 +1,8 @@
+# Place your subdomain list here, one per line.
+# Example:
+# portal.example.com
+# api.example.com
+# mail.example.com
+# vpn.example.com
+# dev.example.com
+# staging.example.com

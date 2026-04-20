@@ -1,0 +1,15 @@
+badssl.com
+www.badssl.com
+expired.badssl.com
+self-signed.badssl.com
+revoked.badssl.com
+wrong.host.badssl.com
+untrusted-root.badssl.com
+tls-v1-0.badssl.com
+tls-v1-1.badssl.com
+tls-v1-2.badssl.com
+tls-v1-3.badssl.com
+http.badssl.com
+hsts.badssl.com
+pinning-test.badssl.com
+no-common-name.badssl.com

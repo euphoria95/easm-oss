@@ -1,0 +1,33 @@
+# Nuclei configuration for EASM low-noise scanning
+severity:
+  - info
+  - low
+  - medium
+  - high
+  - critical
+
+tags:
+  - technologies
+  - takeovers
+  - exposures
+  - misconfiguration
+  - default-logins
+  - exposed-panels
+
+exclude-tags:
+  - intrusive
+  - dos
+  - fuzz
+
+rate-limit: 50
+bulk-size: 25
+concurrency: 25
+timeout: 10
+retries: 1
+
+no-interactsh: true
+silent: true
+jsonl: true
+
+stats: true
+stats-interval: 30

@@ -1,0 +1,8 @@
+ci_id,fqdn,ip,owner,cost_center,environment,description
+CI0087721,portal.example.com,203.0.113.12,Platform Team,CC-4401,production,Customer portal
+CI0087722,api.example.com,203.0.113.15,API Team,CC-4402,production,Public API gateway
+CI0087723,mail.example.com,203.0.113.20,IT Ops,CC-4403,production,Mail server
+CI0087724,vpn.example.com,203.0.113.25,SecOps,CC-4404,production,VPN gateway
+CI0087725,intranet.example.com,10.0.1.50,IT Ops,CC-4403,production,Internal intranet
+CI0087726,crm.example.com,203.0.113.30,Sales Ops,CC-4405,production,Salesforce integration
+CI0087727,legacy-app.example.com,203.0.113.35,Platform Team,CC-4401,production,Legacy application (decom scheduled)
