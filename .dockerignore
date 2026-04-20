@@ -1,0 +1,21 @@
+# Git and editor artifacts
+.git
+.gitignore
+.vscode
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Local runtime data (mounted as volumes in docker-compose)
+data/output/
+data/screenshots/
+data/cache/
+logs/
+oss_data/
+
+# OS artifacts
+.DS_Store
