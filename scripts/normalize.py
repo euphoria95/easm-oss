@@ -594,12 +594,12 @@ def _extract_headers(rec: dict) -> dict:
     headers = {}
     raw_headers = rec.get("header", {}) or {}
     if isinstance(raw_headers, str):
-        # Parse raw header string
+        parsed = {}
         for line in raw_headers.split("\n"):
             if ":" in line:
                 k, v = line.split(":", 1)
-                raw_headers_dict = raw_headers.get(k.strip().lower(), v.strip())
-        return headers
+                parsed[k.strip().lower()] = v.strip()
+        raw_headers = parsed
 
     interesting = [
         "strict-transport-security",
