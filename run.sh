@@ -68,7 +68,9 @@ SCAN_ID="$(date -u +%Y%m%d_%H%M%S)"
 SCAN_LOG="${LOG_DIR}/scan_${SCAN_ID}.log"
 
 # CLI args
+STAGE_ORDER="passive,dns,ports,http,tls,zgrab,nuclei,takeover,normalize,load"
 STAGE_FILTER=""
+FROM_STAGE=""
 SKIP_PASSIVE=false
 DRY_RUN=false
 
@@ -77,16 +79,48 @@ DRY_RUN=false
 # ---------------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --stage)      STAGE_FILTER="$2"; shift 2 ;;
+        --stage)        STAGE_FILTER="$2"; shift 2 ;;
+        --from)         FROM_STAGE="$2"; shift 2 ;;
         --skip-passive) SKIP_PASSIVE=true; shift ;;
-        --dry-run)    DRY_RUN=true; shift ;;
+        --dry-run)      DRY_RUN=true; shift ;;
         -h|--help)
-            echo "Usage: $0 [--stage STAGE1,STAGE2] [--skip-passive] [--dry-run]"
-            echo "Stages: passive, dns, ports, http, tls, zgrab, nuclei, takeover, normalize, load"
+            echo "Usage: $0 [--stage STAGE1,STAGE2 | --from STAGE] [--skip-passive] [--dry-run]"
+            echo ""
+            echo "  --stage STAGES  Run only the specified comma-separated stages"
+            echo "  --from  STAGE   Run from STAGE through the end of the pipeline"
+            echo ""
+            echo "Stages (in order): ${STAGE_ORDER}"
             exit 0 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
+
+# ---------------------------------------------------------------------------
+# Resolve --from STAGE → STAGE_FILTER covering STAGE..end
+# ---------------------------------------------------------------------------
+if [[ -n "${FROM_STAGE}" ]]; then
+    if [[ -n "${STAGE_FILTER}" ]]; then
+        echo "ERROR: --from and --stage are mutually exclusive"
+        exit 1
+    fi
+    _found=false
+    _filter=""
+    IFS=',' read -ra _STAGES <<< "${STAGE_ORDER}"
+    for _s in "${_STAGES[@]}"; do
+        if [[ "${_s}" == "${FROM_STAGE}" ]]; then
+            _found=true
+        fi
+        if ${_found}; then
+            _filter="${_filter:+${_filter},}${_s}"
+        fi
+    done
+    if ! ${_found}; then
+        echo "ERROR: Unknown stage '${FROM_STAGE}'"
+        echo "Valid stages: ${STAGE_ORDER}"
+        exit 1
+    fi
+    STAGE_FILTER="${_filter}"
+fi
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -134,7 +168,9 @@ log "Input: ${INPUT_SUBDOMAINS} ($(count_lines "${INPUT_SUBDOMAINS}") subdomains
 
 if ${DRY_RUN}; then
     log "DRY RUN — printing stages that would execute"
-    for s in passive dns ports http tls zgrab nuclei takeover normalize load; do
+    [[ -n "${FROM_STAGE}" ]] && log "Resuming from: ${FROM_STAGE} (resolved to: ${STAGE_FILTER})"
+    IFS=',' read -ra _DRY_STAGES <<< "${STAGE_ORDER}"
+    for s in "${_DRY_STAGES[@]}"; do
         if should_run "$s"; then echo "  Would run: $s"; fi
     done
     exit 0
@@ -313,7 +349,8 @@ if should_run "tls"; then
                 -scan-mode "${TLSX_SCAN_MODE:-auto}" \
                 -c "${TLSX_CONCURRENCY:-25}" \
                 -silent -json \
-                -o "${TLS_JSONL}" 2>>"${SCAN_LOG}"
+                -o "${TLS_JSONL}" 2>>"${SCAN_LOG}" || \
+                log "WARN: tlsx had errors (partial results may be available)"
 
             log "TLS analysis complete | certs=$(count_lines "${TLS_JSONL}") elapsed=$(elapsed ${stage_start})s"
         fi
@@ -348,7 +385,7 @@ if should_run "zgrab"; then
         ZGRAB_TOTAL=0
         for module in "${!ZGRAB_MODULES[@]}"; do
             port="${ZGRAB_MODULES[$module]}"
-            HOSTS=$(jq -r "select(.port==${port}) | .host" "${PORTS_JSONL}" 2>/dev/null | sort -u)
+            HOSTS=$(jq -r "select(.port==${port}) | .host // empty" "${PORTS_JSONL}" 2>/dev/null | sort -u)
             if [[ -z "${HOSTS}" ]]; then continue; fi
 
             OUTPUT_FILE="${ZGRAB_DIR}/zgrab_${module}.jsonl"
@@ -387,7 +424,8 @@ if should_run "nuclei"; then
             nuclei \
                 -config "${NUCLEI_CONFIG}" \
                 -H "User-Agent: ${USER_AGENT}" \
-                -o "${NUCLEI_JSONL}" 2>>"${SCAN_LOG}"
+                -o "${NUCLEI_JSONL}" 2>>"${SCAN_LOG}" || \
+                log "WARN: nuclei had errors (partial results may be available)"
 
             log "Nuclei complete | findings=$(count_lines "${NUCLEI_JSONL}") elapsed=$(elapsed ${stage_start})s"
         fi

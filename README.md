@@ -90,8 +90,12 @@ docker compose run --rm --profile pipeline easm-pipeline --stage dns
 # Multiple stages
 docker compose run --rm --profile pipeline easm-pipeline --stage dns,ports,http
 
-# Dry run
+# Resume from a specific stage (runs that stage and all stages after it)
+docker compose run --rm --profile pipeline easm-pipeline --from tls
+
+# Dry run (preview what would execute)
 docker compose run --rm --profile pipeline easm-pipeline --dry-run
+docker compose run --rm --profile pipeline easm-pipeline --dry-run --from tls
 ```
 
 Notes:
@@ -117,6 +121,8 @@ go install github.com/zmap/zgrab2/cmd/zgrab2@latest
 # Run
 chmod +x run.sh scripts/*.sh
 ./run.sh
+./run.sh --from tls        # resume from TLS onwards
+./run.sh --stage normalize # re-run normalization only
 ```
 
 ### 5. Test with Synthetic Data
@@ -145,18 +151,41 @@ python3 scripts/load_duckdb.py \
 
 ## Pipeline Stages
 
-| Stage | Tool | Purpose |
-|-------|------|---------|
-| 0. Passive | crt.sh | CT log enrichment — find subdomains from certificate transparency |
-| 1. DNS | dnsx | Resolve A/AAAA/CNAME/NS/MX, filter to live hosts |
-| 2. Ports | naabu | TCP SYN scan top-100 ports, CDN-aware |
-| 3. HTTP | httpx | Full-signal probe: status, title, tech, headers, JARM, screenshot |
-| 4. TLS | tlsx | Deep cert analysis: SANs, expiry, misconfig flags |
-| 5. Services | zgrab2 | Non-HTTP banners: SSH, FTP, SMTP, DB ports |
-| 6. Exposure | nuclei | Low-noise scan: takeovers, exposed panels, misconfigs |
-| 7. Takeover | subzy | Subdomain takeover verification |
-| 8. Normalize | normalize.py | Merge all JSONL → unified asset record per FQDN |
-| 9. Load | load_duckdb.py | Load into DuckDB with analytical views |
+| Stage | Name | Tool | Purpose |
+|-------|------|------|---------|
+| 0 | `passive` | crt.sh | CT log enrichment — find subdomains from certificate transparency |
+| 1 | `dns` | dnsx | Resolve A/AAAA/CNAME/NS/MX, filter to live hosts |
+| 2 | `ports` | naabu | TCP SYN scan top-100 ports, CDN-aware |
+| 3 | `http` | httpx | Full-signal probe: status, title, tech, headers, JARM, screenshot |
+| 4 | `tls` | tlsx | Deep cert analysis: SANs, expiry, misconfig flags |
+| 5 | `zgrab` | zgrab2 | Non-HTTP banners: SSH, FTP, SMTP, DB ports |
+| 6 | `nuclei` | nuclei | Low-noise scan: takeovers, exposed panels, misconfigs |
+| 7 | `takeover` | subzy | Subdomain takeover verification |
+| 8 | `normalize` | normalize.py | Merge all JSONL → unified asset record per FQDN |
+| 9 | `load` | load_duckdb.py | Load into DuckDB with analytical views |
+
+### Partial runs and resuming
+
+Use `--stage` to run one or more specific stages, or `--from` to run from a given stage through the end of the pipeline. Prior stage outputs on disk are reused as inputs — no re-scanning required.
+
+```bash
+# Run only DNS
+./run.sh --stage dns
+
+# Run DNS and port scan together
+./run.sh --stage dns,ports
+
+# Resume from TLS onwards (e.g. after a config fix)
+./run.sh --from tls
+
+# Re-run only normalization and DuckDB load
+./run.sh --from normalize
+
+# Preview without executing
+./run.sh --dry-run --from tls
+```
+
+`--stage` and `--from` are mutually exclusive. `--from` resolves to all stages from the named stage to `load` inclusive.
 
 ## Querying
 

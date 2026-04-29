@@ -271,22 +271,22 @@ def main():
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     con = duckdb.connect(str(db_path))
+    try:
+        # Load
+        count = load_assets(con, args.input, args.scan_id)
+        if not count:
+            return
 
-    # Load
-    count = load_assets(con, args.input, args.scan_id)
-    if not count:
+        # Export Parquet
+        if not args.no_parquet:
+            export_parquet(con, str(db_path), args.scan_id)
+
+        # Stats
+        print_stats(con)
+
+        print(f"\nDuckDB ready: {db_path}", file=sys.stderr)
+    finally:
         con.close()
-        return
-
-    # Export Parquet
-    if not args.no_parquet:
-        export_parquet(con, str(db_path), args.scan_id)
-
-    # Stats
-    print_stats(con)
-
-    con.close()
-    print(f"\nDuckDB ready: {db_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":
