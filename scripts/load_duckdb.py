@@ -70,9 +70,10 @@ def create_views(con: duckdb.DuckDBPyConnection):
             len(web) AS web_entry_count,
             len(tls) AS tls_cert_count,
             len(findings) AS finding_count,
+            len(services) AS service_count,
             cmdb.in_cmdb AS in_cmdb,
-            cmdb.gap_type AS gap_type,
-            cmdb.matched_ci AS ci_id
+            json_extract_string(cmdb.gap_type, '$') AS gap_type,
+            json_extract_string(cmdb.matched_ci, '$') AS ci_id
         FROM assets
     """)
 
@@ -80,8 +81,8 @@ def create_views(con: duckdb.DuckDBPyConnection):
         CREATE OR REPLACE VIEW v_cmdb_gaps AS
         SELECT
             fqdn,
-            cmdb.gap_type AS gap_type,
-            cmdb.matched_ci AS ci_id,
+            json_extract_string(cmdb.gap_type, '$') AS gap_type,
+            json_extract_string(cmdb.matched_ci, '$') AS ci_id,
             cmdb.match_basis AS match_basis,
             dns.a AS ips,
             network.cdn AS cdn,
@@ -90,7 +91,7 @@ def create_views(con: duckdb.DuckDBPyConnection):
         FROM assets
         WHERE cmdb.in_cmdb = false
            OR cmdb.gap_type IS NOT NULL
-        ORDER BY cmdb.gap_type, fqdn
+        ORDER BY json_extract_string(cmdb.gap_type, '$'), fqdn
     """)
 
     # TLS issues: use CTE to unnest tls array, then filter
@@ -149,23 +150,27 @@ def create_views(con: duckdb.DuckDBPyConnection):
             fqdn
     """)
 
-    # Tech stack: double unnest (web → tech) via CTEs
-    con.execute("""
-        CREATE OR REPLACE VIEW v_tech_stack AS
-        WITH web_expanded AS (
-            SELECT fqdn, UNNEST(web) AS w FROM assets WHERE len(web) > 0
-        ),
-        tech_expanded AS (
-            SELECT fqdn, w.url, UNNEST(w.tech) AS t FROM web_expanded
-        )
-        SELECT
-            fqdn,
-            url,
-            t.name AS tech_name,
-            t.version AS tech_version
-        FROM tech_expanded
-        ORDER BY t.name, fqdn
-    """)
+    # Tech stack: double unnest (web → tech) via CTEs.
+    # Guard: bind fails when no assets have web data (empty-array type inference).
+    try:
+        con.execute("""
+            CREATE OR REPLACE VIEW v_tech_stack AS
+            WITH web_expanded AS (
+                SELECT fqdn, UNNEST(web) AS w FROM assets WHERE len(web) > 0
+            ),
+            tech_expanded AS (
+                SELECT fqdn, w.url, UNNEST(w.tech) AS t FROM web_expanded
+            )
+            SELECT
+                fqdn,
+                url,
+                t.name AS tech_name,
+                t.version AS tech_version
+            FROM tech_expanded
+            ORDER BY t.name, fqdn
+        """)
+    except Exception:
+        pass
 
     # Open ports: CTE unnest
     con.execute("""
@@ -186,6 +191,54 @@ def create_views(con: duckdb.DuckDBPyConnection):
         ORDER BY p.port, fqdn
     """)
 
+    # Services / fingerprints: CTE unnest
+    con.execute("""
+        CREATE OR REPLACE VIEW v_services AS
+        WITH expanded AS (
+            SELECT fqdn, UNNEST(services) AS s FROM assets WHERE len(services) > 0
+        )
+        SELECT
+            fqdn,
+            s.port,
+            s.protocol,
+            s.transport,
+            s.service,
+            s.status,
+            s.banner,
+            s.fingerprint.vendor    AS fp_vendor,
+            s.fingerprint.product   AS fp_product,
+            s.fingerprint.version   AS fp_version,
+            s.fingerprint.cpe23     AS fp_cpe23,
+            s.fingerprint.os_vendor AS fp_os_vendor,
+            s.fingerprint.os_product AS fp_os_product,
+            s.fingerprint.os_version AS fp_os_version,
+            s.fingerprint.certainty AS fp_certainty,
+            s.fingerprint.source    AS fp_source
+        FROM expanded
+        ORDER BY fqdn, s.port
+    """)
+
+    # Software inventory: unique vendor/product/version combos across the estate
+    con.execute("""
+        CREATE OR REPLACE VIEW v_software_inventory AS
+        WITH expanded AS (
+            SELECT fqdn, UNNEST(services) AS s FROM assets WHERE len(services) > 0
+        )
+        SELECT
+            s.fingerprint.product   AS product,
+            s.fingerprint.vendor    AS vendor,
+            s.fingerprint.version   AS version,
+            s.fingerprint.cpe23     AS cpe23,
+            s.service               AS service_type,
+            COUNT(DISTINCT fqdn)    AS host_count,
+            ROUND(AVG(s.fingerprint.certainty), 2) AS avg_certainty
+        FROM expanded
+        WHERE s.fingerprint.product IS NOT NULL
+          AND s.fingerprint.product != ''
+        GROUP BY product, vendor, version, cpe23, service_type
+        ORDER BY host_count DESC
+    """)
+
     con.execute("""
         CREATE OR REPLACE VIEW v_scan_stats AS
         SELECT
@@ -197,12 +250,14 @@ def create_views(con: duckdb.DuckDBPyConnection):
             SUM(len(findings)) AS total_findings,
             COUNT(*) FILTER (WHERE cmdb.in_cmdb) AS in_cmdb,
             COUNT(*) FILTER (WHERE NOT cmdb.in_cmdb) AS not_in_cmdb,
-            COUNT(*) FILTER (WHERE cmdb.gap_type = 'shadow_it') AS shadow_it,
-            COUNT(*) FILTER (WHERE cmdb.gap_type = 'stale_ci') AS stale_ci,
+            COUNT(*) FILTER (WHERE json_extract_string(cmdb.gap_type, '$') = 'shadow_it') AS shadow_it,
+            COUNT(*) FILTER (WHERE json_extract_string(cmdb.gap_type, '$') = 'stale_ci') AS stale_ci,
             ROUND(
-                COUNT(*) FILTER (WHERE cmdb.gap_type = 'shadow_it') * 100.0 / NULLIF(COUNT(*), 0),
+                COUNT(*) FILTER (WHERE json_extract_string(cmdb.gap_type, '$') = 'shadow_it') * 100.0 / NULLIF(COUNT(*), 0),
                 1
-            ) AS shadow_it_pct
+            ) AS shadow_it_pct,
+            SUM(len(services)) AS total_services,
+            COUNT(*) FILTER (WHERE len(services) > 0) AS assets_with_services
         FROM assets
         GROUP BY scan_id
     """)
@@ -255,6 +310,23 @@ def print_stats(con: duckdb.DuckDBPyConnection):
     try:
         tls_issues = con.execute("SELECT COUNT(*) FROM v_tls_issues").fetchone()[0]
         print(f"\n  TLS issues: {tls_issues}", file=sys.stderr)
+    except Exception:
+        pass
+
+    # Service fingerprints
+    try:
+        svc_rows = con.execute("""
+            SELECT service, COUNT(*) AS cnt,
+                   COUNT(*) FILTER (WHERE fp_cpe23 IS NOT NULL AND fp_cpe23 != '') AS with_cpe
+            FROM v_services
+            GROUP BY service
+            ORDER BY cnt DESC
+            LIMIT 15
+        """).fetchall()
+        if svc_rows:
+            print("\n=== Services by Protocol ===", file=sys.stderr)
+            for svc, cnt, cpe_cnt in svc_rows:
+                print(f"  {svc or 'unknown'}: {cnt} (CPE: {cpe_cnt})", file=sys.stderr)
     except Exception:
         pass
 

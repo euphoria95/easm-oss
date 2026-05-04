@@ -2,9 +2,15 @@
 data/output/
 data/screenshots/
 data/cache/
+data/archives/
+data/input/
 logs/
+*.log
 oss_data/
 data/smoke/
+
+# Scan state
+data/.scan_state.json
 
 # DuckDB
 *.duckdb
@@ -37,3 +43,7 @@ config/pipeline.env.local
 # Secrets/env files
 .env
 .env.*
+
+# Markdown (keep only README)
+*.md
+!README.md

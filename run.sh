@@ -3,7 +3,7 @@
 # EASM Pipeline Orchestrator
 # =============================================================================
 # Funnel-based EASM discovery pipeline:
-#   CT Enrichment → DNS → Port Scan → HTTP Probe → TLS → zgrab2 → Nuclei
+#   CT Enrichment → DNS → Port Scan → HTTP Probe → TLS → nerva → Nuclei
 #   → Normalize → DuckDB
 #
 # Usage:
@@ -63,12 +63,14 @@ SUBZY_JSON="${OUTPUT_DIR}/subzy.json"
 ASSETS_JSONL="${OUTPUT_DIR}/assets.jsonl"
 DUCKDB_PATH="${SCRIPT_DIR}/${DUCKDB_PATH_VALUE}"
 ZGRAB_DIR="${OUTPUT_DIR}/zgrab"
+NERVA_JSONL="${OUTPUT_DIR}/nerva.jsonl"
+VERIFY_JSONL="${OUTPUT_DIR}/takeover_verifications.jsonl"
 
 SCAN_ID="$(date -u +%Y%m%d_%H%M%S)"
 SCAN_LOG="${LOG_DIR}/scan_${SCAN_ID}.log"
 
 # CLI args
-STAGE_ORDER="passive,dns,ports,http,tls,zgrab,nuclei,takeover,normalize,load"
+STAGE_ORDER="passive,dns,ports,http,tls,fingerprint,nuclei,takeover,normalize,load,verify"
 STAGE_FILTER=""
 FROM_STAGE=""
 SKIP_PASSIVE=false
@@ -79,6 +81,7 @@ DRY_RUN=false
 # ---------------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --)             shift ;;
         --stage)        STAGE_FILTER="$2"; shift 2 ;;
         --from)         FROM_STAGE="$2"; shift 2 ;;
         --skip-passive) SKIP_PASSIVE=true; shift ;;
@@ -94,6 +97,10 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
+
+# Backward-compat: --stage zgrab / --from zgrab → fingerprint
+STAGE_FILTER="${STAGE_FILTER//zgrab/fingerprint}"
+[[ "${FROM_STAGE}" == "zgrab" ]] && FROM_STAGE="fingerprint"
 
 # ---------------------------------------------------------------------------
 # Resolve --from STAGE → STAGE_FILTER covering STAGE..end
@@ -358,51 +365,90 @@ if should_run "tls"; then
 fi
 
 # ===========================================================================
-# STAGE 5: Non-HTTP Service Fingerprinting (zgrab2)
+# STAGE 5: Service Fingerprinting (nerva — replaces zgrab2)
 # ===========================================================================
-if should_run "zgrab"; then
-    log_stage "SERVICE FINGERPRINTING (zgrab2)"
+if should_run "fingerprint"; then
+    log_stage "SERVICE FINGERPRINTING (nerva)"
     stage_start=$(date +%s)
 
     if [[ ! -f "${PORTS_JSONL}" ]]; then
-        log "WARN: No ports data — skipping zgrab2"
+        log "WARN: No ports data — skipping fingerprinting"
     else
-        # Map service ports to zgrab2 modules
-        declare -A ZGRAB_MODULES=(
-            [ssh]=22
-            [ftp]=21
-            [smtp]=25
-            [imap]=143
-            [pop3]=110
-            [mysql]=3306
-            [postgres]=5432
-            [redis]=6379
-            [mongodb]=27017
-            [mssql]=1433
-            [smb]=445
-        )
+        NERVA_TIMEOUT="${NERVA_TIMEOUT:-10}"
+        NERVA_THREADS="${NERVA_THREADS:-50}"
+        NERVA_FAST_MODE="${NERVA_FAST_MODE:-false}"
+        NERVA_UDP="${NERVA_UDP:-false}"
+        NERVA_MISCONFIGS="${NERVA_MISCONFIGS:-false}"
 
-        ZGRAB_TOTAL=0
-        for module in "${!ZGRAB_MODULES[@]}"; do
-            port="${ZGRAB_MODULES[$module]}"
-            HOSTS=$(jq -r "select(.port==${port}) | .host // empty" "${PORTS_JSONL}" 2>/dev/null | sort -u)
-            if [[ -z "${HOSTS}" ]]; then continue; fi
+        # Prefer fqdn:port over ip:port so nerva results map to FQDN-keyed assets.
+        # Join ports.jsonl with dns.jsonl (ip → fqdn). Fall back to ip:port when
+        # no FQDN is known for an IP.
+        if [[ -f "${DNS_JSONL}" ]]; then
+            TARGETS=$(jq -rs \
+                --slurpfile dns "${DNS_JSONL}" \
+                '($dns | map(.host as $f | (.a // [])[] | {(.): $f}) | add // {}) as $ip_map |
+                 .[] |
+                 (($ip_map[(.host // .ip)] // (.host // .ip))) as $h |
+                 "\($h):\(.port)"' \
+                "${PORTS_JSONL}" 2>/dev/null | sort -u)
+        else
+            TARGETS=$(jq -r '"\(.host // .ip):\(.port)"' "${PORTS_JSONL}" 2>/dev/null | sort -u)
+        fi
+        TARGET_COUNT=$(echo "${TARGETS}" | wc -l | tr -d ' ')
 
-            OUTPUT_FILE="${ZGRAB_DIR}/zgrab_${module}.jsonl"
-            log "zgrab2 ${module} (port ${port}) — $(echo "${HOSTS}" | wc -l | tr -d ' ') hosts"
+        if [[ -z "${TARGETS}" || "${TARGET_COUNT}" -eq 0 ]]; then
+            log "WARN: No targets for fingerprinting"
+        else
+            TIMEOUT_MS=$(( NERVA_TIMEOUT * 1000 ))
+            log "nerva: ${TARGET_COUNT} targets (timeout=${NERVA_TIMEOUT}s, workers=${NERVA_THREADS}, misconfigs=${NERVA_MISCONFIGS})"
 
-            echo "${HOSTS}" | \
-                zgrab2 "${module}" \
-                    --port="${port}" \
-                    --timeout="${ZGRAB_TIMEOUT:-10}" \
-                    --output-file="${OUTPUT_FILE}" 2>>"${SCAN_LOG}" || \
-                log "WARN: zgrab2 ${module} had errors"
+            NERVA_CMD=(nerva
+                -w "${TIMEOUT_MS}"
+                -W "${NERVA_THREADS}"
+                --json
+            )
+            [[ "${NERVA_FAST_MODE}" == "true" ]]  && NERVA_CMD+=(-f)
+            [[ "${NERVA_UDP}" == "true" ]]         && NERVA_CMD+=(-U)
+            [[ "${NERVA_MISCONFIGS}" == "true" ]]  && NERVA_CMD+=(--misconfigs)
 
-            COUNT=$(count_lines "${OUTPUT_FILE}")
-            ZGRAB_TOTAL=$(( ZGRAB_TOTAL + COUNT ))
-        done
+            echo "${TARGETS}" | "${NERVA_CMD[@]}" > "${NERVA_JSONL}" 2>>"${SCAN_LOG}" || \
+                log "WARN: nerva had errors (partial results may be available)"
 
-        log "zgrab2 complete | total_banners=${ZGRAB_TOTAL} elapsed=$(elapsed ${stage_start})s"
+            log "nerva complete | fingerprints=$(count_lines "${NERVA_JSONL}") elapsed=$(elapsed ${stage_start})s"
+        fi
+
+        # --- Optional zgrab2 fallback ---
+        if [[ "${FINGERPRINT_BACKEND:-nerva}" == "zgrab2" ]] || [[ "${ZGRAB2_FALLBACK:-false}" == "true" ]]; then
+            log "NOTICE: zgrab2 is deprecated. Set FINGERPRINT_BACKEND=nerva to suppress this fallback."
+
+            declare -A ZGRAB_MODULES=(
+                [ssh]=22  [ftp]=21  [smtp]=25  [imap]=143  [pop3]=110
+                [mysql]=3306  [postgres]=5432  [redis]=6379
+                [mongodb]=27017  [mssql]=1433  [smb]=445
+            )
+
+            ZGRAB_TOTAL=0
+            for module in "${!ZGRAB_MODULES[@]}"; do
+                port="${ZGRAB_MODULES[$module]}"
+                HOSTS=$(jq -r "select(.port==${port}) | .host // empty" "${PORTS_JSONL}" 2>/dev/null | sort -u)
+                if [[ -z "${HOSTS}" ]]; then continue; fi
+
+                OUTPUT_FILE="${ZGRAB_DIR}/zgrab_${module}.jsonl"
+                log "zgrab2 ${module} (port ${port}) — $(echo "${HOSTS}" | wc -l | tr -d ' ') hosts"
+
+                echo "${HOSTS}" | \
+                    zgrab2 "${module}" \
+                        --port="${port}" \
+                        --timeout="${ZGRAB_TIMEOUT:-10}" \
+                        --output-file="${OUTPUT_FILE}" 2>>"${SCAN_LOG}" || \
+                    log "WARN: zgrab2 ${module} had errors"
+
+                COUNT=$(count_lines "${OUTPUT_FILE}")
+                ZGRAB_TOTAL=$(( ZGRAB_TOTAL + COUNT ))
+            done
+
+            log "zgrab2 fallback complete | total_banners=${ZGRAB_TOTAL} elapsed=$(elapsed ${stage_start})s"
+        fi
     fi
 fi
 
@@ -413,13 +459,24 @@ if should_run "nuclei"; then
     log_stage "EXPOSURE SCANNING (nuclei)"
     stage_start=$(date +%s)
 
+    # Ensure templates are present; update silently if missing
+    NUCLEI_TMPL_COUNT=$(nuclei -tl 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "${NUCLEI_TMPL_COUNT}" -eq 0 ]]; then
+        log "Nuclei templates missing — attempting update"
+        nuclei -update-templates 2>>"${SCAN_LOG}" || log "WARN: nuclei template update failed"
+        NUCLEI_TMPL_COUNT=$(nuclei -tl 2>/dev/null | wc -l | tr -d ' ')
+    fi
+    log "Nuclei templates loaded: ${NUCLEI_TMPL_COUNT}"
+
     if [[ ! -f "${HTTPX_JSONL}" ]]; then
-        log "WARN: No HTTP data — skipping nuclei"
+        log "WARN: No HTTP data — skipping nuclei (run from 'http' stage first)"
     else
         URLS=$(jq -r '.url // empty' "${HTTPX_JSONL}" | sort -u)
-        if [[ -z "${URLS}" ]]; then
-            log "WARN: No URLs extracted"
+        URL_COUNT=$(echo "${URLS}" | grep -c . || true)
+        if [[ -z "${URLS}" ]] || [[ "${URL_COUNT}" -eq 0 ]]; then
+            log "WARN: No URLs extracted from ${HTTPX_JSONL}"
         else
+            log "Nuclei scanning ${URL_COUNT} URLs"
             echo "${URLS}" | \
             nuclei \
                 -config "${NUCLEI_CONFIG}" \
@@ -467,7 +524,8 @@ if should_run "normalize"; then
     [[ -f "${DNS_JSONL}" ]]   && NORMALIZE_ARGS+=(--dns "${DNS_JSONL}")
     [[ -f "${PORTS_JSONL}" ]] && NORMALIZE_ARGS+=(--ports "${PORTS_JSONL}")
     [[ -f "${HTTPX_JSONL}" ]] && NORMALIZE_ARGS+=(--http "${HTTPX_JSONL}")
-    [[ -f "${TLS_JSONL}" ]]   && NORMALIZE_ARGS+=(--tls "${TLS_JSONL}")
+    [[ -f "${TLS_JSONL}" ]]    && NORMALIZE_ARGS+=(--tls "${TLS_JSONL}")
+    [[ -f "${NERVA_JSONL}" ]] && NORMALIZE_ARGS+=(--nerva "${NERVA_JSONL}")
     [[ -f "${NUCLEI_JSONL}" ]] && NORMALIZE_ARGS+=(--nuclei "${NUCLEI_JSONL}")
     [[ -f "${SUBZY_JSON}" ]]  && NORMALIZE_ARGS+=(--subzy "${SUBZY_JSON}")
     [[ -f "${CMDB_EXPORT}" ]] && NORMALIZE_ARGS+=(--cmdb "${CMDB_EXPORT}")
@@ -485,9 +543,39 @@ if should_run "normalize"; then
 fi
 
 # ===========================================================================
-# STAGE 9: Load into DuckDB
+# STAGE 9: Archive previous scan, then Load into DuckDB
 # ===========================================================================
 if should_run "load"; then
+    # Archive existing scan before overwriting
+    if [[ -f "${DUCKDB_PATH}" ]]; then
+        log_stage "ARCHIVING PREVIOUS SCAN"
+        stage_start=$(date +%s)
+
+        ARCHIVE_DIR="${SCRIPT_DIR}/data/archives"
+        PREV_SCAN_ID=$(python3 -c "
+import duckdb, sys
+try:
+    con = duckdb.connect('${DUCKDB_PATH}', read_only=True)
+    row = con.execute('SELECT scan_id FROM v_scan_stats LIMIT 1').fetchone()
+    print(row[0] if row else '')
+    con.close()
+except: pass
+" 2>/dev/null)
+
+        if [[ -n "${PREV_SCAN_ID}" ]] && [[ ! -d "${ARCHIVE_DIR}/${PREV_SCAN_ID}" ]]; then
+            python3 "${SCRIPT_DIR}/scripts/archive_scan.py" \
+                --db "${DUCKDB_PATH}" \
+                --scan-id "${PREV_SCAN_ID}" \
+                --archive-dir "${ARCHIVE_DIR}" \
+                --input-file "${INPUT_SUBDOMAINS}" 2>>"${SCAN_LOG}" || \
+                log "WARN: Archive failed (non-fatal)"
+
+            log "Archive complete | prev_scan=${PREV_SCAN_ID} elapsed=$(elapsed ${stage_start})s"
+        else
+            log "No previous scan to archive (first run or already archived)"
+        fi
+    fi
+
     log_stage "DUCKDB LOAD"
     stage_start=$(date +%s)
 
@@ -500,6 +588,25 @@ if should_run "load"; then
             --scan-id "${SCAN_ID}"
 
         log "DuckDB load complete | db=${DUCKDB_PATH} elapsed=$(elapsed ${stage_start})s"
+    fi
+fi
+
+# ===========================================================================
+# STAGE 10: Verify takeover candidates (live DNS + HTTP fingerprint)
+# ===========================================================================
+if should_run "verify"; then
+    log_stage "TAKEOVER VERIFICATION"
+    stage_start=$(date +%s)
+
+    if [[ ! -f "${DUCKDB_PATH}" ]]; then
+        log "WARN: DuckDB not found — skipping takeover verification"
+    else
+        python3 "${SCRIPT_DIR}/scripts/verify_takeovers.py" \
+            --db  "${DUCKDB_PATH}" \
+            --out "${VERIFY_JSONL}" 2>>"${SCAN_LOG}" || \
+            log "WARN: takeover verification completed with warnings"
+
+        log "Takeover verification complete | elapsed=$(elapsed ${stage_start})s"
     fi
 fi
 
@@ -518,6 +625,7 @@ log "  HTTP probed:  $(count_lines "${HTTPX_JSONL}" 2>/dev/null || echo 0)"
 log "  TLS certs:    $(count_lines "${TLS_JSONL}" 2>/dev/null || echo 0)"
 log "  Nuclei finds: $(count_lines "${NUCLEI_JSONL}" 2>/dev/null || echo 0)"
 log "  Assets:       $(count_lines "${ASSETS_JSONL}" 2>/dev/null || echo 0)"
+log "  Takeover chk: $(count_lines "${VERIFY_JSONL}" 2>/dev/null || echo 0) verified"
 log "  Screenshots:  $(find "${SCREENSHOT_DIR}" -name '*.png' 2>/dev/null | wc -l | tr -d ' ')"
 log "  DuckDB:       ${DUCKDB_PATH}"
 log "  Log:          ${SCAN_LOG}"

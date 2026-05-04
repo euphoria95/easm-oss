@@ -15,7 +15,13 @@ data/output/
 data/screenshots/
 data/cache/
 logs/
+*.log
 oss_data/
+data/input/
 
 # OS artifacts
 .DS_Store
+
+# Markdown (keep only README)
+*.md
+!README.md

@@ -20,9 +20,9 @@ subdomains.txt ──→ crt.sh enrichment ──→ targets.txt
                                    ┌───────┴────────┐
                                    ▼                 ▼
                             ┌──────────┐      ┌──────────┐
-                            │  httpx   │      │  zgrab2   │  Service Fingerprinting
-                            │ +screen  │      │  (SSH/    │
-                            └────┬─────┘      │  FTP/DB)  │
+                            │  httpx   │      │  nerva    │  Service Fingerprinting
+                            │ +screen  │      │  (auto-   │  CPE · vendor · version
+                            └────┬─────┘      │  detect)  │  OS hints · misconfigs
                                  │            └────┬─────┘
                             ┌────┴─────┐           │
                             │  tlsx    │           │
@@ -116,7 +116,9 @@ go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest
 go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 go install github.com/sensepost/gowitness/v3@latest
 go install github.com/PentestPad/subzy@latest
-go install github.com/zmap/zgrab2/cmd/zgrab2@latest
+go install github.com/praetorian-inc/nerva/cmd/nerva@latest
+# optional: zgrab2 fallback (set FINGERPRINT_BACKEND=zgrab2 in pipeline.env to use)
+# go install github.com/zmap/zgrab2/cmd/zgrab2@latest
 
 # Run
 chmod +x run.sh scripts/*.sh
@@ -137,7 +139,7 @@ python3 scripts/normalize.py \
     --ports data/output/ports.jsonl \
     --http data/output/httpx.jsonl \
     --tls data/output/tls.jsonl \
-    --zgrab data/output/zgrab/zgrab_ssh.jsonl \
+    --nerva data/output/nerva.jsonl \
     --nuclei data/output/nuclei.jsonl \
     --cmdb data/input/cmdb_export.csv \
     --output data/output/assets.jsonl
@@ -158,7 +160,7 @@ python3 scripts/load_duckdb.py \
 | 2 | `ports` | naabu | TCP SYN scan top-100 ports, CDN-aware |
 | 3 | `http` | httpx | Full-signal probe: status, title, tech, headers, JARM, screenshot |
 | 4 | `tls` | tlsx | Deep cert analysis: SANs, expiry, misconfig flags |
-| 5 | `zgrab` | zgrab2 | Non-HTTP banners: SSH, FTP, SMTP, DB ports |
+| 5 | `fingerprint` | nerva | Auto-detect all protocols: SSH, FTP, DB, Redis, SMB — CPE/vendor/version/OS fingerprints. Alias: `zgrab` |
 | 6 | `nuclei` | nuclei | Low-noise scan: takeovers, exposed panels, misconfigs |
 | 7 | `takeover` | subzy | Subdomain takeover verification |
 | 8 | `normalize` | normalize.py | Merge all JSONL → unified asset record per FQDN |
@@ -238,13 +240,15 @@ bash scripts/diff_scans.sh data/output/assets_prev.jsonl data/output/assets.json
 
 | View | Description |
 |------|-------------|
-| `v_asset_summary` | One-row-per-asset overview |
+| `v_asset_summary` | One-row-per-asset overview with service_count |
 | `v_cmdb_gaps` | Assets missing from CMDB |
 | `v_tls_issues` | Expired, self-signed, expiring certs |
-| `v_findings` | All nuclei/subzy findings by severity |
+| `v_findings` | All nuclei/subzy/nerva findings by severity |
 | `v_tech_stack` | Technology detected per asset |
 | `v_open_ports` | All open ports with service info |
-| `v_scan_stats` | Aggregate scan statistics |
+| `v_services` | Per-port fingerprints: vendor, product, version, CPE, OS, certainty |
+| `v_software_inventory` | Unique software across the estate, grouped by product/version with host count |
+| `v_scan_stats` | Aggregate scan statistics including total_services |
 
 ## Data Model
 
@@ -256,7 +260,10 @@ fqdn, scan_id, first_seen, last_seen, source[], tags[]
 ├── network: { asn: {number, org, country}, cdn, open_ports[] }
 ├── web[]: { port, url, status_code, title, tech[], screenshot_path, ... }
 ├── tls[]: { port, version, issuer, sans[], days_to_expiry, expired, ... }
-├── services[]: { port, service, banner, ... }
+├── services[]: { port, protocol, transport, service, status, banner,
+│               fingerprint: { vendor, product, version, cpe23,
+│                              os_vendor, os_product, os_version,
+│                              certainty, source } }
 ├── findings[]: { source, template_id, severity, matched_at, ... }
 └── cmdb: { matched_ci, match_basis[], in_cmdb, gap_type }
 ```
@@ -270,16 +277,19 @@ easm-oss/
 ├── docker-compose.yml        # Docker Compose stack
 ├── requirements.txt          # Python dependencies
 ├── config/
-│   ├── pipeline.env          # Pipeline configuration
+│   ├── pipeline.env          # Pipeline configuration (NERVA_* and FINGERPRINT_BACKEND)
 │   ├── resolvers.txt         # DNS resolvers
 │   ├── nuclei-config.yaml    # Nuclei scanning profile
-│   └── zgrab2-modules.ini    # zgrab2 module config
+│   └── zgrab2-modules.ini    # zgrab2 module config (deprecated — kept for fallback)
 ├── scripts/
 │   ├── normalize.py          # JSONL merger & asset normalizer
 │   ├── load_duckdb.py        # DuckDB loader with views
+│   ├── run_nerva.sh          # Nerva service fingerprinting wrapper
 │   ├── cmdb_report.py        # CMDB gap analysis report
 │   ├── query.py              # Query runner with pre-built queries
 │   ├── test_pipeline.py      # Synthetic data generator
+│   ├── test_nerva_ingest.py  # Unit tests for Nerva ingestion
+│   ├── test_pipeline_nerva.sh # Integration test: normalize + DuckDB with mock Nerva data
 │   ├── ct_enrich.sh          # Standalone CT log enrichment
 │   ├── diff_scans.sh         # Scan-to-scan diff
 │   ├── cache.sh              # Cache manager
@@ -301,8 +311,48 @@ Per live asset, the pipeline makes approximately:
 - Port scan: top-100 SYN packets (2 if behind CDN)
 - HTTP: 2–3 requests (+ sub-resources for screenshot)
 - TLS: 1 connection per TLS port
-- zgrab2: 1 TCP connection per non-web port
+- Nerva: 1 TCP/UDP connection per open port (concurrent, auto-detects protocol)
 - Nuclei: 5–20 requests (rate-limited to 50 rps total)
+
+## Service Fingerprinting (Nerva)
+
+Nerva replaces zgrab2 as the primary fingerprinting engine. It auto-detects protocols on any open port and produces CPE-normalized vendor/product/version/OS fingerprints.
+
+### Configuration (`config/pipeline.env`)
+
+```bash
+NERVA_TIMEOUT=10          # seconds per connection
+NERVA_THREADS=50          # concurrent workers
+NERVA_FAST_MODE=false     # restrict to default ports only
+NERVA_UDP=false           # enable UDP protocol detection
+NERVA_MISCONFIGS=false    # surface misconfigs (weak SSH KEX, Redis no-auth, etc.)
+FINGERPRINT_BACKEND=nerva # set to "zgrab2" to use legacy fallback
+ZGRAB2_FALLBACK=false     # set to "true" to run both nerva and zgrab2
+```
+
+### Stage alias
+
+`--stage fingerprint` and `--stage zgrab` both run Stage 5.
+
+### Testing
+
+```bash
+# Unit tests (helpers + ingest_nerva)
+python3 scripts/test_nerva_ingest.py
+
+# Integration test (normalize → DuckDB with mock data)
+bash scripts/test_pipeline_nerva.sh
+```
+
+### Dashboard API
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/services` | Fingerprinted services. Params: `service=`, `search=`, `limit=` |
+| `GET /api/services/inventory` | Unique software across the estate (product/vendor/version/CPE, host count) |
+| `GET /api/overview` | Now includes `total_services`, `assets_with_services`, `top_software` |
+
+The dashboard **Services** tab surfaces these endpoints with filter pills, search, and a software inventory table.
 
 ## Security Notes
 
