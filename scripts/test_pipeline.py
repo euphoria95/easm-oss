@@ -262,6 +262,46 @@ def generate_nuclei(httpx_records, output_path):
     return records
 
 
+def generate_subzy(domains, output_path):
+    """
+    Generate realistic subzy output: a mix of vulnerable=true and vulnerable=false records.
+    Returns (all_records, vulnerable_fqdns) — the caller can assert which FQDNs should
+    appear in findings and which should be filtered out.
+    """
+    services = ["github", "heroku", "netlify", "s3", "azure", "shopify", "fastly"]
+    cname_map = {
+        "github":  "your-project.github.io",
+        "heroku":  "young-mountain-12345.herokuapp.com",
+        "netlify": "funny-name-abc123.netlify.app",
+        "s3":      "my-bucket.s3.amazonaws.com",
+        "azure":   "myapp.azurewebsites.net",
+        "shopify": "shops.myshopify.com",
+        "fastly":  "global.prod.fastly.net",
+    }
+    records = []
+    vulnerable_fqdns: list[str] = []
+
+    # Pick 4 domains to be vulnerable, 3 to be non-vulnerable false positives
+    candidates = random.sample(domains, min(7, len(domains)))
+    for i, fqdn in enumerate(candidates):
+        is_vulnerable = i < 4  # first 4 are vulnerable
+        service = services[i % len(services)]
+        rec = {
+            "subdomain": fqdn,
+            "service":   service,
+            "cname":     f"{fqdn}.{cname_map[service]}",
+            "vulnerable": is_vulnerable,
+        }
+        records.append(rec)
+        if is_vulnerable:
+            vulnerable_fqdns.append(fqdn)
+
+    with open(output_path, "w") as f:
+        json.dump(records, f, indent=2)
+
+    return records, vulnerable_fqdns
+
+
 def generate_zgrab_ssh(port_records, output_dir):
     records = []
     for prec in port_records:
@@ -331,10 +371,16 @@ def main():
     nuclei_recs = generate_nuclei(httpx_recs, output_dir / "nuclei.jsonl")
     print(f"  Nuclei: {len(nuclei_recs)} records", file=sys.stderr)
 
+    subzy_recs, vulnerable_fqdns = generate_subzy(
+        [r["host"] for r in dns_recs], output_dir / "subzy.json"
+    )
+    print(f"  Subzy: {len(subzy_recs)} records ({len(vulnerable_fqdns)} vulnerable)", file=sys.stderr)
+
     zgrab_recs = generate_zgrab_ssh(port_recs, zgrab_dir)
     print(f"  zgrab2 SSH: {len(zgrab_recs)} records", file=sys.stderr)
 
     print(f"\nSynthetic data written to {output_dir}/", file=sys.stderr)
+    print(f"Vulnerable FQDNs (expected in findings): {vulnerable_fqdns}", file=sys.stderr)
     print("Run the normalizer:", file=sys.stderr)
     print(f"  python3 scripts/normalize.py \\", file=sys.stderr)
     print(f"    --dns {output_dir}/dns.jsonl \\", file=sys.stderr)
@@ -343,8 +389,20 @@ def main():
     print(f"    --tls {output_dir}/tls.jsonl \\", file=sys.stderr)
     print(f"    --zgrab {zgrab_dir}/zgrab_ssh.jsonl \\", file=sys.stderr)
     print(f"    --nuclei {output_dir}/nuclei.jsonl \\", file=sys.stderr)
+    print(f"    --subzy {output_dir}/subzy.json \\", file=sys.stderr)
     print(f"    --cmdb data/input/cmdb_export.csv \\", file=sys.stderr)
     print(f"    --output {output_dir}/assets.jsonl", file=sys.stderr)
+
+    # Write manifest for test assertions
+    manifest = {
+        "vulnerable_fqdns": vulnerable_fqdns,
+        "non_vulnerable_fqdns": [
+            r["subdomain"] for r in subzy_recs if not r["vulnerable"]
+        ],
+    }
+    with open(output_dir / "test_manifest.json", "w") as f:
+        json.dump(manifest, f, indent=2)
+    print(f"  Manifest: {output_dir}/test_manifest.json", file=sys.stderr)
 
 
 if __name__ == "__main__":

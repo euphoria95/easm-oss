@@ -1,7 +1,8 @@
 # =============================================================================
 # EASM Pipeline - Multi-stage Docker Build
-# Installs: dnsx, naabu, httpx, tlsx, nuclei, zgrab2, gowitness, subzy
+# Installs: dnsx, naabu, httpx, tlsx, nuclei, nerva, zgrab2, gowitness, subzy
 #           + Python venv (duckdb stack), jq, Chromium/Chrome
+# nerva is the primary fingerprinting engine; zgrab2 is kept for fallback.
 #
 # Runtime base can be switched at build-time:
 #   docker build --build-arg RUNTIME_BASE=ubuntu:24.04 -t easm-pipeline .
@@ -10,22 +11,30 @@
 
 ARG RUNTIME_BASE=debian:bookworm-slim
 
+# Stage 0: Pull prebuilt nuclei binary from official image
+FROM projectdiscovery/nuclei:v3.8.0 AS nuclei-bin
+
 # Stage 1: Build Go tools from source
-FROM golang:1.22-bookworm AS go-builder
+FROM golang:1.26-bookworm AS go-builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git libpcap-dev ca-certificates && rm -rf /var/lib/apt/lists/*
+    git \
+    libpcap-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-# ProjectDiscovery tools + companions
-RUN GOBIN=/go/bin go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest && \
-    GOBIN=/go/bin go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest && \
-    GOBIN=/go/bin go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest && \
-    GOBIN=/go/bin go install -v github.com/projectdiscovery/tlsx/cmd/tlsx@latest && \
-    GOBIN=/go/bin go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest && \
-    GOBIN=/go/bin go install -v github.com/projectdiscovery/pdtm/cmd/pdtm@latest && \
-    GOBIN=/go/bin go install -v github.com/sensepost/gowitness/v3@latest && \
-    GOBIN=/go/bin go install -v github.com/PentestPad/subzy@latest && \
-    GOBIN=/go/bin go install -v github.com/zmap/zgrab2/cmd/zgrab2@latest
+ENV GOBIN=/go/bin
+
+# Build tools separately for easier debugging
+RUN go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest
+RUN go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
+RUN go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+RUN go install -v github.com/projectdiscovery/tlsx/cmd/tlsx@latest
+RUN go install -v github.com/projectdiscovery/pdtm/cmd/pdtm@latest
+RUN go install -v github.com/sensepost/gowitness@latest
+RUN go install -v github.com/PentestPad/subzy@latest
+RUN go install -v github.com/zmap/zgrab2/cmd/zgrab2@latest
+RUN go install -v github.com/praetorian-inc/nerva/cmd/nerva@latest
 
 # Stage 2: Runtime image
 FROM ${RUNTIME_BASE} AS runtime
@@ -95,20 +104,24 @@ RUN set -eux; \
     fi; \
     rm -rf /var/lib/apt/lists/*
 
-# Copy Go binaries
+# Copy Go binaries built locally
 COPY --from=go-builder /go/bin/dnsx      /usr/local/bin/
 COPY --from=go-builder /go/bin/naabu     /usr/local/bin/
 COPY --from=go-builder /go/bin/httpx     /usr/local/bin/
 COPY --from=go-builder /go/bin/tlsx      /usr/local/bin/
-COPY --from=go-builder /go/bin/nuclei    /usr/local/bin/
 COPY --from=go-builder /go/bin/pdtm      /usr/local/bin/
 COPY --from=go-builder /go/bin/gowitness /usr/local/bin/
 COPY --from=go-builder /go/bin/subzy     /usr/local/bin/
-COPY --from=go-builder /go/bin/zgrab2    /usr/local/bin/
+COPY --from=go-builder /go/bin/zgrab2       /usr/local/bin/
+COPY --from=go-builder /go/bin/nerva         /usr/local/bin/
+
+# Copy nuclei from official prebuilt image
+COPY --from=nuclei-bin /usr/local/bin/nuclei /usr/local/bin/nuclei
 
 # Python virtual environment + deps
 RUN python3 -m venv /opt/easm-venv
 ENV PATH="/opt/easm-venv/bin:${PATH}"
+
 COPY requirements.txt /tmp/requirements.txt
 RUN python3 -m pip install --upgrade pip setuptools wheel && \
     python3 -m pip install -r /tmp/requirements.txt && \

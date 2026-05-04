@@ -2,20 +2,21 @@
 """
 EASM Pipeline — Asset Normalizer
 
-Merges outputs from dnsx, naabu, httpx, tlsx, zgrab2, nuclei, and subzy
+Merges outputs from dnsx, naabu, httpx, tlsx, nerva, zgrab2, nuclei, and subzy
 into a single unified asset record per FQDN, keyed by the data model
 defined in the EASM plan (§4).
 
 Usage:
     python3 normalize.py \
         --dns dns.jsonl --ports ports.jsonl --http httpx.jsonl \
-        --tls tls.jsonl --zgrab zgrab_ssh.jsonl --nuclei nuclei.jsonl \
+        --tls tls.jsonl --nerva nerva.jsonl --nuclei nuclei.jsonl \
         --subzy subzy.json --cmdb cmdb_export.csv \
         --output assets.jsonl --scan-id 20260419_021509
 """
 
 import argparse
 import csv
+import re
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -113,7 +114,7 @@ class AssetStore:
                     "wildcard": False,
                 },
                 "network": {
-                    "asn": {},
+                    "asn": {"number": None, "org": None, "country": None},
                     "cdn": None,
                     "open_ports": [],
                 },
@@ -362,9 +363,22 @@ class AssetStore:
             service_entry = {
                 "port": port,
                 "protocol": "tcp",
+                "transport": "tcp",
                 "service": module,
                 "status": status,
                 "banner": banner,
+                "fingerprint": {
+                    "vendor": "",
+                    "product": module,
+                    "version": "",
+                    "cpe23": "",
+                    "os_vendor": "",
+                    "os_product": "",
+                    "os_version": "",
+                    "certainty": 0.3,
+                    "source": "zgrab2",
+                },
+                "metadata": {},
                 "raw": data.get("result", {}),
             }
             asset["services"].append(service_entry)
@@ -379,12 +393,114 @@ class AssetStore:
                     "banner": banner,
                 })
 
+    # --- Nerva ---
+    def ingest_nerva(self, records: list[dict]):
+        """Ingest nerva JSONL output.
+
+        Nerva JSON format per line:
+            {"host":"x.x.x.x","ip":"x.x.x.x","port":22,"protocol":"ssh",
+             "transport":"tcp","metadata":{...},"security_findings":[...]}
+
+        All service-specific detail (version, banner) lives in metadata
+        under protocol-specific keys. security_findings is present only
+        when nerva was run with --misconfigs.
+        """
+        for rec in records:
+            host = rec.get("host") or rec.get("ip", "")
+            port = rec.get("port")
+            if not host or port is None:
+                continue
+
+            asset = self._ensure(host)
+            if not asset:
+                continue
+            self._add_source(asset, "nerva")
+
+            protocol = (rec.get("protocol") or "").lower()
+            transport = (rec.get("transport") or "tcp").lower()
+            metadata = rec.get("metadata") or {}
+
+            # version/banner: try common metadata keys across protocols
+            version_str = (
+                metadata.get("version")
+                or metadata.get("server_version")
+                or metadata.get("banner")
+                or ""
+            )
+            banner = (
+                metadata.get("banner")
+                or metadata.get("server_version")
+                or version_str
+            )
+
+            cpe = rec.get("cpe") or metadata.get("cpe") or ""
+            vendor, product, version = _parse_cpe_fields(cpe)
+            if not product and version_str:
+                product, version = _parse_version_string(version_str, protocol)
+
+            os_vendor, os_product, os_version = _extract_os_hints(banner or version_str)
+
+            if cpe:
+                certainty = 0.95
+            elif version_str:
+                certainty = 0.7
+            else:
+                certainty = 0.8
+
+            service_entry = {
+                "port": port,
+                "protocol": transport,
+                "transport": transport,
+                "service": protocol,
+                "status": "success" if protocol else "unknown",
+                "banner": banner,
+                "fingerprint": {
+                    "vendor": vendor,
+                    "product": product,
+                    "version": version,
+                    "cpe23": cpe,
+                    "os_vendor": os_vendor,
+                    "os_product": os_product,
+                    "os_version": os_version,
+                    "certainty": certainty,
+                    "source": "nerva",
+                },
+                "metadata": metadata,
+                "raw": {},
+            }
+            asset["services"].append(service_entry)
+
+            existing_ports = {p["port"] for p in asset["network"]["open_ports"]}
+            if port not in existing_ports:
+                asset["network"]["open_ports"].append({
+                    "port": port,
+                    "protocol": transport,
+                    "service": protocol,
+                    "banner": banner,
+                })
+
+            # Security misconfigurations from --misconfigs flag
+            for sf in rec.get("security_findings") or []:
+                finding = {
+                    "source": "nerva_misconfig",
+                    "template_id": sf.get("id", ""),
+                    "name": sf.get("description", sf.get("id", "")),
+                    "severity": sf.get("severity", "info"),
+                    "matched_at": f"{host}:{port}",
+                    "evidence": sf.get("evidence", ""),
+                    "timestamp": self.timestamp,
+                }
+                asset["findings"].append(finding)
+                self._add_source(asset, "nerva_misconfigs")
+
     # --- Nuclei ---
     def ingest_nuclei(self, records: list[dict]):
         for rec in records:
             host = rec.get("host", "")
+            # Nuclei puts the full URL in "host" (e.g. "https://example.com:8443")
+            if "://" in host:
+                host = host.split("://")[1].split("/")[0].split(":")[0]
             if not host:
-                # Try to extract from matched-at
                 matched = rec.get("matched-at", "") or rec.get("matched_at", "")
                 if "://" in matched:
                     host = matched.split("://")[1].split("/")[0].split(":")[0]
@@ -418,6 +534,9 @@ class AssetStore:
             return
         entries = data if isinstance(data, list) else [data]
         for rec in entries:
+            is_vulnerable = rec.get("vulnerable", False) or rec.get("status") == "vulnerable"
+            if not is_vulnerable:
+                continue
             host = rec.get("subdomain") or rec.get("domain", "")
             if not host:
                 continue
@@ -426,15 +545,16 @@ class AssetStore:
                 continue
             self._add_source(asset, "subzy")
 
+            service = rec.get("service") or rec.get("engine", "")
             finding = {
                 "source": "subzy",
                 "template_id": "subdomain-takeover",
-                "name": f"Subdomain Takeover - {rec.get('service', 'unknown')}",
+                "name": f"Subdomain Takeover - {service or 'unknown'}",
                 "severity": "high",
                 "matched_at": host,
-                "service": rec.get("service", ""),
+                "service": service,
                 "cname": rec.get("cname", ""),
-                "vulnerable": rec.get("vulnerable", False),
+                "vulnerable": True,
                 "timestamp": self.timestamp,
             }
             asset["findings"].append(finding)
@@ -537,6 +657,12 @@ class AssetStore:
             for f in a["findings"]:
                 sev_counts[f.get("severity", "unknown")] += 1
 
+        total_services = sum(len(a.get("services", [])) for a in self.assets.values())
+        with_fingerprints = sum(
+            1 for a in self.assets.values()
+            if any(s.get("fingerprint", {}).get("cpe23") for s in a.get("services", []))
+        )
+
         return {
             "total_assets": total,
             "with_web": with_web,
@@ -548,6 +674,8 @@ class AssetStore:
             "cmdb_gap_pct": round((shadow_it / total * 100) if total > 0 else 0, 1),
             "total_findings": total_findings,
             "findings_by_severity": dict(sev_counts),
+            "total_services": total_services,
+            "with_fingerprints": with_fingerprints,
         }
 
 
@@ -654,6 +782,51 @@ def _module_default_port(module: str) -> int:
     return ports.get(module, 0)
 
 
+def _parse_cpe_fields(cpe: str) -> tuple[str, str, str]:
+    """Extract vendor, product, version from CPE 2.3 string."""
+    if not cpe or not cpe.startswith("cpe:2.3:"):
+        return ("", "", "")
+    parts = cpe.split(":")
+    if len(parts) < 7:
+        return ("", "", "")
+    vendor = parts[3] if parts[3] != "*" else ""
+    product = parts[4] if parts[4] != "*" else ""
+    version = parts[5] if parts[5] != "*" else ""
+    return (vendor, product, version)
+
+
+def _parse_version_string(version_str: str, service: str) -> tuple[str, str]:
+    """Best-effort (product, version) extraction from a free-form version string."""
+    m = re.match(r'^(\S+?)[\s/_-]*([\d][\d.]*\S*)', version_str)
+    if m:
+        return (m.group(1), m.group(2))
+    return (version_str, "")
+
+
+def _extract_os_hints(banner: str) -> tuple[str, str, str]:
+    """Extract (os_vendor, os_product, os_version) from service banners."""
+    if not banner:
+        return ("", "", "")
+
+    m = re.search(r'Ubuntu[- ]?(\S*)', banner, re.IGNORECASE)
+    if m:
+        return ("Canonical", "Ubuntu", m.group(1).rstrip(")"))
+
+    m = re.search(r'Debian[- ]?(\S*)', banner, re.IGNORECASE)
+    if m:
+        return ("Debian", "Debian", m.group(1).rstrip(")"))
+
+    m = re.search(r'(?:CentOS|el)[\s._-]?(\d[\d.]*)', banner, re.IGNORECASE)
+    if m:
+        return ("CentOS", "CentOS", m.group(1))
+
+    m = re.search(r'Windows\s+(\S+)', banner, re.IGNORECASE)
+    if m:
+        return ("Microsoft", "Windows", m.group(1))
+
+    return ("", "", "")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -664,6 +837,7 @@ def main():
     parser.add_argument("--ports", help="naabu JSONL output")
     parser.add_argument("--http", help="httpx JSONL output")
     parser.add_argument("--tls", help="tlsx JSONL output")
+    parser.add_argument("--nerva", help="nerva JSONL output")
     parser.add_argument("--zgrab", action="append", default=[], help="zgrab2 JSONL output (can repeat)")
     parser.add_argument("--nuclei", help="nuclei JSONL output")
     parser.add_argument("--subzy", help="subzy JSON output")
@@ -690,6 +864,10 @@ def main():
     if args.tls:
         print(f"Ingesting TLS: {args.tls}", file=sys.stderr)
         store.ingest_tls(read_jsonl(args.tls))
+
+    if args.nerva:
+        print(f"Ingesting nerva: {args.nerva}", file=sys.stderr)
+        store.ingest_nerva(read_jsonl(args.nerva))
 
     for zgrab_file in args.zgrab:
         # Extract module name from filename: zgrab_ssh.jsonl → ssh
