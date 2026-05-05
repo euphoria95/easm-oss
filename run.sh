@@ -3,7 +3,7 @@
 # EASM Pipeline Orchestrator
 # =============================================================================
 # Funnel-based EASM discovery pipeline:
-#   CT Enrichment → DNS → Port Scan → HTTP Probe → TLS → nerva → Nuclei
+#   DNS → ASN → Port Scan → HTTP Probe → TLS → nerva → Nuclei
 #   → Normalize → DuckDB
 #
 # Usage:
@@ -65,15 +65,19 @@ DUCKDB_PATH="${SCRIPT_DIR}/${DUCKDB_PATH_VALUE}"
 ZGRAB_DIR="${OUTPUT_DIR}/zgrab"
 NERVA_JSONL="${OUTPUT_DIR}/nerva.jsonl"
 VERIFY_JSONL="${OUTPUT_DIR}/takeover_verifications.jsonl"
+IP_TARGETS="${OUTPUT_DIR}/ip_targets.txt"
+FQDN_TARGETS="${OUTPUT_DIR}/fqdn_targets.txt"
+ASN_JSONL="${OUTPUT_DIR}/asn.jsonl"
+RDNS_JSONL="${OUTPUT_DIR}/rdns.jsonl"
 
 SCAN_ID="$(date -u +%Y%m%d_%H%M%S)"
 SCAN_LOG="${LOG_DIR}/scan_${SCAN_ID}.log"
+SCAN_MARKER="${OUTPUT_DIR}/scan_id.txt"
 
 # CLI args
-STAGE_ORDER="passive,dns,ports,http,tls,fingerprint,nuclei,takeover,normalize,load,verify"
+STAGE_ORDER="dns,asn,rdns,ports,http,tls,fingerprint,nuclei,takeover,normalize,load,verify"
 STAGE_FILTER=""
 FROM_STAGE=""
-SKIP_PASSIVE=false
 DRY_RUN=false
 
 # ---------------------------------------------------------------------------
@@ -84,10 +88,9 @@ while [[ $# -gt 0 ]]; do
         --)             shift ;;
         --stage)        STAGE_FILTER="$2"; shift 2 ;;
         --from)         FROM_STAGE="$2"; shift 2 ;;
-        --skip-passive) SKIP_PASSIVE=true; shift ;;
         --dry-run)      DRY_RUN=true; shift ;;
         -h|--help)
-            echo "Usage: $0 [--stage STAGE1,STAGE2 | --from STAGE] [--skip-passive] [--dry-run]"
+            echo "Usage: $0 [--stage STAGE1,STAGE2 | --from STAGE] [--dry-run]"
             echo ""
             echo "  --stage STAGES  Run only the specified comma-separated stages"
             echo "  --from  STAGE   Run from STAGE through the end of the pipeline"
@@ -185,52 +188,70 @@ fi
 
 PIPELINE_START=$(date +%s)
 
-# ===========================================================================
-# STAGE 0: Passive enrichment — CT logs via crt.sh
-# ===========================================================================
-if should_run "passive" && ! ${SKIP_PASSIVE}; then
-    log_stage "PASSIVE ENRICHMENT (crt.sh)"
-    stage_start=$(date +%s)
+# ---------------------------------------------------------------------------
+# Scan isolation: archive orphaned outputs from any previous run, then write
+# the current scan marker.  Skipped for --stage / --from (resume runs).
+# ---------------------------------------------------------------------------
+if [[ -z "${STAGE_FILTER}" ]] && [[ -z "${FROM_STAGE}" ]]; then
+    if [[ -f "${SCAN_MARKER}" ]]; then
+        ORPHAN_ID=$(tr -d '[:space:]' < "${SCAN_MARKER}")
+        if [[ -n "${ORPHAN_ID}" ]]; then
+            ORPHAN_COUNT=0
+            for _f in "${DNS_JSONL}" "${PORTS_JSONL}" "${HTTPX_JSONL}" "${ASSETS_JSONL}"; do
+                [[ -f "${_f}" ]] && ORPHAN_COUNT=$(( ORPHAN_COUNT + 1 ))
+            done
+            if [[ "${ORPHAN_COUNT}" -gt 0 ]]; then
+                log "Archiving orphaned outputs from previous run: ${ORPHAN_ID}"
+                python3 "${SCRIPT_DIR}/scripts/archive_scan.py" \
+                    --archive-raw \
+                    --scan-id "${ORPHAN_ID}" \
+                    --output-dir "${OUTPUT_DIR}" \
+                    --screenshot-dir "${SCREENSHOT_DIR}" \
+                    --log-file "${LOG_DIR}/scan_${ORPHAN_ID}.log" \
+                    --archive-dir "${SCRIPT_DIR}/data/archives" \
+                    --status "partial" 2>>"${SCAN_LOG}" || \
+                    log "WARN: Orphan archive failed — cleaning output directory anyway"
+                # Guarantee clean slate even if archive failed mid-move
+                rm -f "${TARGETS_FILE}" "${IP_TARGETS}" "${FQDN_TARGETS}" \
+                      "${ASN_JSONL}" "${RDNS_JSONL}" "${DNS_JSONL}" "${LIVE_HOSTS}" \
+                      "${PORTS_JSONL}" "${WEB_TARGETS}" "${HTTPX_JSONL}" \
+                      "${TLS_JSONL}" "${NERVA_JSONL}" "${NUCLEI_JSONL}" \
+                      "${SUBZY_JSON}" "${ASSETS_JSONL}" "${VERIFY_JSONL}"
+                mkdir -p "${ZGRAB_DIR}"
+            fi
+        fi
+    fi
+    echo "${SCAN_ID}" > "${SCAN_MARKER}"
+fi
 
-    cp "${INPUT_SUBDOMAINS}" "${TARGETS_FILE}.base"
-
-    IFS=',' read -ra DOMAINS <<< "${ROOT_DOMAINS:-}"
-    for domain in "${DOMAINS[@]}"; do
-        domain=$(echo "$domain" | xargs)  # trim
-        if [[ -z "$domain" ]]; then continue; fi
-        log "Querying crt.sh for *.${domain}"
-        # Rate-limit crt.sh: 1 request per domain, with timeout
-        curl -sf --max-time 30 \
-            "https://crt.sh/?q=%25.${domain}&output=json" 2>/dev/null \
-            | jq -r '.[].name_value // empty' 2>/dev/null \
-            | tr ',' '\n' \
-            | sed 's/^\*\.//' \
-            | grep -E "\.${domain//./\\.}$" \
-            >> "${TARGETS_FILE}.ct" || log "WARN: crt.sh query failed for ${domain}"
-    done
-
-    # Union and deduplicate
-    cat "${TARGETS_FILE}.base" "${TARGETS_FILE}.ct" 2>/dev/null \
-        | tr '[:upper:]' '[:lower:]' \
+# Build normalized targets (lowercase, deduplicated)
+if [[ ! -f "${TARGETS_FILE}" ]]; then
+    tr '[:upper:]' '[:lower:]' < "${INPUT_SUBDOMAINS}" \
         | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
         | grep -v '^$' \
         | sort -u > "${TARGETS_FILE}"
-    rm -f "${TARGETS_FILE}.base" "${TARGETS_FILE}.ct"
-
-    INPUT_COUNT=$(count_lines "${INPUT_SUBDOMAINS}")
-    TOTAL_COUNT=$(count_lines "${TARGETS_FILE}")
-    CT_ADDED=$(( TOTAL_COUNT - INPUT_COUNT ))
-
-    log "Passive enrichment complete | input=${INPUT_COUNT} ct_added=${CT_ADDED} total=${TOTAL_COUNT} elapsed=$(elapsed ${stage_start})s"
-else
-    # No passive enrichment: use input directly
-    if [[ ! -f "${TARGETS_FILE}" ]]; then
-        tr '[:upper:]' '[:lower:]' < "${INPUT_SUBDOMAINS}" \
-            | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
-            | grep -v '^$' \
-            | sort -u > "${TARGETS_FILE}"
-    fi
 fi
+
+# Partition targets into FQDNs and IPs (including CIDR ranges)
+grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$' "${TARGETS_FILE}" > "${IP_TARGETS}" || true
+grep -vE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$' "${TARGETS_FILE}" > "${FQDN_TARGETS}" || true
+
+# Expand CIDRs in IP_TARGETS
+if [[ -s "${IP_TARGETS}" ]]; then
+    python3 -c "
+import ipaddress, sys
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if '/' in line:
+        for ip in ipaddress.ip_network(line, strict=False).hosts():
+            print(ip)
+    elif line:
+        print(line)
+" "${IP_TARGETS}" > "${IP_TARGETS}.expanded"
+    mv "${IP_TARGETS}.expanded" "${IP_TARGETS}"
+fi
+
+log "Targets: fqdns=$(count_lines "${FQDN_TARGETS}") ips=$(count_lines "${IP_TARGETS}")"
 
 # ===========================================================================
 # STAGE 1: DNS Resolution (dnsx)
@@ -239,7 +260,7 @@ if should_run "dns"; then
     log_stage "DNS RESOLUTION (dnsx)"
     stage_start=$(date +%s)
 
-    dnsx -l "${TARGETS_FILE}" \
+    dnsx -l "${FQDN_TARGETS}" \
         -a -aaaa -cname -ns -mx -resp \
         -r "${RESOLVERS}" \
         -rate-limit "${DNS_RATE_LIMIT:-500}" \
@@ -250,7 +271,79 @@ if should_run "dns"; then
     # Extract live hostnames
     jq -r '.host // empty' "${DNS_JSONL}" | sort -u > "${LIVE_HOSTS}"
 
+    # Merge direct IP targets into live hosts
+    if [[ -s "${IP_TARGETS}" ]]; then
+        cat "${IP_TARGETS}" >> "${LIVE_HOSTS}"
+        sort -u "${LIVE_HOSTS}" -o "${LIVE_HOSTS}"
+    fi
+
     log "DNS complete | resolved=$(count_lines "${LIVE_HOSTS}") elapsed=$(elapsed ${stage_start})s"
+fi
+
+# ===========================================================================
+# STAGE 1.5: ASN Enrichment (offline, pyasn)
+# ===========================================================================
+if should_run "asn"; then
+    log_stage "ASN ENRICHMENT (pyasn)"
+    stage_start=$(date +%s)
+
+    ASN_DB="${CACHE_DIR}/ipasn.dat"
+    ASN_NAMES="${CACHE_DIR}/asn_names.tsv"
+
+    # Bootstrap ASN database if missing or stale (>7 days)
+    if [[ ! -f "${ASN_DB}" ]] || [[ $(find "${CACHE_DIR}" -name "ipasn.dat" -mtime +7 2>/dev/null | wc -l) -gt 0 ]]; then
+        log "Downloading fresh BGP RIB data..."
+        RIB_FILE="${CACHE_DIR}/rib_latest.bz2"
+        pyasn_util_download.py --latest --filename "${RIB_FILE}" 2>>"${SCAN_LOG}" || log "WARN: RIB download failed"
+        if [[ -f "${RIB_FILE}" ]]; then
+            pyasn_util_convert.py --single "${RIB_FILE}" "${ASN_DB}" 2>>"${SCAN_LOG}" || log "WARN: RIB conversion failed"
+            rm -f "${RIB_FILE}"
+        fi
+    fi
+
+    if [[ -f "${ASN_DB}" ]]; then
+        ASN_ARGS=(--ips "${IP_TARGETS}" --asndb "${ASN_DB}" --output "${ASN_JSONL}")
+        [[ -f "${DNS_JSONL}" ]] && ASN_ARGS+=(--dns-jsonl "${DNS_JSONL}")
+        [[ -f "${ASN_NAMES}" ]] && ASN_ARGS+=(--names "${ASN_NAMES}")
+
+        python3 "${SCRIPT_DIR}/scripts/enrich_asn.py" "${ASN_ARGS[@]}" 2>>"${SCAN_LOG}"
+        log "ASN enrichment complete | ips=$(count_lines "${ASN_JSONL}") elapsed=$(elapsed ${stage_start})s"
+    else
+        log "WARN: No ASN database available — skipping ASN enrichment"
+    fi
+fi
+
+# ===========================================================================
+# STAGE 1.75: Reverse DNS (PTR lookups via dnsx)
+# ===========================================================================
+if should_run "rdns"; then
+    log_stage "REVERSE DNS (dnsx -ptr)"
+    stage_start=$(date +%s)
+
+    RDNS_INPUT="${OUTPUT_DIR}/rdns_ips.txt"
+
+    # Collect all in-scope IPs: from DNS A records + direct IP targets
+    {
+        [[ -f "${DNS_JSONL}" ]] && jq -r '.a[]? // empty' "${DNS_JSONL}"
+        [[ -f "${IP_TARGETS}" ]] && cat "${IP_TARGETS}"
+    } | sort -u > "${RDNS_INPUT}"
+
+    IP_COUNT=$(count_lines "${RDNS_INPUT}")
+    if [[ "${IP_COUNT}" -gt 0 ]]; then
+        log "Reverse DNS: ${IP_COUNT} IPs"
+        dnsx -l "${RDNS_INPUT}" \
+            -ptr -resp \
+            -r "${RESOLVERS}" \
+            -rate-limit "${DNS_RATE_LIMIT:-500}" \
+            -retry "${DNS_RETRIES:-2}" \
+            -silent -json \
+            -o "${RDNS_JSONL}" 2>>"${SCAN_LOG}"
+
+        log "Reverse DNS complete | records=$(count_lines "${RDNS_JSONL}") elapsed=$(elapsed ${stage_start})s"
+    else
+        log "WARN: No IPs for reverse DNS"
+    fi
+    rm -f "${RDNS_INPUT}"
 fi
 
 # ===========================================================================
@@ -265,13 +358,17 @@ if should_run "ports"; then
     else
         NAABU_ARGS=(
             -l "${LIVE_HOSTS}"
-            -top-ports "${NAABU_TOP_PORTS:-100}"
             -rate "${NAABU_RATE:-1000}"
             -c "${NAABU_WORKERS:-25}"
             -retries "${NAABU_RETRIES:-1}"
             -silent -json
             -o "${PORTS_JSONL}"
         )
+        if [[ -n "${NAABU_PORTS:-}" ]]; then
+            NAABU_ARGS+=(-p "${NAABU_PORTS}")
+        else
+            NAABU_ARGS+=(-top-ports "${NAABU_TOP_PORTS:-100}")
+        fi
         if [[ "${NAABU_EXCLUDE_CDN:-true}" == "true" ]]; then
             NAABU_ARGS+=(-exclude-cdn)
         fi
@@ -453,13 +550,14 @@ if should_run "fingerprint"; then
 fi
 
 # ===========================================================================
-# STAGE 6: Nuclei — Low-noise exposure scanning
+# STAGE 6: Nuclei — Two-pass exposure scanning
+#   Pass 1: Generic broad scan (all URLs, generic tags from config)
+#   Pass 2: Technology-targeted scans (per-technology URLs, specific tags)
 # ===========================================================================
 if should_run "nuclei"; then
     log_stage "EXPOSURE SCANNING (nuclei)"
     stage_start=$(date +%s)
 
-    # Ensure templates are present; update silently if missing
     NUCLEI_TMPL_COUNT=$(nuclei -tl 2>/dev/null | wc -l | tr -d ' ')
     if [[ "${NUCLEI_TMPL_COUNT}" -eq 0 ]]; then
         log "Nuclei templates missing — attempting update"
@@ -476,13 +574,61 @@ if should_run "nuclei"; then
         if [[ -z "${URLS}" ]] || [[ "${URL_COUNT}" -eq 0 ]]; then
             log "WARN: No URLs extracted from ${HTTPX_JSONL}"
         else
-            log "Nuclei scanning ${URL_COUNT} URLs"
+            # --- Pass 1: Generic broad scan ---
+            log "Nuclei pass 1 (generic): scanning ${URL_COUNT} URLs"
             echo "${URLS}" | \
             nuclei \
                 -config "${NUCLEI_CONFIG}" \
                 -H "User-Agent: ${USER_AGENT}" \
                 -o "${NUCLEI_JSONL}" 2>>"${SCAN_LOG}" || \
-                log "WARN: nuclei had errors (partial results may be available)"
+                log "WARN: nuclei pass 1 had errors"
+
+            log "Pass 1 complete | findings=$(count_lines "${NUCLEI_JSONL}")"
+
+            # --- Pass 2: Technology-targeted scans ---
+            NUCLEI_JOBS="${OUTPUT_DIR}/nuclei_jobs.json"
+            ENRICH_ARGS=(--output "${NUCLEI_JOBS}")
+            [[ -f "${HTTPX_JSONL}" ]] && ENRICH_ARGS+=(--httpx "${HTTPX_JSONL}")
+            [[ -f "${NERVA_JSONL}" ]] && ENRICH_ARGS+=(--nerva "${NERVA_JSONL}")
+            [[ -f "${TLS_JSONL}" ]]   && ENRICH_ARGS+=(--tls "${TLS_JSONL}")
+            [[ -f "${PORTS_JSONL}" ]] && ENRICH_ARGS+=(--ports "${PORTS_JSONL}")
+
+            python3 "${SCRIPT_DIR}/scripts/enrich_nuclei.py" "${ENRICH_ARGS[@]}" 2>>"${SCAN_LOG}" || \
+                log "WARN: nuclei enrichment failed — skipping pass 2"
+
+            if [[ -f "${NUCLEI_JOBS}" ]]; then
+                JOB_COUNT=$(jq '. | length' "${NUCLEI_JOBS}")
+                if [[ "${JOB_COUNT}" -gt 0 ]]; then
+                    log "Nuclei pass 2 (targeted): ${JOB_COUNT} technology-specific jobs"
+
+                    for (( i=0; i<JOB_COUNT; i++ )); do
+                        JOB_LABEL=$(jq -r ".[$i].label" "${NUCLEI_JOBS}")
+                        JOB_TAGS=$(jq -r ".[$i].tags" "${NUCLEI_JOBS}")
+                        TARGETS_FILE="${OUTPUT_DIR}/nuclei_targets_${i}.txt"
+                        PASS2_OUT="${OUTPUT_DIR}/nuclei_pass2_${i}.jsonl"
+
+                        jq -r ".[$i].targets[]" "${NUCLEI_JOBS}" > "${TARGETS_FILE}"
+                        TARGET_COUNT=$(count_lines "${TARGETS_FILE}")
+                        log "  ${JOB_LABEL}: ${TARGET_COUNT} targets [tags=${JOB_TAGS}]"
+
+                        nuclei \
+                            -config "${NUCLEI_CONFIG}" \
+                            -l "${TARGETS_FILE}" \
+                            -tags "${JOB_TAGS}" \
+                            -H "User-Agent: ${USER_AGENT}" \
+                            -o "${PASS2_OUT}" 2>>"${SCAN_LOG}" || \
+                            log "WARN: nuclei ${JOB_LABEL} had errors"
+
+                        if [[ -f "${PASS2_OUT}" ]] && [[ $(count_lines "${PASS2_OUT}") -gt 0 ]]; then
+                            cat "${PASS2_OUT}" >> "${NUCLEI_JSONL}"
+                            log "  ${JOB_LABEL}: $(count_lines "${PASS2_OUT}") findings"
+                        fi
+
+                        rm -f "${TARGETS_FILE}" "${PASS2_OUT}"
+                    done
+                fi
+                rm -f "${NUCLEI_JOBS}"
+            fi
 
             log "Nuclei complete | findings=$(count_lines "${NUCLEI_JSONL}") elapsed=$(elapsed ${stage_start})s"
         fi
@@ -529,6 +675,8 @@ if should_run "normalize"; then
     [[ -f "${NUCLEI_JSONL}" ]] && NORMALIZE_ARGS+=(--nuclei "${NUCLEI_JSONL}")
     [[ -f "${SUBZY_JSON}" ]]  && NORMALIZE_ARGS+=(--subzy "${SUBZY_JSON}")
     [[ -f "${CMDB_EXPORT}" ]] && NORMALIZE_ARGS+=(--cmdb "${CMDB_EXPORT}")
+    [[ -f "${ASN_JSONL}" ]]   && NORMALIZE_ARGS+=(--asn "${ASN_JSONL}")
+    [[ -f "${RDNS_JSONL}" ]]  && NORMALIZE_ARGS+=(--rdns "${RDNS_JSONL}")
 
     # Collect all zgrab files
     for zgf in "${ZGRAB_DIR}"/zgrab_*.jsonl; do
@@ -630,3 +778,20 @@ log "  Screenshots:  $(find "${SCREENSHOT_DIR}" -name '*.png' 2>/dev/null | wc -
 log "  DuckDB:       ${DUCKDB_PATH}"
 log "  Log:          ${SCAN_LOG}"
 log "=========================================="
+
+# ===========================================================================
+# Move intermediate outputs into the scan archive and clean data/output/
+# Skipped for --stage / --from (resume runs leave files in place).
+# ===========================================================================
+if [[ -z "${STAGE_FILTER}" ]] && [[ -z "${FROM_STAGE}" ]]; then
+    log "Archiving scan outputs: ${SCAN_ID}"
+    python3 "${SCRIPT_DIR}/scripts/archive_scan.py" \
+        --archive-raw \
+        --scan-id "${SCAN_ID}" \
+        --output-dir "${OUTPUT_DIR}" \
+        --screenshot-dir "${SCREENSHOT_DIR}" \
+        --log-file "${SCAN_LOG}" \
+        --archive-dir "${SCRIPT_DIR}/data/archives" \
+        --status "completed" 2>>"${SCAN_LOG}" || \
+        log "WARN: Archive failed — outputs remain in ${OUTPUT_DIR}"
+fi

@@ -1,8 +1,24 @@
-# Place your subdomain list here, one per line.
-# Example:
-# portal.example.com
-# api.example.com
-# mail.example.com
-# vpn.example.com
-# dev.example.com
-# staging.example.com
+www.lab.crimelab.dev
+wp.lab.crimelab.dev
+dvwa.lab.crimelab.dev
+juice.lab.crimelab.dev
+jenkins.lab.crimelab.dev
+phpmyadmin.lab.crimelab.dev
+shadow.lab.crimelab.dev
+tls-expired.lab.crimelab.dev
+tls-selfsigned.lab.crimelab.dev
+tls-weakcipher.lab.crimelab.dev
+ssh-old.lab.crimelab.dev
+ssh-new.lab.crimelab.dev
+ftp.lab.crimelab.dev
+smtp.lab.crimelab.dev
+mysql.lab.crimelab.dev
+postgres.lab.crimelab.dev
+redis.lab.crimelab.dev
+elastic.lab.crimelab.dev
+mongo.lab.crimelab.dev
+snmp.lab.crimelab.dev
+takeover-s3.lab.crimelab.dev
+takeover-pages.lab.crimelab.dev
+takeover-heroku.lab.crimelab.dev
+cdn.lab.crimelab.dev
