@@ -64,6 +64,11 @@ def create_views(con: duckdb.DuckDBPyConnection):
             dns.a AS ips,
             dns.cname_chain AS cnames,
             network.cdn AS cdn,
+            network.cdn_detection.provider AS cdn_provider,
+            network.cdn_detection.confidence AS cdn_confidence,
+            network.shared_hosting.detected AS shared_hosting_detected,
+            network.shared_hosting.confidence AS shared_hosting_confidence,
+            network.shared_hosting.cohosted_count AS cohosted_count,
             network.asn.org AS asn_org,
             network.asn.number AS asn_number,
             len(network.open_ports) AS port_count,
@@ -72,8 +77,8 @@ def create_views(con: duckdb.DuckDBPyConnection):
             len(findings) AS finding_count,
             len(services) AS service_count,
             cmdb.in_cmdb AS in_cmdb,
-            json_extract_string(cmdb.gap_type, '$') AS gap_type,
-            json_extract_string(cmdb.matched_ci, '$') AS ci_id
+            cmdb.gap_type AS gap_type,
+            cmdb.matched_ci AS ci_id
         FROM assets
     """)
 
@@ -81,8 +86,8 @@ def create_views(con: duckdb.DuckDBPyConnection):
         CREATE OR REPLACE VIEW v_cmdb_gaps AS
         SELECT
             fqdn,
-            json_extract_string(cmdb.gap_type, '$') AS gap_type,
-            json_extract_string(cmdb.matched_ci, '$') AS ci_id,
+            cmdb.gap_type AS gap_type,
+            cmdb.matched_ci AS ci_id,
             cmdb.match_basis AS match_basis,
             dns.a AS ips,
             network.cdn AS cdn,
@@ -91,7 +96,7 @@ def create_views(con: duckdb.DuckDBPyConnection):
         FROM assets
         WHERE cmdb.in_cmdb = false
            OR cmdb.gap_type IS NOT NULL
-        ORDER BY json_extract_string(cmdb.gap_type, '$'), fqdn
+        ORDER BY cmdb.gap_type, fqdn
     """)
 
     # TLS issues: use CTE to unnest tls array, then filter
@@ -136,7 +141,9 @@ def create_views(con: duckdb.DuckDBPyConnection):
             f.name AS finding_name,
             f.severity,
             f.matched_at,
-            f.timestamp AS found_at
+            f.timestamp AS found_at,
+            f.tags AS tags,
+            f.description AS description
         FROM expanded
         ORDER BY
             CASE f.severity
@@ -191,53 +198,113 @@ def create_views(con: duckdb.DuckDBPyConnection):
         ORDER BY p.port, fqdn
     """)
 
-    # Services / fingerprints: CTE unnest
-    con.execute("""
-        CREATE OR REPLACE VIEW v_services AS
-        WITH expanded AS (
-            SELECT fqdn, UNNEST(services) AS s FROM assets WHERE len(services) > 0
-        )
-        SELECT
-            fqdn,
-            s.port,
-            s.protocol,
-            s.transport,
-            s.service,
-            s.status,
-            s.banner,
-            s.fingerprint.vendor    AS fp_vendor,
-            s.fingerprint.product   AS fp_product,
-            s.fingerprint.version   AS fp_version,
-            s.fingerprint.cpe23     AS fp_cpe23,
-            s.fingerprint.os_vendor AS fp_os_vendor,
-            s.fingerprint.os_product AS fp_os_product,
-            s.fingerprint.os_version AS fp_os_version,
-            s.fingerprint.certainty AS fp_certainty,
-            s.fingerprint.source    AS fp_source
-        FROM expanded
-        ORDER BY fqdn, s.port
-    """)
+    # Services / fingerprints: CTE unnest (guard: old archives store services as JSON[])
+    try:
+        con.execute("""
+            CREATE OR REPLACE VIEW v_services AS
+            WITH expanded AS (
+                SELECT fqdn, UNNEST(services) AS s FROM assets WHERE len(services) > 0
+            )
+            SELECT
+                fqdn,
+                s.port,
+                s.protocol,
+                s.transport,
+                s.service,
+                s.status,
+                s.banner,
+                s.fingerprint.vendor    AS fp_vendor,
+                s.fingerprint.product   AS fp_product,
+                s.fingerprint.version   AS fp_version,
+                s.fingerprint.cpe23     AS fp_cpe23,
+                s.fingerprint.os_vendor AS fp_os_vendor,
+                s.fingerprint.os_product AS fp_os_product,
+                s.fingerprint.os_version AS fp_os_version,
+                s.fingerprint.certainty AS fp_certainty,
+                s.fingerprint.source    AS fp_source
+            FROM expanded
+            ORDER BY fqdn, s.port
+        """)
+    except Exception:
+        pass
 
     # Software inventory: unique vendor/product/version combos across the estate
-    con.execute("""
-        CREATE OR REPLACE VIEW v_software_inventory AS
-        WITH expanded AS (
-            SELECT fqdn, UNNEST(services) AS s FROM assets WHERE len(services) > 0
-        )
-        SELECT
-            s.fingerprint.product   AS product,
-            s.fingerprint.vendor    AS vendor,
-            s.fingerprint.version   AS version,
-            s.fingerprint.cpe23     AS cpe23,
-            s.service               AS service_type,
-            COUNT(DISTINCT fqdn)    AS host_count,
-            ROUND(AVG(s.fingerprint.certainty), 2) AS avg_certainty
-        FROM expanded
-        WHERE s.fingerprint.product IS NOT NULL
-          AND s.fingerprint.product != ''
-        GROUP BY product, vendor, version, cpe23, service_type
-        ORDER BY host_count DESC
-    """)
+    try:
+        con.execute("""
+            CREATE OR REPLACE VIEW v_software_inventory AS
+            WITH expanded AS (
+                SELECT fqdn, UNNEST(services) AS s FROM assets WHERE len(services) > 0
+            )
+            SELECT
+                s.fingerprint.product   AS product,
+                s.fingerprint.vendor    AS vendor,
+                s.fingerprint.version   AS version,
+                s.fingerprint.cpe23     AS cpe23,
+                s.service               AS service_type,
+                COUNT(DISTINCT fqdn)    AS host_count,
+                ROUND(AVG(s.fingerprint.certainty), 2) AS avg_certainty
+            FROM expanded
+            WHERE s.fingerprint.product IS NOT NULL
+              AND s.fingerprint.product != ''
+            GROUP BY product, vendor, version, cpe23, service_type
+            ORDER BY host_count DESC
+        """)
+    except Exception:
+        pass
+
+    try:
+        con.execute("""
+            CREATE OR REPLACE VIEW v_reverse_dns AS
+            SELECT
+                fqdn,
+                dns.a AS ips,
+                dns.ptr AS ptr_records
+            FROM assets
+            WHERE dns.ptr IS NOT NULL
+              AND len(dns.ptr) > 0
+            ORDER BY fqdn
+        """)
+    except Exception:
+        pass
+
+    try:
+        con.execute("""
+            CREATE OR REPLACE VIEW v_cdn_analysis AS
+            SELECT
+                fqdn,
+                network.cdn AS cdn,
+                network.cdn_detection.provider AS detected_provider,
+                network.cdn_detection.confidence AS detection_confidence,
+                network.cdn_detection.signals AS detection_signals,
+                dns.cname_chain AS cnames,
+                network.asn.number AS asn_number,
+                network.asn.org AS asn_org,
+                dns.a AS ips
+            FROM assets
+            WHERE network.cdn IS NOT NULL
+               OR network.cdn_detection IS NOT NULL
+            ORDER BY detected_provider, fqdn
+        """)
+    except Exception:
+        pass
+
+    try:
+        con.execute("""
+            CREATE OR REPLACE VIEW v_shared_hosting AS
+            SELECT
+                fqdn,
+                network.shared_hosting.confidence AS confidence,
+                network.shared_hosting.cohosted_count AS cohosted_count,
+                network.shared_hosting.signals AS signals,
+                network.asn.number AS asn_number,
+                network.asn.org AS asn_org,
+                dns.a AS ips
+            FROM assets
+            WHERE network.shared_hosting.detected = true
+            ORDER BY cohosted_count DESC, fqdn
+        """)
+    except Exception:
+        pass
 
     con.execute("""
         CREATE OR REPLACE VIEW v_scan_stats AS
@@ -250,10 +317,10 @@ def create_views(con: duckdb.DuckDBPyConnection):
             SUM(len(findings)) AS total_findings,
             COUNT(*) FILTER (WHERE cmdb.in_cmdb) AS in_cmdb,
             COUNT(*) FILTER (WHERE NOT cmdb.in_cmdb) AS not_in_cmdb,
-            COUNT(*) FILTER (WHERE json_extract_string(cmdb.gap_type, '$') = 'shadow_it') AS shadow_it,
-            COUNT(*) FILTER (WHERE json_extract_string(cmdb.gap_type, '$') = 'stale_ci') AS stale_ci,
+            COUNT(*) FILTER (WHERE trim('"' FROM cmdb.gap_type::VARCHAR) = 'shadow_it') AS shadow_it,
+            COUNT(*) FILTER (WHERE trim('"' FROM cmdb.gap_type::VARCHAR) = 'stale_ci') AS stale_ci,
             ROUND(
-                COUNT(*) FILTER (WHERE json_extract_string(cmdb.gap_type, '$') = 'shadow_it') * 100.0 / NULLIF(COUNT(*), 0),
+                COUNT(*) FILTER (WHERE trim('"' FROM cmdb.gap_type::VARCHAR) = 'shadow_it') * 100.0 / NULLIF(COUNT(*), 0),
                 1
             ) AS shadow_it_pct,
             SUM(len(services)) AS total_services,

@@ -24,6 +24,21 @@ import duckdb
 
 ARCHIVE_DIR_DEFAULT = "data/archives"
 
+INTERMEDIATE_FILES = [
+    "targets.txt",
+    "dns.jsonl",
+    "live_hosts.txt",
+    "ports.jsonl",
+    "web_targets.txt",
+    "httpx.jsonl",
+    "tls.jsonl",
+    "nerva.jsonl",
+    "nuclei.jsonl",
+    "subzy.json",
+    "assets.jsonl",
+    "takeover_verifications.jsonl",
+]
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -80,6 +95,69 @@ def extract_metadata_from_db(db_path: str, scan_id: str) -> dict:
         con.close()
 
     return meta
+
+
+def archive_raw_files(
+    output_dir: str,
+    screenshot_dir: str,
+    log_file: str,
+    scan_id: str,
+    archive_dir: str,
+    status: str = "completed",
+) -> None:
+    """Move intermediate scan files into archives/{scan_id}/raw/ and screenshots/."""
+    out = Path(output_dir)
+    arch = Path(archive_dir) / scan_id
+    arch.mkdir(parents=True, exist_ok=True)
+
+    raw_dir = arch / "raw"
+    raw_dir.mkdir(exist_ok=True)
+
+    for fname in INTERMEDIATE_FILES:
+        src = out / fname
+        dest = raw_dir / fname
+        if src.exists() and not dest.exists():
+            shutil.move(str(src), str(dest))
+
+    zgrab_src = out / "zgrab"
+    if zgrab_src.exists() and any(zgrab_src.iterdir()):
+        zgrab_dest = raw_dir / "zgrab"
+        if not zgrab_dest.exists():
+            shutil.move(str(zgrab_src), str(zgrab_dest))
+    zgrab_src.mkdir(exist_ok=True)
+
+    shots_src = Path(screenshot_dir)
+    if shots_src.exists() and any(shots_src.rglob("*")):
+        arch_shots = arch / "screenshots"
+        if arch_shots.exists():
+            shutil.rmtree(str(arch_shots))
+        shutil.move(str(shots_src), str(arch_shots))
+    shots_src.mkdir(parents=True, exist_ok=True)
+
+    if log_file:
+        log_src = Path(log_file)
+        if log_src.exists():
+            shutil.copy2(str(log_src), str(arch / "scan.log"))
+
+    meta_path = arch / "metadata.json"
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+        except Exception:
+            meta = {"scan_id": scan_id, "results": {}}
+    else:
+        meta = {
+            "scan_id": scan_id,
+            "archived_at": now_iso(),
+            "status": status,
+            "results": {},
+        }
+    meta["raw_archived"] = True
+    meta["raw_archived_at"] = now_iso()
+    meta["status"] = status
+    meta_path.write_text(json.dumps(meta, indent=2, default=str))
+
+    print(f"Raw files archived: {scan_id} → {arch}", file=sys.stderr)
 
 
 def archive_scan(db_path: str, scan_id: str, archive_dir: str,
@@ -203,7 +281,29 @@ def main():
     parser.add_argument("--get", help="Get metadata for a specific scan ID")
     parser.add_argument("--delete", help="Delete a specific archived scan")
     parser.add_argument("--restore", help="Restore archived scan as active DB")
+    # Raw file archiving
+    parser.add_argument("--archive-raw", action="store_true",
+                        help="Move intermediate scan files into the archive folder")
+    parser.add_argument("--output-dir", default="data/output", help="Pipeline output directory")
+    parser.add_argument("--screenshot-dir", default="data/screenshots", help="Screenshots directory")
+    parser.add_argument("--log-file", default="", help="Path to scan log to copy into archive")
+    parser.add_argument("--status", default="completed", choices=["completed", "partial"],
+                        help="Scan status written to metadata.json")
     args = parser.parse_args()
+
+    if args.archive_raw:
+        if not args.scan_id:
+            print("ERROR: --scan-id required for --archive-raw", file=sys.stderr)
+            sys.exit(1)
+        archive_raw_files(
+            output_dir=args.output_dir,
+            screenshot_dir=args.screenshot_dir,
+            log_file=args.log_file,
+            scan_id=args.scan_id,
+            archive_dir=args.archive_dir,
+            status=args.status,
+        )
+        return
 
     if args.list:
         archives = list_archives(args.archive_dir)

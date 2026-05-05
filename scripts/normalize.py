@@ -84,6 +84,31 @@ def read_cmdb_csv(path: str) -> dict[str, dict]:
     return result
 
 
+# Shared hosting detection: known provider ASNs
+_HOSTING_ASNS: dict[int, str] = {
+    26496: "godaddy",
+    46606: "unified_layer",   # Bluehost, HostGator
+    26347: "dreamhost",
+    64476: "siteground",
+    55293: "a2hosting",
+    46475: "inmotionhosting",
+    6315:  "wpengine",
+    22244: "namecheap",
+    19871: "networksolutions",
+    36351: "softlayer",       # IBM Cloud shared
+}
+
+# Shared hosting detection: (header_name, regex_pattern, provider)
+_HOSTING_HEADERS: list[tuple[str, str, str]] = [
+    ("x-powered-by",    r"(?i)cpanel",     "cpanel"),
+    ("server",          r"(?i)litespeed",  "litespeed"),
+    ("x-hacker",        r".",              "wordpress_com"),
+    ("x-kinsta-cache",  r".",              "kinsta"),
+    ("x-wpe-nonce",     r".",              "wpengine"),
+    ("x-pantheon-styx", r".",              "pantheon"),
+]
+
+
 class AssetStore:
     """Accumulates data per FQDN and builds unified asset records."""
 
@@ -112,10 +137,13 @@ class AssetStore:
                     "mx": [],
                     "txt": [],
                     "wildcard": False,
+                    "ptr": [],
                 },
                 "network": {
                     "asn": {"number": None, "org": None, "country": None},
                     "cdn": None,
+                    "cdn_detection": None,
+                    "shared_hosting": None,
                     "open_ports": [],
                 },
                 "web": [],
@@ -184,6 +212,159 @@ class AssetStore:
             for txt in _as_list(rec.get("txt")):
                 if txt and txt not in dns["txt"]:
                     dns["txt"].append(txt)
+
+    # --- ASN ---
+    def ingest_asn(self, records: list[dict]):
+        """Ingest ASN enrichment JSONL. Maps IPs to existing FQDN assets."""
+        ip_to_asn: dict[str, dict] = {}
+        for rec in records:
+            ip = rec.get("ip", "")
+            if ip and rec.get("asn"):
+                ip_to_asn[ip] = rec
+
+        # Enrich existing assets that have resolved IPs
+        for fqdn, asset in self.assets.items():
+            if asset["network"]["asn"]["number"]:
+                continue  # already enriched (e.g. from httpx)
+            for ip in asset["dns"]["a"]:
+                if ip in ip_to_asn:
+                    asn_rec = ip_to_asn[ip]
+                    asset["network"]["asn"] = {
+                        "number": asn_rec["asn"],
+                        "org": asn_rec.get("org", ""),
+                        "country": None,
+                    }
+                    self._add_source(asset, "pyasn")
+                    break
+
+        # Create asset records for standalone IPs (those not behind any FQDN)
+        fqdn_ips: set[str] = set()
+        for asset in self.assets.values():
+            fqdn_ips.update(asset["dns"]["a"])
+
+        for ip, asn_rec in ip_to_asn.items():
+            if ip not in fqdn_ips:
+                asset = self._ensure(ip)
+                if asset:
+                    asset["dns"]["a"] = [ip]
+                    asset["network"]["asn"] = {
+                        "number": asn_rec["asn"],
+                        "org": asn_rec.get("org", ""),
+                        "country": None,
+                    }
+                    self._add_source(asset, "pyasn")
+                    self._add_tag(asset, "ip_only")
+
+    # --- Reverse DNS ---
+    def ingest_rdns(self, records: list[dict]):
+        """Ingest reverse DNS (PTR) records. Maps IPs back to FQDN assets."""
+        ip_to_ptr: dict[str, list[str]] = {}
+        for rec in records:
+            host = rec.get("host", "")  # IP that was queried
+            ptrs = _as_list(rec.get("ptr"))
+            if host and ptrs:
+                ip_to_ptr[host] = [p.rstrip(".").lower() for p in ptrs if p]
+
+        for fqdn, asset in self.assets.items():
+            for ip in asset["dns"]["a"]:
+                if ip in ip_to_ptr:
+                    asset["dns"]["ptr"].append({"ip": ip, "ptrs": ip_to_ptr[ip]})
+                    self._add_source(asset, "rdns")
+
+    # --- CDN ---
+    def enrich_cdn(self):
+        """Run multi-signal CDN detection on all assets."""
+        from detect_cdn import CDNDetector
+        detector = CDNDetector()
+
+        for fqdn, asset in self.assets.items():
+            existing_cdn = asset["network"].get("cdn")
+            result = detector.detect(asset)
+            if result:
+                if not existing_cdn or existing_cdn in ("true", "True", True):
+                    asset["network"]["cdn"] = result["provider"]
+                asset["network"]["cdn_detection"] = {
+                    "provider": result["provider"],
+                    "confidence": result["confidence"],
+                    "signals": result["signals"],
+                }
+                self._add_tag(asset, "cdn")
+            elif not existing_cdn:
+                asset["network"]["cdn"] = None
+                asset["network"]["cdn_detection"] = None
+
+    # --- Shared hosting ---
+    def enrich_shared_hosting(self):
+        """Detect shared hosting via IP density, ASN, HTTP headers, and TLS SAN signals."""
+        # Build ip → [fqdns] map, skipping CDN assets (CDN IPs are not shared hosting)
+        ip_to_fqdns: dict[str, list[str]] = {}
+        for fqdn, asset in self.assets.items():
+            if asset["network"].get("cdn"):
+                continue
+            for ip in asset["dns"]["a"]:
+                ip_to_fqdns.setdefault(ip, []).append(fqdn)
+
+        def _reg(fqdn: str) -> str:
+            parts = fqdn.rstrip(".").split(".")
+            return ".".join(parts[-2:]) if len(parts) >= 2 else fqdn
+
+        for fqdn, asset in self.assets.items():
+            # CDN assets are not shared hosting
+            if asset["network"].get("cdn"):
+                asset["network"]["shared_hosting"] = None
+                continue
+
+            signals: list[str] = []
+
+            # Signal 1: IP density — count peers from different registrable domains
+            self_reg = _reg(fqdn)
+            best_count = 0
+            for ip in asset["dns"]["a"]:
+                cross = [f for f in ip_to_fqdns.get(ip, []) if f != fqdn and _reg(f) != self_reg]
+                if len(cross) > best_count:
+                    best_count = len(cross)
+            if best_count >= 1:
+                signals.append(f"ip_density:{best_count}")
+
+            # Signal 2: known shared-hosting ASN
+            asn_num = asset["network"]["asn"].get("number")
+            if asn_num is not None:
+                provider = _HOSTING_ASNS.get(int(asn_num))
+                if provider:
+                    signals.append(f"asn:{provider}")
+
+            # Signal 3: HTTP response headers fingerprinting hosting panels
+            seen: set[str] = set()
+            for web_entry in asset["web"]:
+                headers = web_entry.get("headers_of_interest", {})
+                for hdr, pattern, provider in _HOSTING_HEADERS:
+                    val = headers.get(hdr, "")
+                    if val and re.search(pattern, val) and provider not in seen:
+                        seen.add(provider)
+                        signals.append(f"header:{provider}")
+
+            # Signal 4: TLS cert covering 3+ distinct registrable domains (shared cert)
+            for tls_entry in asset["tls"]:
+                registrable: set[str] = set()
+                for san in tls_entry.get("sans", []):
+                    parts = san.lstrip("*.").rstrip(".").split(".")
+                    if len(parts) >= 2:
+                        registrable.add(".".join(parts[-2:]))
+                if len(registrable) >= 3:
+                    signals.append(f"tls_san:{len(registrable)}")
+                    break
+
+            if signals:
+                signal_types = {s.split(":")[0] for s in signals}
+                asset["network"]["shared_hosting"] = {
+                    "detected": True,
+                    "confidence": round(min(1.0, len(signal_types) * 0.35), 2),
+                    "cohosted_count": best_count,
+                    "signals": signals,
+                }
+                self._add_tag(asset, "shared_hosting")
+            else:
+                asset["network"]["shared_hosting"] = None
 
     # --- Ports ---
     def ingest_ports(self, records: list[dict]):
@@ -738,6 +919,29 @@ def _extract_headers(rec: dict) -> dict:
         "x-xss-protection",
         "access-control-allow-origin",
         "set-cookie",
+        # CDN detection headers
+        "cf-ray",
+        "cf-cache-status",
+        "x-amz-cf-id",
+        "x-amz-cf-pop",
+        "x-akamai-transformed",
+        "x-akamai-request-id",
+        "x-served-by",
+        "x-fastly-request-id",
+        "x-azure-ref",
+        "x-msedge-ref",
+        "x-sucuri-id",
+        "x-sucuri-cache",
+        "x-cdn",
+        "x-iinfo",
+        "x-nf-request-id",
+        "x-vercel-id",
+        # Shared hosting fingerprints
+        "server",
+        "x-hacker",
+        "x-kinsta-cache",
+        "x-wpe-nonce",
+        "x-pantheon-styx",
     ]
     for h in interesting:
         val = raw_headers.get(h)
@@ -834,6 +1038,8 @@ def _extract_os_hints(banner: str) -> tuple[str, str, str]:
 def main():
     parser = argparse.ArgumentParser(description="EASM Asset Normalizer")
     parser.add_argument("--dns", help="dnsx JSONL output")
+    parser.add_argument("--asn", help="enrich_asn JSONL output")
+    parser.add_argument("--rdns", help="dnsx PTR JSONL output")
     parser.add_argument("--ports", help="naabu JSONL output")
     parser.add_argument("--http", help="httpx JSONL output")
     parser.add_argument("--tls", help="tlsx JSONL output")
@@ -852,6 +1058,14 @@ def main():
     if args.dns:
         print(f"Ingesting DNS: {args.dns}", file=sys.stderr)
         store.ingest_dns(read_jsonl(args.dns))
+
+    if args.asn:
+        print(f"Ingesting ASN: {args.asn}", file=sys.stderr)
+        store.ingest_asn(read_jsonl(args.asn))
+
+    if args.rdns:
+        print(f"Ingesting rDNS: {args.rdns}", file=sys.stderr)
+        store.ingest_rdns(read_jsonl(args.rdns))
 
     if args.ports:
         print(f"Ingesting ports: {args.ports}", file=sys.stderr)
@@ -883,6 +1097,15 @@ def main():
         print(f"Ingesting subzy: {args.subzy}", file=sys.stderr)
         data = read_json_file(args.subzy)
         store.ingest_subzy(data)
+
+    # CDN enrichment (multi-signal, runs after all data sources ingested)
+    try:
+        store.enrich_cdn()
+    except ImportError:
+        print("WARN: detect_cdn module not found — skipping CDN enrichment", file=sys.stderr)
+
+    # Shared hosting detection (runs after CDN so CDN assets are excluded)
+    store.enrich_shared_hosting()
 
     # CMDB reconciliation
     if args.cmdb:

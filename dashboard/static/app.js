@@ -162,6 +162,8 @@ const ICONS = {
     filter: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" class="w-4 h-4"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>',
     server: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" class="w-12 h-12 text-slate-600"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><circle cx="6" cy="6" r="1"/><circle cx="6" cy="18" r="1"/></svg>',
     services: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5"><rect x="5" y="5" width="14" height="14" rx="1"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="2" x2="9" y2="5"/><line x1="15" y1="2" x2="15" y2="5"/><line x1="9" y1="19" x2="9" y2="22"/><line x1="15" y1="19" x2="15" y2="22"/><line x1="2" y1="9" x2="5" y2="9"/><line x1="2" y1="15" x2="5" y2="15"/><line x1="19" y1="9" x2="22" y2="9"/><line x1="19" y1="15" x2="22" y2="15"/></svg>',
+    eye: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class="w-3.5 h-3.5"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>',
+    upload: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class="w-3.5 h-3.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>',
 };
 
 // ---------------------------------------------------------------------------
@@ -197,14 +199,22 @@ async function api(endpoint, params = {}) {
 // Router
 // ---------------------------------------------------------------------------
 function navigateTo(page, params = {}) {
-    const hash = params.id ? `#/${page}/${encodeURIComponent(params.id)}` : `#/${page}`;
+    let hash = `#/${page}`;
+    if (params.id)  hash += `/${encodeURIComponent(params.id)}`;
+    if (params.id2) hash += `/${encodeURIComponent(params.id2)}`;
     window.location.hash = hash;
 }
 
 function parseHash() {
     const hash = window.location.hash.slice(1) || '/overview';
     const parts = hash.split('/').filter(Boolean);
-    return { page: parts[0] || 'overview', params: { id: parts[1] ? decodeURIComponent(parts[1]) : null } };
+    return {
+        page: parts[0] || 'overview',
+        params: {
+            id:  parts[1] ? decodeURIComponent(parts[1]) : null,
+            id2: parts[2] ? decodeURIComponent(parts[2]) : null,
+        },
+    };
 }
 
 function initRouter() {
@@ -410,6 +420,8 @@ async function renderCurrentPage() {
             case 'network': await pageNetwork(content); break;
             case 'takeovers': await pageTakeovers(content); break;
             case 'services': await pageServices(content); break;
+            case 'archive': await pageArchive(content, state.pageParams.id); break;
+            case 'compare': await pageCompare(content, state.pageParams.id, state.pageParams.id2); break;
             default: await pageOverview(content); break;
         }
     } catch (e) {
@@ -1123,12 +1135,16 @@ async function pageAssetDetail(el, fqdn) {
 // ---------------------------------------------------------------------------
 // Page: Findings
 // ---------------------------------------------------------------------------
-let findingState = { severity: '', source: '', search: '' };
+let findingState = { severity: '', source: '', search: '', tag: '' };
 
 async function pageFindings(el) {
-    const data = await api('/findings', findingState);
+    const [data, tagData] = await Promise.all([
+        api('/findings', findingState),
+        api('/findings/tags'),
+    ]);
     const items = data.items || [];
     const summary = data.summary || [];
+    const tags = (tagData.tags || []).slice(0, 30);
 
     el.innerHTML = `
         <div class="flex items-center justify-between mb-6">
@@ -1148,6 +1164,21 @@ async function pageFindings(el) {
                 </button>
             `).join('')}
         </div>
+
+        <!-- Tag Filter Pills -->
+        ${tags.length ? `
+            <div class="flex flex-wrap gap-2 mb-4">
+                <span class="text-xs text-slate-500 self-center mr-1">Tags:</span>
+                ${tags.map(t => `
+                    <button onclick="filterFindings('tag', '${t.tag === findingState.tag ? '' : esc(t.tag)}')"
+                            class="px-2.5 py-1 rounded-full text-xs font-medium transition-all ${t.tag === findingState.tag
+                                ? 'bg-accent text-white'
+                                : 'bg-slate-800 text-slate-400 hover:bg-slate-700'}">
+                        ${esc(t.tag)} <span class="opacity-60">${t.count}</span>
+                    </button>
+                `).join('')}
+            </div>
+        ` : ''}
 
         <!-- Filters -->
         <div class="flex flex-wrap items-center gap-3 mb-4">
@@ -1177,21 +1208,25 @@ async function pageFindings(el) {
                             <th>FQDN</th>
                             <th>Finding</th>
                             <th>Template ID</th>
+                            <th>Tags</th>
                             <th>Source</th>
                             <th>Matched At</th>
                         </tr>
                     </thead>
                     <tbody>
-                        ${items.length ? items.map(f => `
+                        ${items.length ? items.map(f => {
+                            const fTags = (f.tags || []).filter(Boolean);
+                            return `
                             <tr class="clickable" onclick="navigateTo('detail', {id: '${esc(f.fqdn)}'})">
                                 <td>${severityBadge(f.severity)}</td>
                                 <td class="font-mono text-xs text-accent">${esc(f.fqdn)}</td>
                                 <td>${esc(f.finding_name)}</td>
                                 <td class="font-mono text-xs text-slate-500">${esc(f.template_id)}</td>
+                                <td class="text-xs">${fTags.length ? fTags.map(t => `<span class="inline-block bg-slate-800 text-slate-300 rounded px-1.5 py-0.5 mr-1 mb-0.5">${esc(t)}</span>`).join('') : '<span class="text-slate-600">-</span>'}</td>
                                 <td class="text-xs text-slate-400">${esc(f.finding_source)}</td>
                                 <td class="text-xs text-slate-400 max-w-[200px] truncate">${esc(f.matched_at)}</td>
-                            </tr>
-                        `).join('') : `<tr><td colspan="6">${renderEmptyState('No findings', 'Adjust filters or run the pipeline')}</td></tr>`}
+                            </tr>`;
+                        }).join('') : `<tr><td colspan="7">${renderEmptyState('No findings', 'Adjust filters or run the pipeline')}</td></tr>`}
                     </tbody>
                 </table>
             </div>
@@ -2633,6 +2668,28 @@ async function pageScans(el) {
                         `).join('')}
                     </div>
                 </div>
+
+                <!-- Import Scan -->
+                <div class="card p-4">
+                    <h4 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-1.5">
+                        ${ICONS.upload} Import Scan
+                    </h4>
+                    <p class="text-xs text-slate-500 mb-3">Load an archived <code class="text-slate-300">.duckdb</code> or <code class="text-slate-300">.parquet</code> file into the scan history.</p>
+                    <div class="space-y-2">
+                        <input id="import-scan-id" type="text" placeholder="Scan ID (YYYYMMDD_HHMMSS) — optional"
+                               class="w-full text-xs bg-[#0a0e1a] border border-slate-700 rounded px-2 py-1.5 text-slate-300 placeholder-slate-600 focus:outline-none focus:border-accent" />
+                        <input id="import-notes" type="text" placeholder="Notes — optional"
+                               class="w-full text-xs bg-[#0a0e1a] border border-slate-700 rounded px-2 py-1.5 text-slate-300 placeholder-slate-600 focus:outline-none focus:border-accent" />
+                        <label class="block">
+                            <input id="import-file" type="file" accept=".duckdb,.parquet" class="hidden" onchange="importScan()" />
+                            <span onclick="document.getElementById('import-file').click()"
+                                  class="btn-secondary text-xs py-1.5 px-3 w-full text-center cursor-pointer flex items-center justify-center gap-1.5">
+                                ${ICONS.upload} Choose File &amp; Import
+                            </span>
+                        </label>
+                        <div id="import-status" class="text-xs text-slate-500 hidden"></div>
+                    </div>
+                </div>
             </div>
 
             <!-- Right: Scan History -->
@@ -2777,6 +2834,14 @@ function _renderArchiveCard(archive, isLatest) {
                     </div>
                 </div>
                 <div class="flex items-center gap-1">
+                    <button onclick="navigateTo('archive', {id: '${esc(archive.scan_id)}'})"
+                            class="btn-secondary text-xs py-1 px-2" title="Browse this archive">
+                        ${ICONS.eye} View
+                    </button>
+                    <button onclick="exportScan('${esc(archive.scan_id)}')"
+                            class="btn-secondary text-xs py-1 px-2" title="Export as Parquet">
+                        ${ICONS.download} Export
+                    </button>
                     <button onclick="restoreArchive('${esc(archive.scan_id)}')"
                             class="btn-secondary text-xs py-1 px-2" title="Restore this scan as active">
                         ${ICONS.restore} Restore
@@ -2944,6 +3009,50 @@ window.deleteArchive = async function(scanId) {
     }
 };
 
+window.exportScan = function(scanId) {
+    window.location.href = `/api/scans/${scanId}/export`;
+};
+
+window.importScan = async function() {
+    const fileInput = document.getElementById('import-file');
+    const statusEl = document.getElementById('import-status');
+    const file = fileInput?.files?.[0];
+    if (!file) return;
+
+    const scanIdVal = document.getElementById('import-scan-id')?.value.trim() || '';
+    const notesVal  = document.getElementById('import-notes')?.value.trim() || '';
+
+    if (statusEl) {
+        statusEl.textContent = 'Uploading…';
+        statusEl.className = 'text-xs text-slate-400';
+        statusEl.classList.remove('hidden');
+    }
+
+    const form = new FormData();
+    form.append('file', file);
+    if (scanIdVal) form.append('scan_id', scanIdVal);
+    if (notesVal)  form.append('notes', notesVal);
+
+    try {
+        const res = await fetch('/api/scans/import', { method: 'POST', body: form });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Import failed');
+
+        if (statusEl) {
+            statusEl.textContent = `Imported as ${data.scan_id} (${data.stats?.total_assets ?? '?'} assets)`;
+            statusEl.className = 'text-xs text-green-400';
+        }
+        fileInput.value = '';
+        const el = document.getElementById('page-content');
+        if (el) setTimeout(() => pageScans(el), 800);
+    } catch (e) {
+        if (statusEl) {
+            statusEl.textContent = 'Error: ' + e.message;
+            statusEl.className = 'text-xs text-red-400';
+        }
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Pagination
 // ---------------------------------------------------------------------------
@@ -2967,6 +3076,702 @@ function renderPagination(current, total, prefix) {
         </div>
     `;
 }
+
+// ---------------------------------------------------------------------------
+// Page: Archive Viewer
+// ---------------------------------------------------------------------------
+let _archiveTabState = { page: 1, severity: '' };
+
+async function pageArchive(el, scanId) {
+    if (!scanId) { navigateTo('scans'); return; }
+
+    const [meta, data] = await Promise.all([
+        api(`/scans/${encodeURIComponent(scanId)}`),
+        api(`/scans/${encodeURIComponent(scanId)}/overview`),
+    ]);
+
+    _archiveTabState = { page: 1, severity: '' };
+
+    const s = data.scan || {};
+    const sev = data.severity_map || {};
+    const tls = data.tls_health || {};
+    const totalAssets = s.total_assets || 0;
+    const shadowIt = s.shadow_it || 0;
+    const coveragePct = totalAssets > 0 ? ((s.in_cmdb || 0) / totalAssets * 100) : 0;
+
+    el.innerHTML = `
+        <div class="mb-5 flex items-center gap-3 px-4 py-3 rounded-xl border border-amber-500/30 bg-amber-500/5">
+            <span class="text-amber-400 shrink-0">${ICONS.archive}</span>
+            <div class="flex-1 min-w-0">
+                <span class="text-sm font-semibold text-amber-300">Archived Scan</span>
+                <span class="font-mono text-xs text-slate-300 ml-2">${esc(scanId)}</span>
+                ${meta.archived_at ? `<span class="text-xs text-slate-500 ml-2">— archived ${fmtDate(meta.archived_at)}</span>` : ''}
+            </div>
+            <div class="flex items-center gap-2 shrink-0">
+                <button onclick="exportScan('${esc(scanId)}')" class="btn-secondary text-xs py-1 px-3 flex items-center gap-1.5">
+                    ${ICONS.download} Export
+                </button>
+                <a href="#/compare/${esc(scanId)}" class="btn-secondary text-xs py-1 px-3">
+                    Compare
+                </a>
+                <a href="#/scans" class="btn-secondary text-xs py-1 px-3 flex items-center gap-1.5">
+                    ${ICONS.arrowLeft} Back
+                </a>
+            </div>
+        </div>
+
+        <div class="flex items-center justify-between mb-6">
+            <div>
+                <h1 class="text-2xl font-bold text-white">Attack Surface Overview</h1>
+                <p class="text-sm text-slate-500 mt-1">
+                    Scan: ${esc(s.scan_id || scanId)}
+                    <span class="text-amber-500/70 ml-1">(read-only)</span>
+                </p>
+            </div>
+            <div class="flex items-center gap-3">
+                <div class="text-right">
+                    <div class="text-xs text-slate-500">Risk Score</div>
+                    <div class="text-2xl font-bold ${riskColor(data.risk_score)}">${data.risk_score}</div>
+                </div>
+                ${renderRiskGauge(data.risk_score)}
+            </div>
+        </div>
+
+        <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-4 mb-6">
+            ${kpiCard('Total Assets', totalAssets, 'Discovered FQDNs', 'cyan', 'arc-total')}
+            ${kpiCard('Web Assets', s.web_assets, 'HTTP/HTTPS services', 'blue', 'arc-web')}
+            ${kpiCard('Shadow IT', shadowIt, totalAssets ? fmtPct(shadowIt / totalAssets * 100) + ' of total' : '', 'red', 'arc-shadow')}
+            ${kpiCard('Findings', s.total_findings, (sev.critical || 0) + ' critical', 'orange', 'arc-findings')}
+            ${kpiCard('TLS Issues', tls.issues_total, (tls.expired || 0) + ' expired', 'yellow', 'arc-tls')}
+            ${kpiCard('CMDB Coverage', fmtPct(coveragePct), (s.in_cmdb || 0) + ' matched', 'green', 'arc-coverage', true)}
+            ${kpiCard('Services', s.total_services, (s.assets_with_services || 0) + ' hosts', 'purple', 'arc-services')}
+        </div>
+
+        <div class="flex items-center gap-0 mb-5 border-b border-surface-border">
+            ${['overview', 'assets', 'findings', 'tls', 'takeovers'].map((tab, i) => `
+                <button class="archive-tab px-4 py-2.5 text-sm font-medium transition-colors border-b-2 -mb-px
+                    ${i === 0 ? 'text-white border-accent' : 'text-slate-500 border-transparent hover:text-slate-300 hover:border-slate-600'}"
+                    data-tab="${tab}"
+                    onclick="setArchiveTab('${esc(scanId)}', '${tab}')">
+                    ${capitalize(tab)}
+                </button>
+            `).join('')}
+        </div>
+
+        <div id="archive-tab-content"></div>
+    `;
+
+    requestAnimationFrame(() => {
+        document.querySelectorAll('[data-counter]').forEach(el => {
+            const val = parseFloat(el.getAttribute('data-counter'));
+            if (!isNaN(val)) animateCounter(el, val);
+        });
+    });
+
+    const tabContent = document.getElementById('archive-tab-content');
+    if (tabContent) _renderArchiveOverviewTab(tabContent, data);
+}
+
+function _renderArchiveOverviewTab(el, data) {
+    el.innerHTML = `
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
+            <div class="card p-5">
+                <h3 class="text-sm font-semibold text-slate-300 mb-4">Findings by Severity</h3>
+                <div class="chart-container" style="height: 240px;"><canvas id="arc-chart-severity"></canvas></div>
+            </div>
+            <div class="card p-5">
+                <h3 class="text-sm font-semibold text-slate-300 mb-4">CMDB Coverage</h3>
+                <div class="chart-container" style="height: 240px;"><canvas id="arc-chart-cmdb"></canvas></div>
+            </div>
+        </div>
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div class="card p-5">
+                <h3 class="text-sm font-semibold text-slate-300 mb-4">Top Technologies</h3>
+                <div class="chart-container" style="height: 280px;"><canvas id="arc-chart-tech"></canvas></div>
+            </div>
+            <div class="card p-5">
+                <h3 class="text-sm font-semibold text-slate-300 mb-4">Port Distribution</h3>
+                <div class="chart-container" style="height: 280px;"><canvas id="arc-chart-ports"></canvas></div>
+            </div>
+        </div>
+    `;
+    initArchiveOverviewCharts(data);
+}
+
+function initArchiveOverviewCharts(data) {
+    const sev = data.findings_by_severity || [];
+    if (sev.length) {
+        createChart('arc-chart-severity', {
+            type: 'doughnut',
+            data: {
+                labels: sev.map(s => capitalize(s.severity)),
+                datasets: [{ data: sev.map(s => s.count), backgroundColor: sev.map(s => SEVERITY_COLORS[s.severity] || '#6b7280'), borderWidth: 0, hoverOffset: 6 }],
+            },
+            options: { ...CHART_DEFAULTS, cutout: '65%', plugins: { ...CHART_DEFAULTS.plugins, legend: { ...CHART_DEFAULTS.plugins.legend, position: 'right' } } },
+        });
+    }
+    const scan = data.scan || {};
+    const inCmdb = scan.in_cmdb || 0, shadowItV = scan.shadow_it || 0, staleCi = scan.stale_ci || 0;
+    const other = Math.max(0, (scan.not_in_cmdb || 0) - shadowItV);
+    if (inCmdb || shadowItV || staleCi || other) {
+        createChart('arc-chart-cmdb', {
+            type: 'doughnut',
+            data: {
+                labels: ['In CMDB', 'Shadow IT', 'Stale CI', 'Other Gaps'],
+                datasets: [{ data: [inCmdb, shadowItV, staleCi, other], backgroundColor: ['#10b981', '#ef4444', '#eab308', '#f97316'], borderWidth: 0, hoverOffset: 6 }],
+            },
+            options: { ...CHART_DEFAULTS, cutout: '65%', plugins: { ...CHART_DEFAULTS.plugins, legend: { ...CHART_DEFAULTS.plugins.legend, position: 'right' } } },
+        });
+    }
+    const tech = data.top_technologies || [];
+    if (tech.length) {
+        createChart('arc-chart-tech', {
+            type: 'bar',
+            data: { labels: tech.map(t => t.name), datasets: [{ data: tech.map(t => t.count), backgroundColor: 'rgba(6,182,212,0.6)', borderColor: '#06b6d4', borderWidth: 1, borderRadius: 4, barThickness: 18 }] },
+            options: { ...CHART_DEFAULTS, indexAxis: 'y', plugins: { ...CHART_DEFAULTS.plugins, legend: { display: false } }, scales: { x: { grid: { color: '#1e293b' }, ticks: { color: '#64748b', font: { size: 10 } } }, y: { grid: { display: false }, ticks: { color: '#94a3b8', font: { family: 'Inter', size: 11 } } } } },
+        });
+    }
+    const ports = data.port_distribution || [];
+    if (ports.length) {
+        createChart('arc-chart-ports', {
+            type: 'bar',
+            data: { labels: ports.map(p => ':' + p.port), datasets: [{ data: ports.map(p => p.count), backgroundColor: 'rgba(59,130,246,0.6)', borderColor: '#3b82f6', borderWidth: 1, borderRadius: 4 }] },
+            options: { ...CHART_DEFAULTS, plugins: { ...CHART_DEFAULTS.plugins, legend: { display: false } }, scales: { x: { grid: { display: false }, ticks: { color: '#94a3b8', font: { family: 'JetBrains Mono', size: 10 } } }, y: { grid: { color: '#1e293b' }, ticks: { color: '#64748b', font: { size: 10 } } } } },
+        });
+    }
+}
+
+window.setArchiveTab = async function(scanId, tab, page) {
+    document.querySelectorAll('.archive-tab').forEach(t => {
+        const active = t.dataset.tab === tab;
+        t.className = `archive-tab px-4 py-2.5 text-sm font-medium transition-colors border-b-2 -mb-px ${
+            active ? 'text-white border-accent' : 'text-slate-500 border-transparent hover:text-slate-300 hover:border-slate-600'
+        }`;
+    });
+
+    const content = document.getElementById('archive-tab-content');
+    if (!content) return;
+    content.innerHTML = renderLoadingState();
+
+    try {
+        if (tab === 'overview') {
+            const data = await api(`/scans/${scanId}/overview`);
+            _renderArchiveOverviewTab(content, data);
+
+        } else if (tab === 'assets') {
+            _archiveTabState.page = page || 1;
+            const data = await api(`/scans/${scanId}/assets`, { page: _archiveTabState.page, limit: 50 });
+            content.innerHTML = `
+                <div class="card overflow-hidden">
+                    <div class="overflow-x-auto">
+                        <table class="data-table">
+                            <thead><tr>
+                                <th>FQDN</th><th>Ports</th><th>Web</th><th>Findings</th><th>CDN</th><th>Gap</th>
+                            </tr></thead>
+                            <tbody>
+                                ${data.items.length ? data.items.map(a => `
+                                    <tr>
+                                        <td class="font-mono text-xs text-accent">${esc(a.fqdn)}</td>
+                                        <td>${a.port_count || 0}</td>
+                                        <td>${a.web_entry_count || 0}</td>
+                                        <td>${a.finding_count ? `<span class="text-orange-400 font-medium">${a.finding_count}</span>` : '<span class="text-slate-600">0</span>'}</td>
+                                        <td class="text-slate-400 text-xs">${esc(a.cdn || '-')}</td>
+                                        <td>${gapBadge(a.gap_type)}</td>
+                                    </tr>
+                                `).join('') : `<tr><td colspan="6">${renderEmptyState('No assets', '')}</td></tr>`}
+                            </tbody>
+                        </table>
+                    </div>
+                    ${data.pages > 1 ? `
+                        <div class="flex items-center justify-between px-4 py-3 border-t border-surface-border">
+                            <span class="text-xs text-slate-500">${fmt(data.total)} total · page ${data.page} of ${data.pages}</span>
+                            <div class="flex gap-1">
+                                <button class="page-btn" onclick="setArchiveTab('${esc(scanId)}', 'assets', ${data.page - 1})" ${data.page <= 1 ? 'disabled' : ''}>Prev</button>
+                                <button class="page-btn" onclick="setArchiveTab('${esc(scanId)}', 'assets', ${data.page + 1})" ${data.page >= data.pages ? 'disabled' : ''}>Next</button>
+                            </div>
+                        </div>
+                    ` : ''}
+                </div>
+            `;
+
+        } else if (tab === 'findings') {
+            const data = await api(`/scans/${scanId}/findings`, { severity: _archiveTabState.severity || '', limit: 200 });
+            content.innerHTML = `
+                <div class="flex flex-wrap gap-2 mb-4">
+                    ${['', 'critical', 'high', 'medium', 'low', 'info'].map(s => `
+                        <button class="btn-secondary text-xs py-1 px-3 ${_archiveTabState.severity === s ? 'ring-1 ring-accent text-accent' : ''}"
+                                onclick="_setArchiveFindingsSeverity('${esc(scanId)}', '${s}')">
+                            ${s ? capitalize(s) : 'All'}
+                        </button>
+                    `).join('')}
+                </div>
+                <div class="card overflow-hidden">
+                    <div class="overflow-x-auto">
+                        <table class="data-table">
+                            <thead><tr>
+                                <th>Severity</th><th>FQDN</th><th>Finding</th><th>Template</th><th>Matched At</th>
+                            </tr></thead>
+                            <tbody>
+                                ${data.items.length ? data.items.map(f => `
+                                    <tr>
+                                        <td>${severityBadge(f.severity)}</td>
+                                        <td class="font-mono text-xs text-accent">${esc(f.fqdn)}</td>
+                                        <td>${esc(f.finding_name)}</td>
+                                        <td class="text-slate-500 font-mono text-xs">${esc(f.template_id)}</td>
+                                        <td class="text-slate-400 text-xs">${esc(f.matched_at)}</td>
+                                    </tr>
+                                `).join('') : `<tr><td colspan="5">${renderEmptyState('No findings', '')}</td></tr>`}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+
+        } else if (tab === 'tls') {
+            const data = await api(`/scans/${scanId}/tls`, { limit: 200 });
+            const sm = data.summary || {};
+            content.innerHTML = `
+                <div class="grid grid-cols-3 md:grid-cols-6 gap-3 mb-4">
+                    ${kpiCard('Total Issues', sm.total, '', 'red', 'arc-tls-total')}
+                    ${kpiCard('Expired', sm.expired, '', 'red', 'arc-tls-exp')}
+                    ${kpiCard('Self-Signed', sm.self_signed, '', 'orange', 'arc-tls-ss')}
+                    ${kpiCard('Expiring <30d', sm.expiring_30d, '', 'yellow', 'arc-tls-30d')}
+                    ${kpiCard('Mismatched', sm.mismatched, '', 'purple', 'arc-tls-mm')}
+                    ${kpiCard('Revoked/Untrusted', (sm.revoked || 0) + (sm.untrusted || 0), '', 'red', 'arc-tls-rv')}
+                </div>
+                <div class="card overflow-hidden">
+                    <div class="overflow-x-auto">
+                        <table class="data-table">
+                            <thead><tr>
+                                <th>FQDN</th><th>Port</th><th>Issuer</th><th>Expires</th><th>Issues</th>
+                            </tr></thead>
+                            <tbody>
+                                ${data.items.length ? data.items.map(t => `
+                                    <tr>
+                                        <td class="font-mono text-xs text-accent">${esc(t.fqdn)}</td>
+                                        <td>${t.port}</td>
+                                        <td class="text-slate-400 text-xs truncate max-w-[160px]">${esc(t.issuer || '-')}</td>
+                                        <td class="text-xs ${(t.days_to_expiry || 999) < 30 ? 'text-yellow-400' : 'text-slate-400'}">${t.not_after ? fmtDate(t.not_after) : '-'}</td>
+                                        <td class="text-xs space-x-1">
+                                            ${t.expired ? '<span class="badge badge-critical">Expired</span>' : ''}
+                                            ${t.self_signed ? '<span class="badge badge-high">Self-signed</span>' : ''}
+                                            ${t.mismatched ? '<span class="badge badge-medium">Mismatch</span>' : ''}
+                                        </td>
+                                    </tr>
+                                `).join('') : `<tr><td colspan="5">${renderEmptyState('No TLS issues', '')}</td></tr>`}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+            requestAnimationFrame(() => {
+                document.querySelectorAll('[data-counter]').forEach(el => {
+                    const val = parseFloat(el.getAttribute('data-counter'));
+                    if (!isNaN(val)) animateCounter(el, val);
+                });
+            });
+
+        } else if (tab === 'takeovers') {
+            const data = await api(`/scans/${scanId}/takeovers`, { limit: 200 });
+            content.innerHTML = `
+                <div class="card overflow-hidden">
+                    <div class="overflow-x-auto">
+                        <table class="data-table">
+                            <thead><tr>
+                                <th>FQDN</th><th>Service</th><th>Status</th><th>Confidence</th><th>CNAME</th>
+                            </tr></thead>
+                            <tbody>
+                                ${data.items.length ? data.items.map(t => `
+                                    <tr>
+                                        <td class="font-mono text-xs text-accent">${esc(t.fqdn)}</td>
+                                        <td class="text-slate-400 text-xs">${esc(t.service || '-')}</td>
+                                        <td><span class="badge badge-${t.status === 'confirmed' ? 'critical' : t.status === 'unverified' ? 'medium' : 'low'}">${esc(t.status)}</span></td>
+                                        <td class="text-xs text-slate-400">${esc(t.confidence || '-')}</td>
+                                        <td class="font-mono text-xs text-slate-500 truncate max-w-[200px]">${esc(t.stored_cname || '-')}</td>
+                                    </tr>
+                                `).join('') : `<tr><td colspan="5">${renderEmptyState('No takeover candidates', '')}</td></tr>`}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+        }
+    } catch (e) {
+        content.innerHTML = renderErrorState(e.message);
+    }
+};
+
+window._setArchiveFindingsSeverity = function(scanId, severity) {
+    _archiveTabState.severity = severity;
+    setArchiveTab(scanId, 'findings');
+};
+
+// ---------------------------------------------------------------------------
+// Page: Scan Comparison
+// ---------------------------------------------------------------------------
+
+async function pageCompare(el, scanA, scanB) {
+    if (!scanA) { navigateTo('scans'); return; }
+
+    // No scanB yet — show the scan picker
+    if (!scanB) {
+        await _pageComparePicker(el, scanA);
+        return;
+    }
+
+    const data = await api(`/compare/${encodeURIComponent(scanA)}/${encodeURIComponent(scanB)}`);
+    const riskDelta = data.risk_score.delta;
+    const riskDeltaClass = riskDelta > 0 ? 'text-red-400' : riskDelta < 0 ? 'text-green-400' : 'text-slate-500';
+
+    el.innerHTML = `
+        <div class="flex items-center gap-3 mb-6">
+            <button onclick="history.back()" class="btn-secondary text-xs py-1 px-3 flex items-center gap-1.5">
+                ${ICONS.arrowLeft} Back
+            </button>
+            <div>
+                <h1 class="text-2xl font-bold text-white">Scan Comparison</h1>
+                <p class="text-sm text-slate-500 mt-1">Changes from baseline to current</p>
+            </div>
+        </div>
+
+        <!-- Scan pair header -->
+        <div class="card p-5 mb-5">
+            <div class="grid grid-cols-5 gap-4 items-center">
+                <div class="col-span-2 text-center p-3 rounded-xl bg-[#0a0e1a]">
+                    <div class="text-[10px] text-slate-500 uppercase tracking-widest mb-1">Baseline (A)</div>
+                    <div class="font-mono text-sm font-semibold text-slate-200">${esc(scanA === 'current' ? 'Current Active' : scanA)}</div>
+                    <div class="text-xs text-slate-500 mt-1">${fmt(data.scan_a.total_assets)} assets</div>
+                </div>
+                <div class="text-center space-y-2">
+                    <div class="text-slate-600 text-xl">→</div>
+                    <button onclick="navigateTo('compare', {id: '${esc(scanB)}', id2: '${esc(scanA)}'})"
+                            class="btn-secondary text-xs py-1 px-2 block mx-auto" title="Swap A and B">
+                        ⇄ Swap
+                    </button>
+                    <a href="#/compare/${esc(scanA)}" class="btn-secondary text-xs py-1 px-2 block mx-auto">Change B</a>
+                </div>
+                <div class="col-span-2 text-center p-3 rounded-xl bg-[#0a0e1a]">
+                    <div class="text-[10px] text-slate-500 uppercase tracking-widest mb-1">Current (B)</div>
+                    <div class="font-mono text-sm font-semibold text-accent">${esc(scanB === 'current' ? 'Current Active' : scanB)}</div>
+                    <div class="text-xs text-slate-500 mt-1">${fmt(data.scan_b.total_assets)} assets</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Risk score delta -->
+        <div class="card p-5 mb-5">
+            <h3 class="text-sm font-semibold text-slate-300 mb-5">Risk Score</h3>
+            <div class="grid grid-cols-5 gap-4 items-center">
+                <div class="col-span-2 flex items-center justify-center gap-5">
+                    ${renderRiskGauge(data.risk_score.a)}
+                    <div class="text-center">
+                        <div class="text-3xl font-bold ${riskColor(data.risk_score.a)}">${data.risk_score.a}</div>
+                        <div class="text-xs text-slate-500 mt-1">Baseline</div>
+                    </div>
+                </div>
+                <div class="text-center">
+                    <div class="text-2xl font-bold ${riskDeltaClass}">
+                        ${riskDelta > 0 ? '+' : ''}${riskDelta}
+                    </div>
+                    <div class="text-[10px] text-slate-500 mt-1 uppercase tracking-wider">
+                        ${riskDelta > 0 ? 'Higher risk' : riskDelta < 0 ? 'Lower risk' : 'Unchanged'}
+                    </div>
+                </div>
+                <div class="col-span-2 flex items-center justify-center gap-5">
+                    ${renderRiskGauge(data.risk_score.b)}
+                    <div class="text-center">
+                        <div class="text-3xl font-bold ${riskColor(data.risk_score.b)}">${data.risk_score.b}</div>
+                        <div class="text-xs text-slate-500 mt-1">Current</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- KPI table -->
+        <div class="card p-5 mb-5">
+            <h3 class="text-sm font-semibold text-slate-300 mb-4">Metrics</h3>
+            <div class="overflow-x-auto">
+                <table class="data-table">
+                    <thead><tr>
+                        <th>Metric</th>
+                        <th>Baseline (A)</th>
+                        <th>Current (B)</th>
+                        <th>Change</th>
+                    </tr></thead>
+                    <tbody>
+                        ${_kpiRow('Total Assets',    data.kpis.total_assets,    false)}
+                        ${_kpiRow('Web Assets',      data.kpis.web_assets,      false)}
+                        ${_kpiRow('Total Findings',  data.kpis.total_findings,  true)}
+                        ${_kpiRow('TLS Issues',      data.kpis.tls_issues,      true)}
+                        ${_kpiRow('Shadow IT',       data.kpis.shadow_it,       true)}
+                        ${_kpiRow('Stale CI',        data.kpis.stale_ci,        true)}
+                        ${_kpiRow('In CMDB',         data.kpis.in_cmdb,         false)}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Asset changes -->
+        <div class="card p-5 mb-5">
+            <h3 class="text-sm font-semibold text-slate-300 mb-4">Asset Changes</h3>
+            <div class="flex gap-1.5 mb-4">
+                ${_compareTabBtn('cmp-asset', 'new',     'New',     data.totals?.new_assets     ?? data.new_assets.length,     true)}
+                ${_compareTabBtn('cmp-asset', 'removed', 'Removed', data.totals?.removed_assets ?? data.removed_assets.length, false)}
+                ${_compareTabBtn('cmp-asset', 'changed', 'Changed', data.totals?.changed_assets ?? data.changed_assets.length, false)}
+            </div>
+            <div id="cmp-assets-content">${_newAssetsTable(data.new_assets)}</div>
+            <div id="cmp-assets-notice" class="text-xs text-slate-500 mt-2">${
+                data.new_assets.length < (data.totals?.new_assets ?? 0)
+                    ? `Showing ${data.new_assets.length} of ${data.totals.new_assets} new assets — use <code>?limit=N</code> to load more`
+                    : ''
+            }</div>
+        </div>
+
+        <!-- Finding changes -->
+        <div class="card p-5">
+            <h3 class="text-sm font-semibold text-slate-300 mb-4">Finding Changes</h3>
+            <div class="flex gap-1.5 mb-4">
+                ${_compareTabBtn('cmp-finding', 'new',      'New',      data.totals?.new_findings      ?? data.new_findings.length,      true)}
+                ${_compareTabBtn('cmp-finding', 'resolved', 'Resolved', data.totals?.resolved_findings ?? data.resolved_findings.length, false)}
+            </div>
+            <div id="cmp-findings-content">${_findingsTable(data.new_findings)}</div>
+            <div id="cmp-findings-notice" class="text-xs text-slate-500 mt-2">${
+                data.new_findings.length < (data.totals?.new_findings ?? 0)
+                    ? `Showing ${data.new_findings.length} of ${data.totals.new_findings} new findings — use <code>?limit=N</code> to load more`
+                    : ''
+            }</div>
+        </div>
+    `;
+
+    window._compareData = data;
+}
+
+async function _pageComparePicker(el, scanA) {
+    const scansData = await api('/scans');
+    const archives = (scansData.archives || []).filter(a => a.scan_id !== scanA);
+
+    el.innerHTML = `
+        <div class="flex items-center gap-3 mb-6">
+            <a href="#/archive/${esc(scanA)}" class="btn-secondary text-xs py-1 px-3 flex items-center gap-1.5">
+                ${ICONS.arrowLeft} Back
+            </a>
+            <div>
+                <h1 class="text-2xl font-bold text-white">Compare Scans</h1>
+                <p class="text-sm text-slate-500 mt-1">
+                    Select a scan to compare with <span class="font-mono text-slate-300">${esc(scanA)}</span> as the baseline
+                </p>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
+            <!-- Fixed baseline -->
+            <div class="card p-5 border-accent/40">
+                <div class="text-[10px] text-slate-500 uppercase tracking-widest mb-3">Baseline (A) — Fixed</div>
+                <div class="font-mono text-sm font-semibold text-accent">${esc(scanA)}</div>
+            </div>
+
+            <!-- Scan B picker -->
+            <div class="space-y-3">
+                <div class="text-xs text-slate-500 uppercase tracking-wider mb-1">Select Current (B)</div>
+
+                <div class="archive-card cursor-pointer hover:border-accent/40 transition-colors"
+                     onclick="navigateTo('compare', {id: '${esc(scanA)}', id2: 'current'})">
+                    <div class="flex items-center gap-3">
+                        <div class="timeline-dot active"></div>
+                        <div>
+                            <div class="text-sm font-medium text-white">Current Active Scan</div>
+                            <div class="text-xs text-slate-500 mt-0.5">Live data from easm.duckdb</div>
+                        </div>
+                    </div>
+                </div>
+
+                ${archives.map(a => `
+                    <div class="archive-card cursor-pointer hover:border-accent/40 transition-colors"
+                         onclick="navigateTo('compare', {id: '${esc(scanA)}', id2: '${esc(a.scan_id)}'})">
+                        <div class="flex items-center gap-3">
+                            <div class="timeline-dot"></div>
+                            <div>
+                                <div class="font-mono text-sm text-white">${esc(a.scan_id)}</div>
+                                <div class="text-xs text-slate-500 mt-0.5">
+                                    ${fmtDate(a.archived_at)} · ${fmt((a.results || {}).total_assets || 0)} assets
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `).join('')}
+
+                ${archives.length === 0 ? `
+                    <p class="text-sm text-slate-600 text-center py-6">No other archives available</p>
+                ` : ''}
+            </div>
+        </div>
+    `;
+}
+
+function _compareTabBtn(group, tab, label, count, active) {
+    return `
+        <button class="${group}-tab px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
+            active ? 'bg-accent/20 text-accent border-accent/30' : 'bg-transparent text-slate-400 border-surface-border hover:border-slate-500'
+        }" data-tab="${tab}" onclick="_compareTab('${group}', '${tab}')">
+            ${label} <span class="ml-1 opacity-60">${count}</span>
+        </button>
+    `;
+}
+
+function _kpiRow(label, kpi, higherIsBad) {
+    if (!kpi) return '';
+    const d = kpi.delta;
+    let cls = 'text-slate-500';
+    if (d !== 0) cls = (higherIsBad ? d > 0 : d < 0) ? 'text-red-400' : 'text-green-400';
+    const str = d > 0 ? `+${fmt(d)}` : fmt(d);
+    const arrow = d > 0 ? ' ↑' : d < 0 ? ' ↓' : '';
+    return `
+        <tr>
+            <td class="font-medium text-slate-300">${esc(label)}</td>
+            <td class="text-slate-400">${fmt(kpi.a)}</td>
+            <td class="text-slate-400">${fmt(kpi.b)}</td>
+            <td class="${cls} font-semibold">${str}${arrow}</td>
+        </tr>
+    `;
+}
+
+function _newAssetsTable(assets) {
+    if (!assets.length) return renderEmptyState('No new assets', '');
+    return `
+        <div class="overflow-x-auto">
+            <table class="data-table">
+                <thead><tr><th>FQDN</th><th>Ports</th><th>Web</th><th>Findings</th><th>CDN</th><th>ASN</th></tr></thead>
+                <tbody>
+                    ${assets.map(a => `
+                        <tr>
+                            <td class="font-mono text-xs text-green-400">${esc(a.fqdn)}</td>
+                            <td>${a.port_count || 0}</td>
+                            <td>${a.web_count || 0}</td>
+                            <td>${a.finding_count ? `<span class="text-orange-400 font-medium">${a.finding_count}</span>` : '0'}</td>
+                            <td class="text-slate-400 text-xs">${esc(a.cdn || '-')}</td>
+                            <td class="text-slate-400 text-xs truncate max-w-[140px]">${esc(a.asn_org || '-')}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        </div>
+    `;
+}
+
+function _removedAssetsTable(assets) {
+    if (!assets.length) return renderEmptyState('No removed assets', '');
+    return `
+        <div class="overflow-x-auto">
+            <table class="data-table">
+                <thead><tr><th>FQDN</th></tr></thead>
+                <tbody>
+                    ${assets.map(a => `
+                        <tr><td class="font-mono text-xs text-red-400/70 line-through">${esc(a.fqdn)}</td></tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        </div>
+    `;
+}
+
+function _changedAssetsTable(assets) {
+    if (!assets.length) return renderEmptyState('No changed assets', '');
+    return `
+        <div class="overflow-x-auto">
+            <table class="data-table">
+                <thead><tr>
+                    <th>FQDN</th><th>New Ports</th><th>Closed Ports</th><th>New Findings</th><th>Resolved</th>
+                </tr></thead>
+                <tbody>
+                    ${assets.map(a => `
+                        <tr>
+                            <td class="font-mono text-xs text-accent">${esc(a.fqdn)}</td>
+                            <td class="text-xs text-green-400 font-mono">
+                                ${a.new_ports.length ? a.new_ports.map(p => ':' + p).join(' ') : '-'}
+                            </td>
+                            <td class="text-xs text-red-400 font-mono">
+                                ${a.closed_ports.length ? a.closed_ports.map(p => ':' + p).join(' ') : '-'}
+                            </td>
+                            <td class="text-xs">
+                                ${a.new_findings.length
+                                    ? a.new_findings.map(f => `<span class="badge badge-${esc(f.severity)}">${esc(f.severity)}</span>`).join(' ')
+                                    : '-'}
+                            </td>
+                            <td class="text-xs text-slate-500">${a.resolved_findings.length || '-'}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        </div>
+    `;
+}
+
+function _findingsTable(findings) {
+    if (!findings.length) return renderEmptyState('No findings', '');
+    return `
+        <div class="overflow-x-auto">
+            <table class="data-table">
+                <thead><tr>
+                    <th>Severity</th><th>FQDN</th><th>Finding</th><th>Template</th><th>Matched At</th>
+                </tr></thead>
+                <tbody>
+                    ${findings.map(f => `
+                        <tr>
+                            <td>${severityBadge(f.severity)}</td>
+                            <td class="font-mono text-xs text-accent">${esc(f.fqdn)}</td>
+                            <td>${esc(f.finding_name)}</td>
+                            <td class="font-mono text-xs text-slate-500">${esc(f.template_id)}</td>
+                            <td class="text-xs text-slate-400">${esc(f.matched_at)}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        </div>
+    `;
+}
+
+window._compareTab = function(group, tab) {
+    document.querySelectorAll(`.${group}-tab`).forEach(t => {
+        const active = t.dataset.tab === tab;
+        t.className = `${group}-tab px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
+            active ? 'bg-accent/20 text-accent border-accent/30' : 'bg-transparent text-slate-400 border-surface-border hover:border-slate-500'
+        }`;
+    });
+
+    const data = window._compareData;
+    if (!data) return;
+
+    const totals = data.totals || {};
+
+    if (group === 'cmp-asset') {
+        const el = document.getElementById('cmp-assets-content');
+        const notice = document.getElementById('cmp-assets-notice');
+        if (!el) return;
+        let list, total, label;
+        if (tab === 'new')     { list = data.new_assets;     total = totals.new_assets;     label = 'new assets';     el.innerHTML = _newAssetsTable(list); }
+        if (tab === 'removed') { list = data.removed_assets; total = totals.removed_assets; label = 'removed assets'; el.innerHTML = _removedAssetsTable(list); }
+        if (tab === 'changed') { list = data.changed_assets; total = totals.changed_assets; label = 'changed assets'; el.innerHTML = _changedAssetsTable(list); }
+        if (notice) {
+            notice.innerHTML = (list && total && list.length < total)
+                ? `Showing ${list.length} of ${total} ${label} — use <code>?limit=N</code> to load more`
+                : '';
+        }
+    } else if (group === 'cmp-finding') {
+        const el = document.getElementById('cmp-findings-content');
+        const notice = document.getElementById('cmp-findings-notice');
+        if (!el) return;
+        const isNew = tab === 'new';
+        const list  = isNew ? data.new_findings : data.resolved_findings;
+        const total = isNew ? totals.new_findings : totals.resolved_findings;
+        const label = isNew ? 'new findings' : 'resolved findings';
+        el.innerHTML = _findingsTable(list);
+        if (notice) {
+            notice.innerHTML = (list && total && list.length < total)
+                ? `Showing ${list.length} of ${total} ${label} — use <code>?limit=N</code> to load more`
+                : '';
+        }
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
