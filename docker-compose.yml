@@ -1,28 +1,54 @@
 # =============================================================================
 # EASM Pipeline - Docker Compose
 # =============================================================================
-# Usage:
-#   docker compose --profile pipeline build
-#   docker compose --profile pipeline run --rm easm-pipeline                           # full pipeline
-#   docker compose --profile pipeline run --rm easm-pipeline -- --stage dns            # single stage
-#   docker compose --profile pipeline run --rm easm-pipeline -- --stage dns,ports      # multiple stages
-#   docker compose --profile pipeline run --rm easm-pipeline -- --from tls             # resume from TLS onwards
-#   docker compose --profile pipeline run --rm easm-pipeline -- --from normalize       # re-run normalize + load only
-#   docker compose --profile pipeline run --rm easm-pipeline -- --dry-run --from tls   # preview what would run
-#   docker compose --profile gallery up gowitness                                       # screenshot gallery
-#   docker compose --profile dashboard up dashboard                                     # web dashboard (port 8443)
+# One-click deployment:
+#   docker compose up -d --build        # build & start dashboard
+#   open http://127.0.0.1:9990          # configure stages, enter targets, scan
+#   docker compose down                 # stop everything
+#
+# Optional CLI / utility services (profiles):
+#   docker compose --profile cli run --rm easm-pipeline -- --stage dns
+#   docker compose --profile gallery up gowitness
+#   docker compose --profile query run --rm duckdb
 # =============================================================================
 
 services:
   # -------------------------------------------------------------------------
-  # Main EASM pipeline runner
+  # EASM Dashboard — primary service, builds the shared image
   # -------------------------------------------------------------------------
-  easm-pipeline:
+  dashboard:
     build:
       context: .
       dockerfile: Dockerfile
       args:
         RUNTIME_BASE: ${RUNTIME_BASE:-debian:bookworm-slim}
+    image: easm-pipeline:local
+    container_name: easm-dashboard
+    entrypoint: ["python3", "-m", "uvicorn", "dashboard.app:app", "--host", "0.0.0.0", "--port", "8443"]
+    environment:
+      - EASM_DB_PATH=/easm/data/output/easm.duckdb
+      - DASHBOARD_PORT=8443
+    ports:
+      - "127.0.0.1:9990:8443"
+    volumes:
+      - ./data:/easm/data
+      - ./dashboard:/easm/dashboard:ro
+      - ./scripts:/easm/scripts:ro
+      - ./run.sh:/easm/run.sh:ro
+      - ./config:/easm/config:ro
+      - ./logs:/easm/logs
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    shm_size: "2gb"
+    networks:
+      - easm-net
+
+  # -------------------------------------------------------------------------
+  # CLI pipeline runner (reuses dashboard image)
+  # -------------------------------------------------------------------------
+  easm-pipeline:
+    image: easm-pipeline:local
     container_name: easm-pipeline
     env_file:
       - config/pipeline.env
@@ -30,26 +56,20 @@ services:
       - ./data:/easm/data
       - ./logs:/easm/logs
       - ./config:/easm/config:ro
-    # SYN scanning requires NET_ADMIN + NET_RAW
     cap_add:
       - NET_ADMIN
       - NET_RAW
-    # Chromium needs /dev/shm
     shm_size: "2gb"
     networks:
       - easm-net
     profiles:
-      - pipeline
+      - cli
 
   # -------------------------------------------------------------------------
   # gowitness v3 - screenshot gallery & API
   # -------------------------------------------------------------------------
   gowitness:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        RUNTIME_BASE: ${RUNTIME_BASE:-debian:bookworm-slim}
+    image: easm-pipeline:local
     container_name: easm-gowitness
     entrypoint: ["gowitness"]
     command:
@@ -73,46 +93,10 @@ services:
       - gallery
 
   # -------------------------------------------------------------------------
-  # EASM Dashboard — Web UI for scan results
-  # -------------------------------------------------------------------------
-  dashboard:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        RUNTIME_BASE: ${RUNTIME_BASE:-debian:bookworm-slim}
-    container_name: easm-dashboard
-    entrypoint: ["python3", "-m", "uvicorn", "dashboard.app:app", "--host", "0.0.0.0", "--port", "8443"]
-    environment:
-      - EASM_DB_PATH=/easm/data/output/easm.duckdb
-      - DASHBOARD_PORT=8443
-    ports:
-      - "8443:8443"
-    volumes:
-      - ./data:/easm/data
-      - ./dashboard:/easm/dashboard:ro
-      - ./scripts:/easm/scripts:ro
-      - ./run.sh:/easm/run.sh:ro
-      - ./config:/easm/config:ro
-      - ./logs:/easm/logs
-    cap_add:
-      - NET_ADMIN
-      - NET_RAW
-    shm_size: "2gb"
-    networks:
-      - easm-net
-    profiles:
-      - dashboard
-
-  # -------------------------------------------------------------------------
   # DuckDB CLI for ad-hoc queries
   # -------------------------------------------------------------------------
   duckdb:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        RUNTIME_BASE: ${RUNTIME_BASE:-debian:bookworm-slim}
+    image: easm-pipeline:local
     container_name: easm-duckdb
     entrypoint: ["python3", "-c", "import duckdb; db = duckdb.connect('/easm/data/output/easm.duckdb'); print('DuckDB connected. Use db.sql() to query.'); import code; code.interact(local=locals())"]
     volumes:

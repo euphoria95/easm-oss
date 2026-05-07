@@ -13,6 +13,20 @@ const SEVERITY_COLORS = {
 };
 const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low', 'info'];
 
+const PIPELINE_STAGES = [
+    { id: 'dns',         name: 'DNS Resolution',        tool: 'dnsx' },
+    { id: 'asn',         name: 'ASN Enrichment',         tool: 'pyasn' },
+    { id: 'rdns',        name: 'Reverse DNS',            tool: 'dnsx' },
+    { id: 'ports',       name: 'Port Scanning',          tool: 'naabu' },
+    { id: 'http',        name: 'HTTP Probing',           tool: 'httpx' },
+    { id: 'tls',         name: 'TLS Analysis',           tool: 'tlsx' },
+    { id: 'fingerprint', name: 'Fingerprinting',         tool: 'nerva' },
+    { id: 'nuclei',      name: 'Vulnerability Scan',     tool: 'nuclei' },
+    { id: 'normalize',   name: 'Normalization',          tool: 'normalize.py', required: true },
+    { id: 'load',        name: 'DuckDB Load',            tool: 'load_duckdb.py', required: true },
+    { id: 'verify',      name: 'Takeover Verification',  tool: 'verify.py' },
+];
+
 const GAP_LABELS = {
     shadow_it: 'Shadow IT', stale_ci: 'Stale CI',
     unmanaged: 'Unmanaged', orphan_cert: 'Orphan Cert',
@@ -164,6 +178,7 @@ const ICONS = {
     services: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5"><rect x="5" y="5" width="14" height="14" rx="1"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="2" x2="9" y2="5"/><line x1="15" y1="2" x2="15" y2="5"/><line x1="9" y1="19" x2="9" y2="22"/><line x1="15" y1="19" x2="15" y2="22"/><line x1="2" y1="9" x2="5" y2="9"/><line x1="2" y1="15" x2="5" y2="15"/><line x1="19" y1="9" x2="22" y2="9"/><line x1="19" y1="15" x2="22" y2="15"/></svg>',
     eye: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class="w-3.5 h-3.5"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>',
     upload: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class="w-3.5 h-3.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>',
+    bounty: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5"><circle cx="12" cy="8" r="6"/><path d="M15.477 12.89L17 22l-5-3-5 3 1.523-9.11"/></svg>',
 };
 
 // ---------------------------------------------------------------------------
@@ -331,6 +346,7 @@ function renderSidebar() {
         { id: 'network', label: 'Network', icon: ICONS.network },
         { id: 'takeovers', label: 'Takeovers', icon: ICONS.takeovers },
         { id: 'services', label: 'Services', icon: ICONS.services },
+        { id: 'bounty', label: 'Bug Bounty', icon: ICONS.bounty },
     ];
     return `
         <div class="px-5 py-5 flex items-center gap-3 border-b border-surface-border">
@@ -420,6 +436,7 @@ async function renderCurrentPage() {
             case 'network': await pageNetwork(content); break;
             case 'takeovers': await pageTakeovers(content); break;
             case 'services': await pageServices(content); break;
+            case 'bounty': await pageBounty(content); break;
             case 'archive': await pageArchive(content, state.pageParams.id); break;
             case 'compare': await pageCompare(content, state.pageParams.id, state.pageParams.id2); break;
             default: await pageOverview(content); break;
@@ -2632,6 +2649,19 @@ async function pageScans(el) {
                         placeholder="Enter subdomains, one per line&#10;&#10;example.com&#10;app.example.com&#10;api.example.com&#10;staging.example.org&#10;&#10;Lines starting with # are ignored"
                         ${active ? 'disabled' : ''}
                     ></textarea>
+                    <div class="flex items-center gap-3 mb-3">
+                        <span class="text-xs text-slate-400 whitespace-nowrap">Mode:</span>
+                        <label class="flex items-center gap-1.5 cursor-pointer">
+                            <input type="radio" name="scan-mode" value="recon" checked
+                                   class="accent-[#00d4ff]" ${active ? 'disabled' : ''}>
+                            <span class="text-xs text-slate-300">Recon</span>
+                        </label>
+                        <label class="flex items-center gap-1.5 cursor-pointer">
+                            <input type="radio" name="scan-mode" value="bounty"
+                                   class="accent-[#00d4ff]" ${active ? 'disabled' : ''}>
+                            <span class="text-xs text-slate-300">Bug Bounty Prepare</span>
+                        </label>
+                    </div>
                     <div class="flex items-center justify-between">
                         <div class="flex items-center gap-2">
                             <button onclick="loadExampleSubdomains()" class="btn-secondary" ${active ? 'disabled' : ''}>
@@ -2645,27 +2675,29 @@ async function pageScans(el) {
                     </div>
                 </div>
 
-                <!-- Quick Info -->
+                <!-- Pipeline Configuration -->
                 <div class="card p-4">
-                    <h4 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">Pipeline Stages</h4>
-                    <div class="space-y-2 text-xs">
-                        ${[
-                            ['CT Enrichment', 'Passive subdomain discovery via Certificate Transparency'],
-                            ['DNS Resolution', 'A, AAAA, CNAME, NS, MX records via dnsx'],
-                            ['Port Scanning', 'Top 100 ports via naabu'],
-                            ['HTTP Probing', 'Web service fingerprinting via httpx'],
-                            ['TLS Analysis', 'Certificate health checks via tlsx'],
-                            ['Nuclei Scan', 'Vulnerability & exposure detection'],
-                            ['Normalization', 'Unified asset records + CMDB reconciliation'],
-                        ].map(([name, desc]) => `
-                            <div class="flex items-start gap-2">
-                                <span class="w-1.5 h-1.5 rounded-full bg-accent mt-1.5 shrink-0"></span>
-                                <div>
-                                    <span class="text-slate-300 font-medium">${name}</span>
-                                    <span class="text-slate-500"> — ${desc}</span>
-                                </div>
-                            </div>
+                    <div class="flex items-center justify-between mb-3">
+                        <h4 class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Pipeline Stages</h4>
+                        <label class="flex items-center gap-2 cursor-pointer select-none">
+                            <span class="text-[11px] text-slate-500">Full Pipeline</span>
+                            <input type="checkbox" id="scan-full-pipeline" checked
+                                   onchange="toggleFullPipeline(this)"
+                                   class="w-3.5 h-3.5 rounded accent-[#00d4ff]"
+                                   ${active ? 'disabled' : ''}>
+                        </label>
+                    </div>
+                    <div id="stage-checkboxes" class="space-y-1 text-xs" style="display:none">
+                        ${PIPELINE_STAGES.map(s => `
+                            <label class="flex items-center gap-2.5 cursor-pointer py-1 px-1 rounded hover:bg-white/[0.03] transition-colors select-none ${s.required ? 'opacity-60' : ''}">
+                                <input type="checkbox" class="stage-checkbox w-3.5 h-3.5 rounded accent-[#00d4ff]"
+                                       value="${s.id}" checked
+                                       ${s.required || active ? 'disabled' : ''}>
+                                <span class="text-slate-300 flex-1">${s.name}</span>
+                                <span class="text-slate-600 font-mono text-[10px]">${s.tool}</span>
+                            </label>
                         `).join('')}
+                        <p class="text-[10px] text-slate-600 pt-1">Normalize & Load are always included.</p>
                     </div>
                 </div>
 
@@ -2750,6 +2782,9 @@ function _read_scan_state_from(data) {
 }
 
 function _renderActiveScan(active) {
+    const stagesLabel = active.stages && active.stages !== 'full'
+        ? active.stages.split(',').join(', ')
+        : 'Full Pipeline';
     return `
         <div class="scan-progress">
             <div class="flex items-center gap-3 mb-3">
@@ -2767,6 +2802,14 @@ function _renderActiveScan(active) {
                 <div>
                     <span class="text-slate-500">Started:</span>
                     <span class="text-slate-300 ml-1">${fmtDate(active.started_at)}</span>
+                </div>
+                <div>
+                    <span class="text-slate-500">Stages:</span>
+                    <span class="text-slate-300 ml-1">${esc(stagesLabel)}</span>
+                </div>
+                <div>
+                    <span class="text-slate-500">Mode:</span>
+                    <span class="text-slate-300 ml-1">${esc(active.mode || 'recon')}</span>
                 </div>
             </div>
             <p class="text-xs text-slate-500 mt-3">Auto-refreshes every 5 seconds. Previous scan data is being archived.</p>
@@ -2905,6 +2948,25 @@ function _formatBytes(bytes) {
     return (bytes / 1048576).toFixed(1) + ' MB';
 }
 
+window.toggleFullPipeline = function(checkbox) {
+    const container = document.getElementById('stage-checkboxes');
+    if (!container) return;
+    container.style.display = checkbox.checked ? 'none' : '';
+    if (checkbox.checked) {
+        container.querySelectorAll('.stage-checkbox:not(:disabled)').forEach(cb => { cb.checked = true; });
+    }
+};
+
+function _getSelectedStages() {
+    const fp = document.getElementById('scan-full-pipeline');
+    if (fp && fp.checked) return '';
+    const checked = document.querySelectorAll('.stage-checkbox:checked');
+    const ids = Array.from(checked).map(cb => cb.value);
+    if (!ids.includes('normalize')) ids.push('normalize');
+    if (!ids.includes('load')) ids.push('load');
+    return ids.join(',');
+}
+
 window.startScan = async function() {
     const textarea = document.getElementById('scan-subdomains');
     const btn = document.getElementById('btn-start-scan');
@@ -2922,7 +2984,13 @@ window.startScan = async function() {
         return;
     }
 
-    if (!confirm(`Start scan with ${lines.length} subdomain${lines.length !== 1 ? 's' : ''}?\n\nThis will archive the current scan data and run the full EASM pipeline.`)) {
+    const stages = _getSelectedStages();
+    const modeEl = document.querySelector('input[name="scan-mode"]:checked');
+    const mode = modeEl ? modeEl.value : 'recon';
+    const stageInfo = stages ? `\nStages: ${stages}` : '\nAll pipeline stages will run.';
+    const modeInfo = mode === 'bounty' ? '\nMode: Bug Bounty Prepare (expanded scanning)' : '';
+
+    if (!confirm(`Start scan with ${lines.length} subdomain${lines.length !== 1 ? 's' : ''}?\n${stageInfo}${modeInfo}\n\nThis will archive the current scan data.`)) {
         return;
     }
 
@@ -2933,7 +3001,7 @@ window.startScan = async function() {
         const result = await fetch('/api/scans/new', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ subdomains }),
+            body: JSON.stringify({ subdomains, stages, mode }),
         });
         const data = await result.json();
 
@@ -3076,6 +3144,238 @@ function renderPagination(current, total, prefix) {
         </div>
     `;
 }
+
+// ---------------------------------------------------------------------------
+// Page: Bug Bounty
+// ---------------------------------------------------------------------------
+const BOUNTY_TIER_COLORS = {
+    S: { bg: 'rgba(239,68,68,0.15)', border: '#ef4444', text: '#fca5a5', label: 'Critical Priority' },
+    A: { bg: 'rgba(249,115,22,0.15)', border: '#f97316', text: '#fdba74', label: 'High Priority' },
+    B: { bg: 'rgba(234,179,8,0.15)', border: '#eab308', text: '#fde047', label: 'Medium Priority' },
+    C: { bg: 'rgba(59,130,246,0.15)', border: '#3b82f6', text: '#93c5fd', label: 'Low Priority' },
+    D: { bg: 'rgba(100,116,139,0.12)', border: '#475569', text: '#94a3b8', label: 'Background' },
+};
+
+async function pageBounty(el) {
+    let data;
+    try {
+        data = await api('/bounty');
+    } catch (e) {
+        el.innerHTML = renderErrorState(e.message);
+        return;
+    }
+
+    if (!data.available) {
+        el.innerHTML = `
+            <div class="flex items-center justify-between mb-6">
+                <div>
+                    <h1 class="text-2xl font-bold text-white">Bug Bounty Prep</h1>
+                    <p class="text-sm text-slate-500 mt-1">Ranked target list for bug bounty programs</p>
+                </div>
+            </div>
+            <div class="card p-10 text-center">
+                <div class="text-slate-600 mb-4 flex justify-center">${ICONS.bounty}</div>
+                <p class="text-slate-300 font-medium mb-2">No bounty data available</p>
+                <p class="text-sm text-slate-500 mb-4">Run the pipeline in bounty mode to generate scored targets.</p>
+                <a href="#/scans" class="btn-primary inline-flex items-center gap-2">
+                    ${ICONS.newScan} Go to New Scan
+                </a>
+            </div>
+        `;
+        return;
+    }
+
+    const items = data.items || [];
+    const summary = data.summary || [];
+    const tierOrder = ['S', 'A', 'B', 'C', 'D'];
+
+    const tierCounts = {};
+    tierOrder.forEach(t => { tierCounts[t] = 0; });
+    summary.forEach(s => { if (s.tier) tierCounts[s.tier] = s.count || 0; });
+
+    el.innerHTML = `
+        <div class="flex items-center justify-between mb-6">
+            <div>
+                <h1 class="text-2xl font-bold text-white">Bug Bounty Prep</h1>
+                <p class="text-sm text-slate-500 mt-1">${fmt(items.length)} targets scored — sorted by priority</p>
+            </div>
+            <div class="flex gap-2">
+                <button onclick="exportBounty('csv')" class="btn-secondary text-xs flex items-center gap-1.5">
+                    ${ICONS.download} CSV
+                </button>
+                <button onclick="exportBounty('json')" class="btn-secondary text-xs flex items-center gap-1.5">
+                    ${ICONS.download} JSON
+                </button>
+            </div>
+        </div>
+
+        <!-- Tier distribution -->
+        <div class="grid grid-cols-5 gap-3 mb-6">
+            ${tierOrder.map(tier => {
+                const c = BOUNTY_TIER_COLORS[tier] || BOUNTY_TIER_COLORS.D;
+                const row = summary.find(s => s.tier === tier) || {};
+                return `
+                    <div class="card p-4 text-center" style="border-color: ${c.border}; background: ${c.bg}">
+                        <div class="text-3xl font-bold" style="color: ${c.text}">${tier}</div>
+                        <div class="text-xl font-bold text-white mt-1">${fmt(row.count || 0)}</div>
+                        <div class="text-[10px] text-slate-500 uppercase tracking-wider mt-1">${c.label}</div>
+                        ${row.avg_score != null ? `<div class="text-[10px] text-slate-600 mt-0.5">avg ${row.avg_score}</div>` : ''}
+                    </div>
+                `;
+            }).join('')}
+        </div>
+
+        <!-- Target table -->
+        <div class="card overflow-hidden">
+            <div class="flex items-center justify-between px-5 py-3 border-b border-surface-border">
+                <h3 class="text-sm font-semibold text-slate-300">Ranked Targets</h3>
+                <input id="bounty-search" type="text" placeholder="Filter targets…"
+                       oninput="filterBountyTable(this.value)"
+                       class="text-xs bg-[#0a0e1a] border border-slate-700 rounded px-2 py-1 text-slate-300 placeholder-slate-600 focus:outline-none focus:border-accent w-52" />
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-xs">
+                    <thead>
+                        <tr class="border-b border-surface-border text-slate-500 uppercase tracking-wider">
+                            <th class="px-4 py-2 text-left">Tier</th>
+                            <th class="px-4 py-2 text-left">Score</th>
+                            <th class="px-4 py-2 text-left">FQDN</th>
+                            <th class="px-4 py-2 text-left">Top Signal</th>
+                            <th class="px-4 py-2 text-right">Ports</th>
+                            <th class="px-4 py-2 text-right">Findings</th>
+                            <th class="px-4 py-2 text-center">Auth</th>
+                            <th class="px-4 py-2 text-center">CDN</th>
+                        </tr>
+                    </thead>
+                    <tbody id="bounty-table-body">
+                        ${_renderBountyRows(items)}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    `;
+
+    window._bountyItems = items;
+}
+
+function _tierBadge(tier) {
+    const c = BOUNTY_TIER_COLORS[tier] || BOUNTY_TIER_COLORS.D;
+    return `<span class="font-bold text-sm px-2 py-0.5 rounded" style="color:${c.text};background:${c.bg};border:1px solid ${c.border}">${esc(tier)}</span>`;
+}
+
+function _renderBountyRows(items) {
+    if (!items.length) return `<tr><td colspan="8" class="text-center py-8 text-slate-500">No targets</td></tr>`;
+    window._bountyRowData = items;
+    return items.map((item, idx) => {
+        const highlights = item.highlights || [];
+        const topSignal = highlights[0] || '-';
+        const ports = (item.open_ports || []).length;
+        const cdn = item.behind_cdn;
+        return `
+            <tr class="border-b border-surface-border hover:bg-white/[0.02] transition-colors cursor-pointer"
+                onclick="_expandBountyRow(this, ${idx})">
+                <td class="px-4 py-2.5">${_tierBadge(item.tier)}</td>
+                <td class="px-4 py-2.5 font-bold text-white">${item.bounty_score}</td>
+                <td class="px-4 py-2.5 font-mono text-slate-200">${esc(item.fqdn)}</td>
+                <td class="px-4 py-2.5 text-slate-400 max-w-[280px] truncate" title="${esc(topSignal)}">${esc(topSignal)}</td>
+                <td class="px-4 py-2.5 text-right text-slate-300">${fmt(ports)}</td>
+                <td class="px-4 py-2.5 text-right ${item.critical_findings > 0 ? 'text-red-400' : 'text-slate-300'}">${fmt(item.nuclei_findings || 0)}</td>
+                <td class="px-4 py-2.5 text-center">${item.has_auth ? '<span class="text-green-400">✓</span>' : '<span class="text-slate-600">-</span>'}</td>
+                <td class="px-4 py-2.5 text-center">${cdn ? '<span class="text-slate-400">CDN</span>' : '<span class="text-yellow-400">Direct</span>'}</td>
+            </tr>
+        `;
+    }).join('');
+}
+
+window._expandBountyRow = function(tr, idx) {
+    const existingDetail = tr.nextElementSibling;
+    if (existingDetail && existingDetail.classList.contains('bounty-detail-row')) {
+        existingDetail.remove();
+        return;
+    }
+    const item = (window._bountyRowData || [])[idx];
+    if (!item) return;
+
+    const detail = document.createElement('tr');
+    detail.className = 'bounty-detail-row';
+    const sb = {
+        attack_surface: item.score_attack_surface,
+        technology: item.score_technology,
+        security_posture: item.score_security_posture,
+        criticality: item.score_criticality,
+    };
+    const recs = item.recommended_focus || [];
+    const highlights = item.highlights || [];
+    const techs = item.technologies || [];
+
+    detail.innerHTML = `
+        <td colspan="8" class="px-6 py-4 bg-[#0a0e1a] border-b border-surface-border">
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                <div>
+                    <div class="text-[10px] text-slate-500 uppercase tracking-wider mb-2">Score Breakdown</div>
+                    ${[['Attack Surface', sb.attack_surface, 25],['Technology', sb.technology, 25],
+                       ['Security Posture', sb.security_posture, 25],['Criticality', sb.criticality, 25]]
+                      .map(([label, val, max]) => `
+                        <div class="mb-1.5">
+                            <div class="flex justify-between text-xs mb-0.5">
+                                <span class="text-slate-400">${esc(label)}</span>
+                                <span class="text-slate-300">${val || 0}/${max}</span>
+                            </div>
+                            <div class="h-1.5 rounded bg-slate-800">
+                                <div class="h-full rounded bg-accent" style="width:${Math.round((val||0)/max*100)}%"></div>
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
+                <div>
+                    <div class="text-[10px] text-slate-500 uppercase tracking-wider mb-2">Signals Detected</div>
+                    <ul class="space-y-1">
+                        ${highlights.map(h => `<li class="text-xs text-slate-300 flex gap-1.5"><span class="text-accent mt-0.5">›</span>${esc(h)}</li>`).join('')}
+                    </ul>
+                    ${techs.length ? `<div class="mt-2 flex flex-wrap gap-1">${techs.slice(0,8).map(t => `<span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">${esc(t)}</span>`).join('')}</div>` : ''}
+                </div>
+                <div>
+                    <div class="text-[10px] text-slate-500 uppercase tracking-wider mb-2">Recommended Focus</div>
+                    <ol class="space-y-1.5 list-decimal list-inside">
+                        ${recs.map(r => `<li class="text-xs text-slate-300">${esc(r)}</li>`).join('') || '<li class="text-xs text-slate-500">No specific recommendations</li>'}
+                    </ol>
+                    <a href="#/detail/${encodeURIComponent(item.fqdn)}" class="inline-block mt-3 text-xs text-accent hover:underline">
+                        View full asset details ${ICONS.chevronRight}
+                    </a>
+                </div>
+            </div>
+        </td>
+    `;
+    tr.insertAdjacentElement('afterend', detail);
+};
+
+window.filterBountyTable = function(q) {
+    const items = window._bountyItems || [];
+    const filtered = q
+        ? items.filter(i => (i.fqdn || '').toLowerCase().includes(q.toLowerCase()))
+        : items;
+    const tbody = document.getElementById('bounty-table-body');
+    if (tbody) tbody.innerHTML = _renderBountyRows(filtered);
+};
+
+window.exportBounty = async function(fmt) {
+    try {
+        const res = await fetch(`/api/bounty/export?format=${fmt}`);
+        if (!res.ok) { alert('Export failed'); return; }
+        const data = await res.json();
+        if (fmt === 'csv') {
+            const blob = new Blob([data.csv], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a'); a.href = url; a.download = 'bounty_report.csv'; a.click();
+            URL.revokeObjectURL(url);
+        } else {
+            const blob = new Blob([JSON.stringify(data.items || data, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a'); a.href = url; a.download = 'bounty_report.json'; a.click();
+            URL.revokeObjectURL(url);
+        }
+    } catch (e) { alert('Export error: ' + e.message); }
+};
 
 // ---------------------------------------------------------------------------
 // Page: Archive Viewer

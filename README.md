@@ -84,34 +84,40 @@ vim data/input/cmdb_export.csv
 # Edit ROOT_DOMAINS in config/pipeline.env
 ```
 
-### 3. Run with Docker
+### 3. Run with Docker (one-click)
 
 ```bash
-# Build (recommended runtime: Debian Bookworm Slim)
-docker compose build
+# Build & start the dashboard
+docker compose up -d --build
 
-# Optional: build on Ubuntu 24.04 runtime base
-RUNTIME_BASE=ubuntu:24.04 docker compose build
+# Open the dashboard — configure stages, enter targets, click Start Scan
+open http://127.0.0.1:9990
 
-# Full pipeline
-docker compose run --rm --profile pipeline easm-pipeline
-
-# Single stage
-docker compose run --rm --profile pipeline easm-pipeline --stage dns
-
-# Multiple stages
-docker compose run --rm --profile pipeline easm-pipeline --stage dns,ports,http
-
-# Resume from a specific stage (runs that stage and all stages after it)
-docker compose run --rm --profile pipeline easm-pipeline --from tls
-
-# Dry run (preview what would execute)
-docker compose run --rm --profile pipeline easm-pipeline --dry-run
-docker compose run --rm --profile pipeline easm-pipeline --dry-run --from tls
+# Stop everything
+docker compose down
 ```
 
+The dashboard runs the full pipeline inside its container. Select which stages
+to run from the scan form (defaults to full pipeline).
+
+<details>
+<summary>Optional: CLI usage & advanced build options</summary>
+
+```bash
+# Build with Ubuntu 24.04 runtime base (uses Google Chrome instead of Chromium)
+RUNTIME_BASE=ubuntu:24.04 docker compose build
+
+# Run pipeline from CLI (without the dashboard)
+docker compose --profile cli run --rm easm-pipeline
+docker compose --profile cli run --rm easm-pipeline --stage dns,ports,http
+docker compose --profile cli run --rm easm-pipeline --from tls
+docker compose --profile cli run --rm easm-pipeline --dry-run
+```
+
+</details>
+
 Notes:
-- Default runtime base is `debian:bookworm-slim` (more predictable Chromium packaging in containers).
+- Default runtime base is `debian:bookworm-slim` (works on both x86_64 and arm64).
 - `ubuntu:24.04` is supported via `RUNTIME_BASE=ubuntu:24.04`; the image installs Google Chrome instead of snap-based Chromium.
 
 ### 4. Run Natively

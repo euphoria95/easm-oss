@@ -36,6 +36,11 @@ try:
 except ImportError:
     _duckdb_create_views = None
 
+try:
+    from load_duckdb import create_bounty_views as _duckdb_create_bounty_views
+except ImportError:
+    _duckdb_create_bounty_views = None
+
 DB_PATH = os.environ.get("EASM_DB_PATH", "data/output/easm.duckdb")
 STATIC_DIR = Path(__file__).parent / "static"
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -781,6 +786,86 @@ def list_takeovers(
 
 
 # ---------------------------------------------------------------------------
+# API — Bug Bounty
+# ---------------------------------------------------------------------------
+
+def _get_bounty(con) -> dict:
+    has_table = safe_query(
+        con,
+        "SELECT 1 FROM information_schema.tables WHERE table_name = 'bounty_scores'",
+    )
+    if not has_table:
+        return {"items": [], "summary": [], "available": False}
+
+    items = safe_query(con, """
+        SELECT
+            fqdn,
+            bounty_score,
+            tier,
+            score_breakdown.attack_surface   AS score_attack_surface,
+            score_breakdown.technology        AS score_technology,
+            score_breakdown.security_posture  AS score_security_posture,
+            score_breakdown.criticality       AS score_criticality,
+            highlights,
+            recommended_focus,
+            attack_surface_summary.open_ports AS open_ports,
+            attack_surface_summary.services   AS services,
+            attack_surface_summary.technologies AS technologies,
+            attack_surface_summary.has_auth   AS has_auth,
+            attack_surface_summary.behind_cdn AS behind_cdn,
+            attack_surface_summary.nuclei_findings  AS nuclei_findings,
+            attack_surface_summary.critical_findings AS critical_findings
+        FROM bounty_scores
+        ORDER BY bounty_score DESC
+    """)
+    summary = safe_query(con, "SELECT * FROM v_bounty_summary")
+    return {"items": items, "summary": summary, "available": True}
+
+
+def _export_bounty(con, fmt: str) -> dict:
+    has_table = safe_query(
+        con,
+        "SELECT 1 FROM information_schema.tables WHERE table_name = 'bounty_scores'",
+    )
+    if not has_table:
+        raise HTTPException(status_code=404, detail="No bounty data available")
+
+    rows = query_rows(con, "SELECT * FROM bounty_scores ORDER BY bounty_score DESC")
+    if fmt == "csv":
+        import io, csv as _csv
+        buf = io.StringIO()
+        if rows:
+            flat = []
+            for r in rows:
+                flat.append({
+                    "fqdn": r.get("fqdn", ""),
+                    "bounty_score": r.get("bounty_score", 0),
+                    "tier": r.get("tier", ""),
+                    "score_attack_surface": (r.get("score_breakdown") or {}).get("attack_surface", ""),
+                    "score_technology": (r.get("score_breakdown") or {}).get("technology", ""),
+                    "score_security_posture": (r.get("score_breakdown") or {}).get("security_posture", ""),
+                    "score_criticality": (r.get("score_breakdown") or {}).get("criticality", ""),
+                    "highlights": "; ".join(r.get("highlights") or []),
+                    "recommended_focus": "; ".join(r.get("recommended_focus") or []),
+                })
+            writer = _csv.DictWriter(buf, fieldnames=list(flat[0].keys()))
+            writer.writeheader()
+            writer.writerows(flat)
+        return {"csv": buf.getvalue()}
+    return {"items": rows}
+
+
+@app.get("/api/bounty", response_class=ORJSONResponse)
+def bounty_report(db=Depends(get_db)):
+    return _get_bounty(db)
+
+
+@app.get("/api/bounty/export", response_class=ORJSONResponse)
+def bounty_export(db=Depends(get_db), format: str = Query("json")):
+    return _export_bounty(db, format)
+
+
+# ---------------------------------------------------------------------------
 # API — Search
 # ---------------------------------------------------------------------------
 
@@ -839,7 +924,7 @@ def _write_scan_state(state: dict):
     SCAN_STATE_FILE.write_text(json.dumps(state, default=str))
 
 
-def _run_pipeline(scan_id: str, input_file: str, stages: str = ""):
+def _run_pipeline(scan_id: str, input_file: str, stages: str = "", mode: str = "recon"):
     """Run the pipeline in a background thread."""
     try:
         _write_scan_state({
@@ -847,6 +932,8 @@ def _run_pipeline(scan_id: str, input_file: str, stages: str = ""):
             "status": "running",
             "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "input_file": input_file,
+            "stages": stages or "full",
+            "mode": mode or "recon",
         })
 
         run_sh = PROJECT_ROOT / "run.sh"
@@ -856,6 +943,8 @@ def _run_pipeline(scan_id: str, input_file: str, stages: str = ""):
         cmd = ["bash", str(run_sh)]
         if stages:
             cmd.extend(["--stage", stages])
+        if mode and mode != "recon":
+            cmd.extend(["--mode", mode])
 
         result = subprocess.run(
             cmd,
@@ -1214,6 +1303,10 @@ async def create_scan(request: Request):
     body = await request.json()
     subdomains_text = body.get("subdomains", "").strip()
     notes = body.get("notes", "")
+    stages = body.get("stages", "").strip()
+    mode = body.get("mode", "recon").strip() or "recon"
+    if mode not in ("recon", "bounty"):
+        mode = "recon"
 
     if not subdomains_text:
         raise HTTPException(status_code=400, detail="No subdomains provided")
@@ -1240,7 +1333,7 @@ async def create_scan(request: Request):
 
     thread = threading.Thread(
         target=_run_pipeline,
-        args=(scan_id, str(input_file)),
+        args=(scan_id, str(input_file), stages, mode),
         daemon=True,
     )
     thread.start()
