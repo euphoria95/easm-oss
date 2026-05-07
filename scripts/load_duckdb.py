@@ -329,6 +329,67 @@ def create_views(con: duckdb.DuckDBPyConnection):
         GROUP BY scan_id
     """)
 
+    create_bounty_views(con)
+
+
+def create_bounty_views(con: duckdb.DuckDBPyConnection):
+    """Create bounty scoring views if bounty_scores table exists."""
+    try:
+        has_table = con.execute("""
+            SELECT 1 FROM information_schema.tables WHERE table_name = 'bounty_scores'
+        """).fetchone()
+        if not has_table:
+            return
+
+        con.execute("""
+            CREATE OR REPLACE VIEW v_bounty_scores AS
+            SELECT
+                fqdn,
+                bounty_score,
+                tier,
+                score_breakdown.attack_surface   AS score_attack_surface,
+                score_breakdown.technology        AS score_technology,
+                score_breakdown.security_posture  AS score_security_posture,
+                score_breakdown.criticality       AS score_criticality,
+                attack_surface_summary.open_ports AS open_ports,
+                attack_surface_summary.services   AS services,
+                attack_surface_summary.technologies AS technologies,
+                attack_surface_summary.has_auth   AS has_auth,
+                attack_surface_summary.behind_cdn AS behind_cdn,
+                attack_surface_summary.nuclei_findings  AS nuclei_findings,
+                attack_surface_summary.critical_findings AS critical_findings
+            FROM bounty_scores
+            ORDER BY bounty_score DESC
+        """)
+
+        try:
+            con.execute("""
+                CREATE OR REPLACE VIEW v_bounty_highlights AS
+                WITH expanded AS (
+                    SELECT fqdn, bounty_score, tier, UNNEST(highlights) AS highlight
+                    FROM bounty_scores WHERE len(highlights) > 0
+                )
+                SELECT fqdn, bounty_score, tier, highlight
+                FROM expanded
+                ORDER BY bounty_score DESC, fqdn
+            """)
+        except Exception:
+            pass
+
+        con.execute("""
+            CREATE OR REPLACE VIEW v_bounty_summary AS
+            SELECT
+                tier,
+                COUNT(*) AS count,
+                ROUND(AVG(bounty_score), 1) AS avg_score,
+                MAX(bounty_score) AS max_score
+            FROM bounty_scores
+            GROUP BY tier
+            ORDER BY CASE tier WHEN 'S' THEN 1 WHEN 'A' THEN 2 WHEN 'B' THEN 3 WHEN 'C' THEN 4 ELSE 5 END
+        """)
+    except Exception as e:
+        print(f"WARN: Could not create bounty views: {e}", file=sys.stderr)
+
 
 def export_parquet(con: duckdb.DuckDBPyConnection, db_path: str, scan_id: str):
     """Export assets table as Parquet for archival."""

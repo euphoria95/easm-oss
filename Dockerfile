@@ -1,6 +1,6 @@
 # =============================================================================
 # EASM Pipeline - Multi-stage Docker Build
-# Installs: dnsx, naabu, httpx, tlsx, nuclei, nerva, zgrab2, gowitness, subzy
+# Installs: dnsx, naabu, httpx, tlsx, nuclei, nerva, zgrab2, gowitness
 #           + Python venv (duckdb stack), jq, Chromium/Chrome
 # nerva is the primary fingerprinting engine; zgrab2 is kept for fallback.
 #
@@ -32,7 +32,6 @@ RUN go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
 RUN go install -v github.com/projectdiscovery/tlsx/cmd/tlsx@latest
 RUN go install -v github.com/projectdiscovery/pdtm/cmd/pdtm@latest
 RUN go install -v github.com/sensepost/gowitness@latest
-RUN go install -v github.com/PentestPad/subzy@latest
 RUN go install -v github.com/zmap/zgrab2/cmd/zgrab2@latest
 RUN go install -v github.com/praetorian-inc/nerva/cmd/nerva@latest
 
@@ -65,6 +64,9 @@ RUN set -eux; \
         python3 \
         python3-pip \
         python3-venv \
+        build-essential \
+        gcc \
+        python3-dev \
         sudo \
         tini; \
     if [[ "${ID}" == "ubuntu" ]]; then \
@@ -111,7 +113,6 @@ COPY --from=go-builder /go/bin/httpx     /usr/local/bin/
 COPY --from=go-builder /go/bin/tlsx      /usr/local/bin/
 COPY --from=go-builder /go/bin/pdtm      /usr/local/bin/
 COPY --from=go-builder /go/bin/gowitness /usr/local/bin/
-COPY --from=go-builder /go/bin/subzy     /usr/local/bin/
 COPY --from=go-builder /go/bin/zgrab2       /usr/local/bin/
 COPY --from=go-builder /go/bin/nerva         /usr/local/bin/
 

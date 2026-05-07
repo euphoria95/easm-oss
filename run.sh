@@ -59,11 +59,11 @@ WEB_TARGETS="${OUTPUT_DIR}/web_targets.txt"
 HTTPX_JSONL="${OUTPUT_DIR}/httpx.jsonl"
 TLS_JSONL="${OUTPUT_DIR}/tls.jsonl"
 NUCLEI_JSONL="${OUTPUT_DIR}/nuclei.jsonl"
-SUBZY_JSON="${OUTPUT_DIR}/subzy.json"
 ASSETS_JSONL="${OUTPUT_DIR}/assets.jsonl"
 DUCKDB_PATH="${SCRIPT_DIR}/${DUCKDB_PATH_VALUE}"
 ZGRAB_DIR="${OUTPUT_DIR}/zgrab"
 NERVA_JSONL="${OUTPUT_DIR}/nerva.jsonl"
+SERVICE_DETECT_JSONL="${OUTPUT_DIR}/service_detection.jsonl"
 VERIFY_JSONL="${OUTPUT_DIR}/takeover_verifications.jsonl"
 IP_TARGETS="${OUTPUT_DIR}/ip_targets.txt"
 FQDN_TARGETS="${OUTPUT_DIR}/fqdn_targets.txt"
@@ -75,10 +75,12 @@ SCAN_LOG="${LOG_DIR}/scan_${SCAN_ID}.log"
 SCAN_MARKER="${OUTPUT_DIR}/scan_id.txt"
 
 # CLI args
-STAGE_ORDER="dns,asn,rdns,ports,http,tls,fingerprint,nuclei,takeover,normalize,load,verify"
+STAGE_ORDER="dns,asn,rdns,ports,http,tls,fingerprint,nuclei,normalize,load,verify"
 STAGE_FILTER=""
 FROM_STAGE=""
 DRY_RUN=false
+DEBUG_MODE=${DEBUG_MODE:-false}
+PIPELINE_MODE="${PIPELINE_MODE:-recon}"
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -88,12 +90,16 @@ while [[ $# -gt 0 ]]; do
         --)             shift ;;
         --stage)        STAGE_FILTER="$2"; shift 2 ;;
         --from)         FROM_STAGE="$2"; shift 2 ;;
+        --mode)         PIPELINE_MODE="$2"; shift 2 ;;
         --dry-run)      DRY_RUN=true; shift ;;
+        --debug)        DEBUG_MODE=true; shift ;;
         -h|--help)
-            echo "Usage: $0 [--stage STAGE1,STAGE2 | --from STAGE] [--dry-run]"
+            echo "Usage: $0 [--stage STAGE1,STAGE2 | --from STAGE] [--mode recon|bounty] [--dry-run] [--debug]"
             echo ""
             echo "  --stage STAGES  Run only the specified comma-separated stages"
             echo "  --from  STAGE   Run from STAGE through the end of the pipeline"
+            echo "  --mode  MODE    Pipeline mode: recon (default) or bounty"
+            echo "  --debug         Enable debug mode (detailed timing and diagnostics)"
             echo ""
             echo "Stages (in order): ${STAGE_ORDER}"
             exit 0 ;;
@@ -165,16 +171,74 @@ elapsed() {
 }
 
 # ---------------------------------------------------------------------------
+# Debug mode helpers
+# ---------------------------------------------------------------------------
+declare -a DEBUG_STAGE_NAMES=()
+declare -a DEBUG_STAGE_DURATIONS=()
+
+debug_log() {
+    if [[ "${DEBUG_MODE}" == "true" ]]; then
+        local ts
+        ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "[DEBUG ${ts}] $*" | tee -a "${SCAN_LOG}"
+    fi
+}
+
+debug_stage_start() {
+    if [[ "${DEBUG_MODE}" == "true" ]]; then
+        local stage_name="$1"
+        debug_log ">>> Stage '${stage_name}' starting"
+        debug_log "    Memory: $(ps -o rss= -p $$ | awk '{printf "%.1f MB", $1/1024}')"
+    fi
+}
+
+debug_stage_end() {
+    if [[ "${DEBUG_MODE}" == "true" ]]; then
+        local stage_name="$1"
+        local duration="$2"
+        local detail="${3:-}"
+        DEBUG_STAGE_NAMES+=("${stage_name}")
+        DEBUG_STAGE_DURATIONS+=("${duration}")
+        debug_log "<<< Stage '${stage_name}' finished in ${duration}s ${detail}"
+    fi
+}
+
+debug_substep() {
+    if [[ "${DEBUG_MODE}" == "true" ]]; then
+        local msg="$1"
+        debug_log "    ↳ ${msg}"
+    fi
+}
+
+debug_summary() {
+    if [[ "${DEBUG_MODE}" != "true" ]]; then return; fi
+    log ""
+    log "==================== DEBUG: TIMING SUMMARY ===================="
+    log ""
+    printf "[%s] %-22s %10s %8s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "STAGE" "DURATION" "% TOTAL" | tee -a "${SCAN_LOG}"
+    printf "[%s] %-22s %10s %8s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(printf '%0.s-' {1..22})" "$(printf '%0.s-' {1..10})" "$(printf '%0.s-' {1..8})" | tee -a "${SCAN_LOG}"
+    local total_elapsed=$1
+    for i in "${!DEBUG_STAGE_NAMES[@]}"; do
+        local name="${DEBUG_STAGE_NAMES[$i]}"
+        local dur="${DEBUG_STAGE_DURATIONS[$i]}"
+        local pct=0
+        if [[ "${total_elapsed}" -gt 0 ]]; then
+            pct=$(( dur * 100 / total_elapsed ))
+        fi
+        printf "[%s] %-22s %9ss %7s%%\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${name}" "${dur}" "${pct}" | tee -a "${SCAN_LOG}"
+    done
+    log ""
+    log "Total pipeline duration: ${total_elapsed}s"
+    log "==============================================================="
+}
+
+# ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
-if [[ ! -f "${INPUT_SUBDOMAINS}" ]]; then
-    log "ERROR: Input file not found: ${INPUT_SUBDOMAINS}"
-    log "Place your subdomain list at data/input/subdomains.txt"
-    exit 1
-fi
-
 log "EASM Pipeline started | scan_id=${SCAN_ID}"
-log "Input: ${INPUT_SUBDOMAINS} ($(count_lines "${INPUT_SUBDOMAINS}") subdomains)"
+if [[ "${DEBUG_MODE}" == "true" ]]; then
+    log "DEBUG MODE enabled — detailed timing and diagnostics will be logged"
+fi
 
 if ${DRY_RUN}; then
     log "DRY RUN — printing stages that would execute"
@@ -187,6 +251,20 @@ if ${DRY_RUN}; then
 fi
 
 PIPELINE_START=$(date +%s)
+BOUNTY_REPORT_JSONL="${OUTPUT_DIR}/bounty_report.jsonl"
+
+# ---------------------------------------------------------------------------
+# Bounty mode overrides
+# ---------------------------------------------------------------------------
+if [[ "${PIPELINE_MODE}" == "bounty" ]]; then
+    log "BOUNTY MODE — expanded scanning configuration"
+    NAABU_TOP_PORTS=1000
+    NAABU_EXCLUDE_CDN=false
+    NERVA_MISCONFIGS=true
+    NERVA_UDP=true
+    NERVA_FAST_MODE=false
+    NUCLEI_CONFIG="${CONFIG_DIR}/nuclei-bounty.yaml"
+fi
 
 # ---------------------------------------------------------------------------
 # Scan isolation: archive orphaned outputs from any previous run, then write
@@ -215,14 +293,20 @@ if [[ -z "${STAGE_FILTER}" ]] && [[ -z "${FROM_STAGE}" ]]; then
                 rm -f "${TARGETS_FILE}" "${IP_TARGETS}" "${FQDN_TARGETS}" \
                       "${ASN_JSONL}" "${RDNS_JSONL}" "${DNS_JSONL}" "${LIVE_HOSTS}" \
                       "${PORTS_JSONL}" "${WEB_TARGETS}" "${HTTPX_JSONL}" \
-                      "${TLS_JSONL}" "${NERVA_JSONL}" "${NUCLEI_JSONL}" \
-                      "${SUBZY_JSON}" "${ASSETS_JSONL}" "${VERIFY_JSONL}"
+                      "${TLS_JSONL}" "${NERVA_JSONL}" "${SERVICE_DETECT_JSONL}" \
+                      "${NUCLEI_JSONL}" "${ASSETS_JSONL}" "${VERIFY_JSONL}"
                 mkdir -p "${ZGRAB_DIR}"
             fi
         fi
     fi
     echo "${SCAN_ID}" > "${SCAN_MARKER}"
 fi
+
+if [[ ! -f "${INPUT_SUBDOMAINS}" ]]; then
+    log "No input file found: ${INPUT_SUBDOMAINS} — nothing to scan"
+    exit 0
+fi
+log "Input: ${INPUT_SUBDOMAINS} ($(count_lines "${INPUT_SUBDOMAINS}") subdomains)"
 
 # Build normalized targets (lowercase, deduplicated)
 if [[ ! -f "${TARGETS_FILE}" ]]; then
@@ -259,6 +343,7 @@ log "Targets: fqdns=$(count_lines "${FQDN_TARGETS}") ips=$(count_lines "${IP_TAR
 if should_run "dns"; then
     log_stage "DNS RESOLUTION (dnsx)"
     stage_start=$(date +%s)
+    debug_stage_start "dns"
 
     dnsx -l "${FQDN_TARGETS}" \
         -a -aaaa -cname -ns -mx -resp \
@@ -267,6 +352,8 @@ if should_run "dns"; then
         -retry "${DNS_RETRIES:-2}" \
         -silent -json \
         -o "${DNS_JSONL}" 2>>"${SCAN_LOG}"
+
+    debug_substep "dnsx completed: input=$(count_lines "${FQDN_TARGETS}") output=$(count_lines "${DNS_JSONL}")"
 
     # Extract live hostnames
     jq -r '.host // empty' "${DNS_JSONL}" | sort -u > "${LIVE_HOSTS}"
@@ -277,6 +364,8 @@ if should_run "dns"; then
         sort -u "${LIVE_HOSTS}" -o "${LIVE_HOSTS}"
     fi
 
+    debug_substep "Live hosts extracted: $(count_lines "${LIVE_HOSTS}") IP merge included"
+    debug_stage_end "dns" "$(elapsed ${stage_start})"
     log "DNS complete | resolved=$(count_lines "${LIVE_HOSTS}") elapsed=$(elapsed ${stage_start})s"
 fi
 
@@ -286,6 +375,7 @@ fi
 if should_run "asn"; then
     log_stage "ASN ENRICHMENT (pyasn)"
     stage_start=$(date +%s)
+    debug_stage_start "asn"
 
     ASN_DB="${CACHE_DIR}/ipasn.dat"
     ASN_NAMES="${CACHE_DIR}/asn_names.tsv"
@@ -293,6 +383,7 @@ if should_run "asn"; then
     # Bootstrap ASN database if missing or stale (>7 days)
     if [[ ! -f "${ASN_DB}" ]] || [[ $(find "${CACHE_DIR}" -name "ipasn.dat" -mtime +7 2>/dev/null | wc -l) -gt 0 ]]; then
         log "Downloading fresh BGP RIB data..."
+        debug_substep "RIB download triggered"
         RIB_FILE="${CACHE_DIR}/rib_latest.bz2"
         pyasn_util_download.py --latest --filename "${RIB_FILE}" 2>>"${SCAN_LOG}" || log "WARN: RIB download failed"
         if [[ -f "${RIB_FILE}" ]]; then
@@ -307,9 +398,12 @@ if should_run "asn"; then
         [[ -f "${ASN_NAMES}" ]] && ASN_ARGS+=(--names "${ASN_NAMES}")
 
         python3 "${SCRIPT_DIR}/scripts/enrich_asn.py" "${ASN_ARGS[@]}" 2>>"${SCAN_LOG}"
+        debug_substep "IPs processed: $(count_lines "${IP_TARGETS}") → ASN records: $(count_lines "${ASN_JSONL}")"
+        debug_stage_end "asn" "$(elapsed ${stage_start})"
         log "ASN enrichment complete | ips=$(count_lines "${ASN_JSONL}") elapsed=$(elapsed ${stage_start})s"
     else
         log "WARN: No ASN database available — skipping ASN enrichment"
+        debug_stage_end "asn" "$(elapsed ${stage_start})" "(skipped)"
     fi
 fi
 
@@ -319,6 +413,7 @@ fi
 if should_run "rdns"; then
     log_stage "REVERSE DNS (dnsx -ptr)"
     stage_start=$(date +%s)
+    debug_stage_start "rdns"
 
     RDNS_INPUT="${OUTPUT_DIR}/rdns_ips.txt"
 
@@ -331,6 +426,7 @@ if should_run "rdns"; then
     IP_COUNT=$(count_lines "${RDNS_INPUT}")
     if [[ "${IP_COUNT}" -gt 0 ]]; then
         log "Reverse DNS: ${IP_COUNT} IPs"
+        debug_substep "IP count: ${IP_COUNT}"
         dnsx -l "${RDNS_INPUT}" \
             -ptr -resp \
             -r "${RESOLVERS}" \
@@ -339,9 +435,12 @@ if should_run "rdns"; then
             -silent -json \
             -o "${RDNS_JSONL}" 2>>"${SCAN_LOG}"
 
+        debug_substep "PTR records found: $(count_lines "${RDNS_JSONL}")"
+        debug_stage_end "rdns" "$(elapsed ${stage_start})"
         log "Reverse DNS complete | records=$(count_lines "${RDNS_JSONL}") elapsed=$(elapsed ${stage_start})s"
     else
         log "WARN: No IPs for reverse DNS"
+        debug_stage_end "rdns" "$(elapsed ${stage_start})" "(skipped)"
     fi
     rm -f "${RDNS_INPUT}"
 fi
@@ -352,10 +451,13 @@ fi
 if should_run "ports"; then
     log_stage "PORT SCANNING (naabu)"
     stage_start=$(date +%s)
+    debug_stage_start "ports"
 
     if [[ ! -f "${LIVE_HOSTS}" ]] || [[ $(count_lines "${LIVE_HOSTS}") -eq 0 ]]; then
         log "WARN: No live hosts — skipping port scan"
+        debug_stage_end "ports" "$(elapsed ${stage_start})" "(skipped)"
     else
+        debug_substep "live_hosts input: $(count_lines "${LIVE_HOSTS}")"
         NAABU_ARGS=(
             -l "${LIVE_HOSTS}"
             -rate "${NAABU_RATE:-1000}"
@@ -383,6 +485,8 @@ if should_run "ports"; then
 
         OPEN_PORTS=$(count_lines "${PORTS_JSONL}")
         WEB_COUNT=$(count_lines "${WEB_TARGETS}")
+        debug_substep "open_ports: ${OPEN_PORTS} web_targets: ${WEB_COUNT}"
+        debug_stage_end "ports" "$(elapsed ${stage_start})"
         log "Port scan complete | open_ports=${OPEN_PORTS} web_targets=${WEB_COUNT} elapsed=$(elapsed ${stage_start})s"
     fi
 fi
@@ -393,10 +497,13 @@ fi
 if should_run "http"; then
     log_stage "HTTP PROBING (httpx)"
     stage_start=$(date +%s)
+    debug_stage_start "http"
 
     if [[ ! -f "${WEB_TARGETS}" ]] || [[ $(count_lines "${WEB_TARGETS}") -eq 0 ]]; then
         log "WARN: No web targets — skipping HTTP probe"
+        debug_stage_end "http" "$(elapsed ${stage_start})" "(skipped)"
     else
+        debug_substep "web_targets input: $(count_lines "${WEB_TARGETS}")"
         HTTPX_ARGS=(
             -l "${WEB_TARGETS}"
             -sc -cl -ct -location -title -server -td -method -websocket
@@ -423,7 +530,56 @@ if should_run "http"; then
 
         httpx "${HTTPX_ARGS[@]}" 2>>"${SCAN_LOG}"
 
-        log "HTTP probe complete | probed=$(count_lines "${HTTPX_JSONL}") screenshots=$(find "${SCREENSHOT_DIR}" -name '*.png' 2>/dev/null | wc -l | tr -d ' ') elapsed=$(elapsed ${stage_start})s"
+        SCREENSHOTS_COUNT=$(find "${SCREENSHOT_DIR}" -name '*.png' 2>/dev/null | wc -l | tr -d ' ')
+        debug_substep "httpx output: $(count_lines "${HTTPX_JSONL}") screenshots: ${SCREENSHOTS_COUNT}"
+        debug_stage_end "http" "$(elapsed ${stage_start})"
+        log "HTTP probe complete | probed=$(count_lines "${HTTPX_JSONL}") screenshots=${SCREENSHOTS_COUNT} elapsed=$(elapsed ${stage_start})s"
+
+        # --- Service detection fallback for unprobed ports ---
+        if [[ "${SERVICE_DETECT_FALLBACK:-false}" == "true" ]] && [[ -f "${PORTS_JSONL}" ]] && [[ -f "${HTTPX_JSONL}" ]]; then
+            debug_substep "Computing unprobed ports for service detection fallback"
+
+            # Build list of host:port that httpx successfully probed
+            PROBED_SET=$(jq -r '
+                (.input // ((.host // "") + ":" + ((.port // 443) | tostring))) as $hp |
+                if ($hp | contains(":")) then $hp
+                else ((.host // "") + ":" + ((.port // 443) | tostring))
+                end
+            ' "${HTTPX_JSONL}" 2>/dev/null | sort -u)
+
+            # All web target host:port pairs
+            ALL_WEB=$(cat "${WEB_TARGETS}" 2>/dev/null | sort -u)
+
+            # Compute unprobed = all_web - probed
+            UNPROBED=$(comm -23 <(echo "${ALL_WEB}") <(echo "${PROBED_SET}"))
+            UNPROBED_COUNT=$(echo "${UNPROBED}" | grep -c . || true)
+
+            if [[ "${UNPROBED_COUNT}" -gt 0 ]]; then
+                log "Service detection fallback: ${UNPROBED_COUNT} unprobed web targets"
+                debug_substep "Running naabu -sV on ${UNPROBED_COUNT} targets"
+
+                UNPROBED_FILE="${OUTPUT_DIR}/unprobed_targets.txt"
+                echo "${UNPROBED}" > "${UNPROBED_FILE}"
+
+                NAABU_SV_ARGS=(
+                    -list "${UNPROBED_FILE}"
+                    -rate "${SERVICE_DETECT_RATE:-100}"
+                    -retries "${NAABU_RETRIES:-1}"
+                    -sV
+                    -silent -json
+                    -o "${SERVICE_DETECT_JSONL}"
+                )
+
+                naabu "${NAABU_SV_ARGS[@]}" 2>>"${SCAN_LOG}" || \
+                    log "WARN: naabu service detection had errors"
+
+                log "Service detection complete | detected=$(count_lines "${SERVICE_DETECT_JSONL}") elapsed=$(elapsed ${stage_start})s"
+                debug_substep "Service detection: $(count_lines "${SERVICE_DETECT_JSONL}") results"
+                rm -f "${UNPROBED_FILE}"
+            else
+                debug_substep "All web targets successfully probed — no service detection needed"
+            fi
+        fi
     fi
 fi
 
@@ -433,9 +589,11 @@ fi
 if should_run "tls"; then
     log_stage "TLS ANALYSIS (tlsx)"
     stage_start=$(date +%s)
+    debug_stage_start "tls"
 
     if [[ ! -f "${PORTS_JSONL}" ]]; then
         log "WARN: No ports data — skipping TLS"
+        debug_stage_end "tls" "$(elapsed ${stage_start})" "(skipped)"
     else
         TLS_PORTS_PATTERN=$(echo "${TLS_PORTS}" | sed 's/,/|/g')
         TLS_TARGETS=$(jq -r --arg ports "${TLS_PORTS_PATTERN}" \
@@ -444,7 +602,10 @@ if should_run "tls"; then
 
         if [[ -z "${TLS_TARGETS}" ]]; then
             log "WARN: No TLS targets found"
+            debug_stage_end "tls" "$(elapsed ${stage_start})" "(skipped)"
         else
+            TLS_TARGET_COUNT=$(echo "${TLS_TARGETS}" | grep -c . || true)
+            debug_substep "TLS targets: ${TLS_TARGET_COUNT}"
             echo "${TLS_TARGETS}" | \
             tlsx \
                 -ja3 -jarm -so -tv -cipher -serial \
@@ -456,6 +617,8 @@ if should_run "tls"; then
                 -o "${TLS_JSONL}" 2>>"${SCAN_LOG}" || \
                 log "WARN: tlsx had errors (partial results may be available)"
 
+            debug_substep "Certs found: $(count_lines "${TLS_JSONL}")"
+            debug_stage_end "tls" "$(elapsed ${stage_start})"
             log "TLS analysis complete | certs=$(count_lines "${TLS_JSONL}") elapsed=$(elapsed ${stage_start})s"
         fi
     fi
@@ -467,9 +630,11 @@ fi
 if should_run "fingerprint"; then
     log_stage "SERVICE FINGERPRINTING (nerva)"
     stage_start=$(date +%s)
+    debug_stage_start "fingerprint"
 
     if [[ ! -f "${PORTS_JSONL}" ]]; then
         log "WARN: No ports data — skipping fingerprinting"
+        debug_stage_end "fingerprint" "$(elapsed ${stage_start})" "(skipped)"
     else
         NERVA_TIMEOUT="${NERVA_TIMEOUT:-10}"
         NERVA_THREADS="${NERVA_THREADS:-50}"
@@ -495,9 +660,11 @@ if should_run "fingerprint"; then
 
         if [[ -z "${TARGETS}" || "${TARGET_COUNT}" -eq 0 ]]; then
             log "WARN: No targets for fingerprinting"
+            debug_stage_end "fingerprint" "$(elapsed ${stage_start})" "(skipped)"
         else
             TIMEOUT_MS=$(( NERVA_TIMEOUT * 1000 ))
             log "nerva: ${TARGET_COUNT} targets (timeout=${NERVA_TIMEOUT}s, workers=${NERVA_THREADS}, misconfigs=${NERVA_MISCONFIGS})"
+            debug_substep "nerva target count: ${TARGET_COUNT}"
 
             NERVA_CMD=(nerva
                 -w "${TIMEOUT_MS}"
@@ -511,6 +678,8 @@ if should_run "fingerprint"; then
             echo "${TARGETS}" | "${NERVA_CMD[@]}" > "${NERVA_JSONL}" 2>>"${SCAN_LOG}" || \
                 log "WARN: nerva had errors (partial results may be available)"
 
+            debug_substep "nerva fingerprints: $(count_lines "${NERVA_JSONL}")"
+            debug_stage_end "fingerprint" "$(elapsed ${stage_start})"
             log "nerva complete | fingerprints=$(count_lines "${NERVA_JSONL}") elapsed=$(elapsed ${stage_start})s"
         fi
 
@@ -544,6 +713,7 @@ if should_run "fingerprint"; then
                 ZGRAB_TOTAL=$(( ZGRAB_TOTAL + COUNT ))
             done
 
+            debug_substep "zgrab2 fallback banner count: ${ZGRAB_TOTAL}"
             log "zgrab2 fallback complete | total_banners=${ZGRAB_TOTAL} elapsed=$(elapsed ${stage_start})s"
         fi
     fi
@@ -557,6 +727,7 @@ fi
 if should_run "nuclei"; then
     log_stage "EXPOSURE SCANNING (nuclei)"
     stage_start=$(date +%s)
+    debug_stage_start "nuclei"
 
     NUCLEI_TMPL_COUNT=$(nuclei -tl 2>/dev/null | wc -l | tr -d ' ')
     if [[ "${NUCLEI_TMPL_COUNT}" -eq 0 ]]; then
@@ -565,15 +736,19 @@ if should_run "nuclei"; then
         NUCLEI_TMPL_COUNT=$(nuclei -tl 2>/dev/null | wc -l | tr -d ' ')
     fi
     log "Nuclei templates loaded: ${NUCLEI_TMPL_COUNT}"
+    debug_substep "Templates loaded: ${NUCLEI_TMPL_COUNT}"
 
     if [[ ! -f "${HTTPX_JSONL}" ]]; then
         log "WARN: No HTTP data — skipping nuclei (run from 'http' stage first)"
+        debug_stage_end "nuclei" "$(elapsed ${stage_start})" "(skipped)"
     else
         URLS=$(jq -r '.url // empty' "${HTTPX_JSONL}" | sort -u)
         URL_COUNT=$(echo "${URLS}" | grep -c . || true)
         if [[ -z "${URLS}" ]] || [[ "${URL_COUNT}" -eq 0 ]]; then
             log "WARN: No URLs extracted from ${HTTPX_JSONL}"
+            debug_stage_end "nuclei" "$(elapsed ${stage_start})" "(skipped)"
         else
+            debug_substep "URLs for pass 1: ${URL_COUNT}"
             # --- Pass 1: Generic broad scan ---
             log "Nuclei pass 1 (generic): scanning ${URL_COUNT} URLs"
             echo "${URLS}" | \
@@ -583,6 +758,7 @@ if should_run "nuclei"; then
                 -o "${NUCLEI_JSONL}" 2>>"${SCAN_LOG}" || \
                 log "WARN: nuclei pass 1 had errors"
 
+            debug_substep "Pass 1 findings: $(count_lines "${NUCLEI_JSONL}")"
             log "Pass 1 complete | findings=$(count_lines "${NUCLEI_JSONL}")"
 
             # --- Pass 2: Technology-targeted scans ---
@@ -598,6 +774,7 @@ if should_run "nuclei"; then
 
             if [[ -f "${NUCLEI_JOBS}" ]]; then
                 JOB_COUNT=$(jq '. | length' "${NUCLEI_JOBS}")
+                debug_substep "Pass 2 job count: ${JOB_COUNT}"
                 if [[ "${JOB_COUNT}" -gt 0 ]]; then
                     log "Nuclei pass 2 (targeted): ${JOB_COUNT} technology-specific jobs"
 
@@ -630,28 +807,10 @@ if should_run "nuclei"; then
                 rm -f "${NUCLEI_JOBS}"
             fi
 
+            debug_substep "Pass 2 findings: $(count_lines "${NUCLEI_JSONL}")"
+            debug_stage_end "nuclei" "$(elapsed ${stage_start})"
             log "Nuclei complete | findings=$(count_lines "${NUCLEI_JSONL}") elapsed=$(elapsed ${stage_start})s"
         fi
-    fi
-fi
-
-# ===========================================================================
-# STAGE 7: Subdomain takeover check
-# ===========================================================================
-if should_run "takeover"; then
-    log_stage "TAKEOVER CHECK (subzy)"
-    stage_start=$(date +%s)
-
-    if [[ ! -f "${LIVE_HOSTS}" ]]; then
-        log "WARN: No live hosts — skipping takeover check"
-    else
-        subzy run \
-            --targets "${LIVE_HOSTS}" \
-            --hide_fails \
-            --output "${SUBZY_JSON}" 2>>"${SCAN_LOG}" || \
-            log "WARN: subzy completed with warnings"
-
-        log "Takeover check complete | elapsed=$(elapsed ${stage_start})s"
     fi
 fi
 
@@ -661,6 +820,7 @@ fi
 if should_run "normalize"; then
     log_stage "NORMALIZATION"
     stage_start=$(date +%s)
+    debug_stage_start "normalize"
 
     NORMALIZE_ARGS=(
         --output "${ASSETS_JSONL}"
@@ -672,8 +832,8 @@ if should_run "normalize"; then
     [[ -f "${HTTPX_JSONL}" ]] && NORMALIZE_ARGS+=(--http "${HTTPX_JSONL}")
     [[ -f "${TLS_JSONL}" ]]    && NORMALIZE_ARGS+=(--tls "${TLS_JSONL}")
     [[ -f "${NERVA_JSONL}" ]] && NORMALIZE_ARGS+=(--nerva "${NERVA_JSONL}")
+    [[ -f "${SERVICE_DETECT_JSONL}" ]] && NORMALIZE_ARGS+=(--service-detect "${SERVICE_DETECT_JSONL}")
     [[ -f "${NUCLEI_JSONL}" ]] && NORMALIZE_ARGS+=(--nuclei "${NUCLEI_JSONL}")
-    [[ -f "${SUBZY_JSON}" ]]  && NORMALIZE_ARGS+=(--subzy "${SUBZY_JSON}")
     [[ -f "${CMDB_EXPORT}" ]] && NORMALIZE_ARGS+=(--cmdb "${CMDB_EXPORT}")
     [[ -f "${ASN_JSONL}" ]]   && NORMALIZE_ARGS+=(--asn "${ASN_JSONL}")
     [[ -f "${RDNS_JSONL}" ]]  && NORMALIZE_ARGS+=(--rdns "${RDNS_JSONL}")
@@ -687,6 +847,8 @@ if should_run "normalize"; then
 
     python3 "${SCRIPT_DIR}/scripts/normalize.py" "${NORMALIZE_ARGS[@]}"
 
+    debug_substep "Assets output: $(count_lines "${ASSETS_JSONL}")"
+    debug_stage_end "normalize" "$(elapsed ${stage_start})"
     log "Normalization complete | assets=$(count_lines "${ASSETS_JSONL}") elapsed=$(elapsed ${stage_start})s"
 fi
 
@@ -698,6 +860,7 @@ if should_run "load"; then
     if [[ -f "${DUCKDB_PATH}" ]]; then
         log_stage "ARCHIVING PREVIOUS SCAN"
         stage_start=$(date +%s)
+        debug_stage_start "load_archive"
 
         ARCHIVE_DIR="${SCRIPT_DIR}/data/archives"
         PREV_SCAN_ID=$(python3 -c "
@@ -711,6 +874,7 @@ except: pass
 " 2>/dev/null)
 
         if [[ -n "${PREV_SCAN_ID}" ]] && [[ ! -d "${ARCHIVE_DIR}/${PREV_SCAN_ID}" ]]; then
+            debug_substep "prev_scan_id: ${PREV_SCAN_ID} archive_path: ${ARCHIVE_DIR}/${PREV_SCAN_ID}"
             python3 "${SCRIPT_DIR}/scripts/archive_scan.py" \
                 --db "${DUCKDB_PATH}" \
                 --scan-id "${PREV_SCAN_ID}" \
@@ -718,23 +882,29 @@ except: pass
                 --input-file "${INPUT_SUBDOMAINS}" 2>>"${SCAN_LOG}" || \
                 log "WARN: Archive failed (non-fatal)"
 
+            debug_stage_end "load_archive" "$(elapsed ${stage_start})"
             log "Archive complete | prev_scan=${PREV_SCAN_ID} elapsed=$(elapsed ${stage_start})s"
         else
             log "No previous scan to archive (first run or already archived)"
+            debug_stage_end "load_archive" "$(elapsed ${stage_start})" "(skipped)"
         fi
     fi
 
     log_stage "DUCKDB LOAD"
     stage_start=$(date +%s)
+    debug_stage_start "load_duckdb"
 
     if [[ ! -f "${ASSETS_JSONL}" ]]; then
         log "WARN: No assets file — skipping DuckDB load"
+        debug_stage_end "load_duckdb" "$(elapsed ${stage_start})" "(skipped)"
     else
+        debug_substep "Assets file: $(count_lines "${ASSETS_JSONL}") records"
         python3 "${SCRIPT_DIR}/scripts/load_duckdb.py" \
             --input "${ASSETS_JSONL}" \
             --db "${DUCKDB_PATH}" \
             --scan-id "${SCAN_ID}"
 
+        debug_stage_end "load_duckdb" "$(elapsed ${stage_start})"
         log "DuckDB load complete | db=${DUCKDB_PATH} elapsed=$(elapsed ${stage_start})s"
     fi
 fi
@@ -745,16 +915,43 @@ fi
 if should_run "verify"; then
     log_stage "TAKEOVER VERIFICATION"
     stage_start=$(date +%s)
+    debug_stage_start "verify"
 
     if [[ ! -f "${DUCKDB_PATH}" ]]; then
         log "WARN: DuckDB not found — skipping takeover verification"
+        debug_stage_end "verify" "$(elapsed ${stage_start})" "(skipped)"
     else
         python3 "${SCRIPT_DIR}/scripts/verify_takeovers.py" \
             --db  "${DUCKDB_PATH}" \
             --out "${VERIFY_JSONL}" 2>>"${SCAN_LOG}" || \
             log "WARN: takeover verification completed with warnings"
 
+        debug_substep "Candidates verified: $(count_lines "${VERIFY_JSONL}")"
+        debug_stage_end "verify" "$(elapsed ${stage_start})"
         log "Takeover verification complete | elapsed=$(elapsed ${stage_start})s"
+    fi
+fi
+
+# ===========================================================================
+# STAGE 11: Bounty Scoring (bounty mode only)
+# ===========================================================================
+if [[ "${PIPELINE_MODE}" == "bounty" ]] && should_run "load"; then
+    log_stage "BOUNTY SCORING"
+    stage_start=$(date +%s)
+    debug_stage_start "bounty_scoring"
+
+    if [[ ! -f "${DUCKDB_PATH}" ]]; then
+        log "WARN: DuckDB not found — skipping bounty scoring"
+        debug_stage_end "bounty_scoring" "$(elapsed ${stage_start})" "(skipped)"
+    else
+        python3 "${SCRIPT_DIR}/scripts/score_bounty.py" \
+            --db "${DUCKDB_PATH}" \
+            --output "${BOUNTY_REPORT_JSONL}" 2>>"${SCAN_LOG}" || \
+            log "WARN: bounty scoring completed with warnings"
+
+        debug_substep "Bounty report: $(count_lines "${BOUNTY_REPORT_JSONL}")"
+        debug_stage_end "bounty_scoring" "$(elapsed ${stage_start})"
+        log "Bounty scoring complete | records=$(count_lines "${BOUNTY_REPORT_JSONL}") elapsed=$(elapsed ${stage_start})s"
     fi
 fi
 
@@ -762,9 +959,11 @@ fi
 # Summary
 # ===========================================================================
 PIPELINE_ELAPSED=$(elapsed ${PIPELINE_START})
+debug_summary "${PIPELINE_ELAPSED}"
 log "=========================================="
 log "EASM Pipeline complete"
 log "  Scan ID:      ${SCAN_ID}"
+log "  Mode:         ${PIPELINE_MODE}"
 log "  Wall clock:   ${PIPELINE_ELAPSED}s"
 log "  Targets:      $(count_lines "${TARGETS_FILE}")"
 log "  Live hosts:   $(count_lines "${LIVE_HOSTS}" 2>/dev/null || echo 0)"

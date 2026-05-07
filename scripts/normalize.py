@@ -2,7 +2,7 @@
 """
 EASM Pipeline — Asset Normalizer
 
-Merges outputs from dnsx, naabu, httpx, tlsx, nerva, zgrab2, nuclei, and subzy
+Merges outputs from dnsx, naabu, httpx, tlsx, nerva, zgrab2, nuclei
 into a single unified asset record per FQDN, keyed by the data model
 defined in the EASM plan (§4).
 
@@ -10,7 +10,7 @@ Usage:
     python3 normalize.py \
         --dns dns.jsonl --ports ports.jsonl --http httpx.jsonl \
         --tls tls.jsonl --nerva nerva.jsonl --nuclei nuclei.jsonl \
-        --subzy subzy.json --cmdb cmdb_export.csv \
+        --cmdb cmdb_export.csv \
         --output assets.jsonl --scan-id 20260419_021509
 """
 
@@ -389,6 +389,62 @@ class AssetStore:
             if port not in existing_ports:
                 asset["network"]["open_ports"].append(port_entry)
 
+    # --- Service Detection (naabu -sV fallback) ---
+    def ingest_service_detection(self, records: list[dict]):
+        """Ingest naabu -sV service detection results.
+
+        naabu -sV JSON format per line:
+            {"host":"x.x.x.x","port":8080,"protocol":"tcp",
+             "service_info":{"name":"http-proxy","product":"Squid","version":"4.13",...}}
+        """
+        for rec in records:
+            host = rec.get("host") or rec.get("ip", "")
+            port = rec.get("port")
+            if not host or port is None:
+                continue
+
+            asset = self._ensure(host)
+            if not asset:
+                continue
+            self._add_source(asset, "naabu_sv")
+
+            svc_info = rec.get("service_info") or rec.get("service") or {}
+            if isinstance(svc_info, str):
+                svc_info = {"name": svc_info}
+
+            service_name = svc_info.get("name", "") or ""
+            product = svc_info.get("product", "") or ""
+            version = svc_info.get("version", "") or ""
+
+            for p in asset["network"]["open_ports"]:
+                if p["port"] == port and not p.get("service"):
+                    p["service"] = service_name
+                    break
+
+            if service_name:
+                service_entry = {
+                    "port": port,
+                    "protocol": rec.get("protocol", "tcp"),
+                    "transport": rec.get("protocol", "tcp"),
+                    "service": service_name,
+                    "status": "detected",
+                    "banner": svc_info.get("banner", ""),
+                    "fingerprint": {
+                        "vendor": svc_info.get("vendor", ""),
+                        "product": product,
+                        "version": version,
+                        "cpe23": svc_info.get("cpe", ""),
+                        "os_vendor": "",
+                        "os_product": "",
+                        "os_version": "",
+                        "certainty": 0.5,
+                        "source": "naabu_sv",
+                    },
+                    "metadata": svc_info,
+                    "raw": {},
+                }
+                asset["services"].append(service_entry)
+
     # --- HTTP ---
     def ingest_http(self, records: list[dict]):
         for rec in records:
@@ -709,37 +765,6 @@ class AssetStore:
             }
             asset["findings"].append(finding)
 
-    # --- Subzy ---
-    def ingest_subzy(self, data: Any):
-        if data is None:
-            return
-        entries = data if isinstance(data, list) else [data]
-        for rec in entries:
-            is_vulnerable = rec.get("vulnerable", False) or rec.get("status") == "vulnerable"
-            if not is_vulnerable:
-                continue
-            host = rec.get("subdomain") or rec.get("domain", "")
-            if not host:
-                continue
-            asset = self._ensure(host)
-            if not asset:
-                continue
-            self._add_source(asset, "subzy")
-
-            service = rec.get("service") or rec.get("engine", "")
-            finding = {
-                "source": "subzy",
-                "template_id": "subdomain-takeover",
-                "name": f"Subdomain Takeover - {service or 'unknown'}",
-                "severity": "high",
-                "matched_at": host,
-                "service": service,
-                "cname": rec.get("cname", ""),
-                "vulnerable": True,
-                "timestamp": self.timestamp,
-            }
-            asset["findings"].append(finding)
-
     # --- CMDB reconciliation ---
     def reconcile_cmdb(self, cmdb: dict[str, dict]):
         if not cmdb:
@@ -1044,9 +1069,9 @@ def main():
     parser.add_argument("--http", help="httpx JSONL output")
     parser.add_argument("--tls", help="tlsx JSONL output")
     parser.add_argument("--nerva", help="nerva JSONL output")
+    parser.add_argument("--service-detect", help="naabu service detection JSONL output")
     parser.add_argument("--zgrab", action="append", default=[], help="zgrab2 JSONL output (can repeat)")
     parser.add_argument("--nuclei", help="nuclei JSONL output")
-    parser.add_argument("--subzy", help="subzy JSON output")
     parser.add_argument("--cmdb", help="CMDB CSV export")
     parser.add_argument("--output", required=True, help="Output JSONL path")
     parser.add_argument("--scan-id", default=now_iso(), help="Scan identifier")
@@ -1071,6 +1096,10 @@ def main():
         print(f"Ingesting ports: {args.ports}", file=sys.stderr)
         store.ingest_ports(read_jsonl(args.ports))
 
+    if args.service_detect:
+        print(f"Ingesting service detection: {args.service_detect}", file=sys.stderr)
+        store.ingest_service_detection(read_jsonl(args.service_detect))
+
     if args.http:
         print(f"Ingesting HTTP: {args.http}", file=sys.stderr)
         store.ingest_http(read_jsonl(args.http))
@@ -1092,11 +1121,6 @@ def main():
     if args.nuclei:
         print(f"Ingesting nuclei: {args.nuclei}", file=sys.stderr)
         store.ingest_nuclei(read_jsonl(args.nuclei))
-
-    if args.subzy:
-        print(f"Ingesting subzy: {args.subzy}", file=sys.stderr)
-        data = read_json_file(args.subzy)
-        store.ingest_subzy(data)
 
     # CDN enrichment (multi-signal, runs after all data sources ingested)
     try:

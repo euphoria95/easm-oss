@@ -33,10 +33,11 @@ INTERMEDIATE_FILES = [
     "httpx.jsonl",
     "tls.jsonl",
     "nerva.jsonl",
+    "service_detection.jsonl",
     "nuclei.jsonl",
-    "subzy.json",
     "assets.jsonl",
     "takeover_verifications.jsonl",
+    "bounty_report.jsonl",
 ]
 
 
