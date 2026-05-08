@@ -2612,6 +2612,7 @@ function filterServices(key, val) {
 // Page: New Scan
 // ---------------------------------------------------------------------------
 let _scanPollTimer = null;
+let _logPollTimer = null;
 
 async function pageScans(el) {
     const [scansData, activeData] = await Promise.all([
@@ -2762,14 +2763,18 @@ async function pageScans(el) {
 
     // Poll if scan is running
     if (_scanPollTimer) clearInterval(_scanPollTimer);
+    if (_logPollTimer) { clearInterval(_logPollTimer); _logPollTimer = null; }
     if (active) {
         _scanPollTimer = setInterval(async () => {
             try {
                 const st = await api('/scans/active');
                 if (st.status !== 'running') {
-                    clearInterval(_scanPollTimer);
-                    _scanPollTimer = null;
+                    clearInterval(_scanPollTimer); _scanPollTimer = null;
+                    if (_logPollTimer) { clearInterval(_logPollTimer); _logPollTimer = null; }
                     pageScans(el);
+                } else {
+                    const stageEl = document.getElementById('scan-current-stage');
+                    if (stageEl && st.current_stage) stageEl.textContent = st.current_stage;
                 }
             } catch { /* ignore */ }
         }, 5000);
@@ -2785,6 +2790,7 @@ function _renderActiveScan(active) {
     const stagesLabel = active.stages && active.stages !== 'full'
         ? active.stages.split(',').join(', ')
         : 'Full Pipeline';
+    const stageDisplay = active.current_stage || 'Initializing…';
     return `
         <div class="scan-progress">
             <div class="flex items-center gap-3 mb-3">
@@ -2811,10 +2817,48 @@ function _renderActiveScan(active) {
                     <span class="text-slate-500">Mode:</span>
                     <span class="text-slate-300 ml-1">${esc(active.mode || 'recon')}</span>
                 </div>
+                <div class="col-span-2">
+                    <span class="text-slate-500">Current stage:</span>
+                    <span id="scan-current-stage" class="text-accent ml-1">${esc(stageDisplay)}</span>
+                </div>
             </div>
-            <p class="text-xs text-slate-500 mt-3">Auto-refreshes every 5 seconds. Previous scan data is being archived.</p>
+            <div class="mt-3">
+                <button id="debug-log-btn" onclick="toggleDebugLogs()" class="btn-secondary text-xs py-1 px-2">Show logs</button>
+                <div id="debug-log-panel" style="display:none" class="mt-2">
+                    <pre id="debug-log-content" class="text-xs text-slate-400 font-mono bg-slate-900/60 rounded p-2 max-h-52 overflow-auto whitespace-pre-wrap break-all"></pre>
+                </div>
+            </div>
+            <p class="text-xs text-slate-500 mt-3">Auto-refreshes every 5 seconds.</p>
         </div>
     `;
+}
+
+function toggleDebugLogs() {
+    const panel = document.getElementById('debug-log-panel');
+    const btn = document.getElementById('debug-log-btn');
+    if (!panel) return;
+    const open = panel.style.display !== 'none';
+    if (open) {
+        panel.style.display = 'none';
+        if (btn) btn.textContent = 'Show logs';
+        if (_logPollTimer) { clearInterval(_logPollTimer); _logPollTimer = null; }
+    } else {
+        panel.style.display = 'block';
+        if (btn) btn.textContent = 'Hide logs';
+        _fetchDebugLogs();
+        _logPollTimer = setInterval(_fetchDebugLogs, 3000);
+    }
+}
+
+async function _fetchDebugLogs() {
+    try {
+        const data = await api('/scans/logs?lines=80');
+        const el = document.getElementById('debug-log-content');
+        if (el && data.lines) {
+            el.textContent = data.lines.join('\n');
+            el.scrollTop = el.scrollHeight;
+        }
+    } catch { /* ignore */ }
 }
 
 function _renderLastScanResult(scan) {

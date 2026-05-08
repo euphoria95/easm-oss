@@ -47,6 +47,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 ARCHIVE_DIR = PROJECT_ROOT / "data" / "archives"
 INPUT_DIR = PROJECT_ROOT / "data" / "input"
 SCAN_STATE_FILE = PROJECT_ROOT / "data" / ".scan_state.json"
+LOGS_DIR = PROJECT_ROOT / "logs"
 
 app = FastAPI(title="EASM Dashboard", version="1.0.0")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -924,6 +925,28 @@ def _write_scan_state(state: dict):
     SCAN_STATE_FILE.write_text(json.dumps(state, default=str))
 
 
+def _get_current_stage(scan_id: str | None) -> str | None:
+    if not scan_id:
+        return None
+    log_path = LOGS_DIR / f"scan_{scan_id}.log"
+    if not log_path.exists():
+        return None
+    try:
+        with log_path.open("rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 10240))
+            tail = f.read().decode("utf-8", errors="replace")
+        for line in reversed(tail.splitlines()):
+            if "========== STAGE:" in line:
+                m = re.search(r"STAGE:\s*(.+?)\s*=+\s*$", line)
+                if m:
+                    return m.group(1).strip()
+    except Exception:
+        pass
+    return None
+
+
 def _run_pipeline(scan_id: str, input_file: str, stages: str = "", mode: str = "recon"):
     """Run the pipeline in a background thread."""
     try:
@@ -952,7 +975,6 @@ def _run_pipeline(scan_id: str, input_file: str, stages: str = "", mode: str = "
             env=env,
             capture_output=True,
             text=True,
-            timeout=3600,
         )
 
         status = "completed" if result.returncode == 0 else "failed"
@@ -964,11 +986,6 @@ def _run_pipeline(scan_id: str, input_file: str, stages: str = "", mode: str = "
             state["error"] = (result.stderr or "")[-500:]
         _write_scan_state(state)
 
-    except subprocess.TimeoutExpired:
-        state = _read_scan_state()
-        state["status"] = "failed"
-        state["error"] = "Pipeline timed out after 3600s"
-        _write_scan_state(state)
     except Exception as e:
         state = _read_scan_state()
         state["status"] = "failed"
@@ -1351,7 +1368,30 @@ def active_scan():
     state = _read_scan_state()
     if not state:
         return {"status": "idle"}
+    if state.get("status") == "running":
+        state["current_stage"] = _get_current_stage(state.get("scan_id"))
     return state
+
+
+@app.get("/api/scans/logs", response_class=ORJSONResponse)
+def scan_logs(lines: int = 100):
+    state = _read_scan_state()
+    scan_id = state.get("scan_id")
+    if not scan_id:
+        return {"lines": []}
+    log_path = LOGS_DIR / f"scan_{scan_id}.log"
+    if not log_path.exists():
+        return {"lines": [], "scan_id": scan_id}
+    n = min(lines, 500)
+    try:
+        with log_path.open("rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - n * 120))
+            content = f.read().decode("utf-8", errors="replace")
+        return {"lines": content.splitlines()[-n:], "scan_id": scan_id}
+    except Exception as e:
+        return {"lines": [], "error": str(e)}
 
 
 @app.get("/api/scans", response_class=ORJSONResponse)
