@@ -289,6 +289,8 @@ def load_candidates(con: duckdb.DuckDBPyConnection) -> list[tuple[str, str, str]
        service — catches everything subzy missed due to HTTP errors.
     """
     # Source 1: pipeline findings
+    # Note: findings struct contains: template_id, name, template, severity, ...
+    # Avoid f.vulnerable / f.source which may not exist in older schema versions.
     src1: list[tuple[str, str, str]] = con.execute("""
         WITH expanded AS (
             SELECT fqdn, UNNEST(findings) AS f
@@ -297,11 +299,10 @@ def load_candidates(con: duckdb.DuckDBPyConnection) -> list[tuple[str, str, str]
         )
         SELECT DISTINCT
             fqdn,
-            COALESCE(f.service, '') AS service,
-            COALESCE(CAST(f.cname AS VARCHAR), '') AS cname
+            '' AS service,
+            '' AS cname
         FROM expanded
-        WHERE (f.source = 'subzy'  AND f.vulnerable = true)
-           OR (f.source = 'nuclei' AND f.template_id LIKE '%takeover%')
+        WHERE f.template_id LIKE '%takeover%'
     """).fetchall()
 
     # FQDNs already covered by subzy/nuclei — DNS source won't add duplicates for these

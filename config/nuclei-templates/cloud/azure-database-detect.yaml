@@ -1,0 +1,30 @@
+id: azure-database-detect
+info:
+  name: Azure Database Endpoint Detection
+  author: easm-pipeline
+  severity: high
+  description: Detects Azure SQL Database, Cosmos DB, and Redis Cache endpoints.
+  tags: cloud,azure,database
+  metadata:
+    provider: azure
+    service: database
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}"
+    matchers-condition: or
+    matchers:
+      - type: word
+        words:
+          - "database.windows.net"
+          - "documents.azure.com"
+          - "redis.cache.windows.net"
+          - "mongo.cosmos.azure.com"
+        condition: or
+        part: body
+
+      - type: regex
+        regex:
+          - '(?i)\.(database\.windows\.net|documents\.azure\.com|redis\.cache\.windows\.net|mongo\.cosmos\.azure\.com)'
+        part: header

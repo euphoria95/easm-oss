@@ -26,7 +26,7 @@ from pathlib import Path
 import duckdb
 import orjson
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 # Import create_views from pipeline scripts
@@ -40,6 +40,16 @@ try:
     from load_duckdb import create_bounty_views as _duckdb_create_bounty_views
 except ImportError:
     _duckdb_create_bounty_views = None
+
+try:
+    from load_duckdb import create_livecheck_views as _duckdb_create_livecheck_views
+except ImportError:
+    _duckdb_create_livecheck_views = None
+
+try:
+    from load_duckdb import create_cloud_views as _duckdb_create_cloud_views
+except ImportError:
+    _duckdb_create_cloud_views = None
 
 DB_PATH = os.environ.get("EASM_DB_PATH", "data/output/easm.duckdb")
 STATIC_DIR = Path(__file__).parent / "static"
@@ -113,7 +123,7 @@ def root():
 
 @app.get("/favicon.ico")
 def favicon():
-    return JSONResponse(status_code=204, content=None)
+    return Response(status_code=204)
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +227,30 @@ def _get_overview(con) -> dict:
         """,
     )
 
+    # AIMAP: AI agent findings
+    aimap_findings = safe_query(
+        con,
+        """
+        SELECT
+            template_id,
+            finding_name,
+            severity,
+            COUNT(*) AS count
+        FROM v_findings
+        WHERE finding_source = 'aimap'
+        GROUP BY template_id, finding_name, severity
+        ORDER BY count DESC
+        LIMIT 20
+        """,
+    )
+    aimap_total = sum(r["count"] for r in aimap_findings)
+
+    # Cloud endpoints summary
+    cloud_providers = safe_query(con, "SELECT * FROM v_cloud_providers")
+    cloud_risk = safe_query(con, "SELECT * FROM v_cloud_risk")
+    cloud_total = sum(r["count"] for r in (cloud_risk or []))
+    cloud_hosts = sum(r["host_count"] for r in (cloud_providers or []))
+
     total = scan.get("total_assets", 0) or 0
     tls_total = tls_health.get("total_certs", 0) or 0
     tls_issues_count = sum(
@@ -246,6 +280,13 @@ def _get_overview(con) -> dict:
         "critical_findings": critical_findings,
         "service_distribution": service_dist,
         "top_software": top_software,
+        "aimap": {"total": aimap_total, "findings": aimap_findings},
+        "cloud": {
+            "total_endpoints": cloud_total,
+            "total_hosts": cloud_hosts,
+            "providers": cloud_providers,
+            "risk_distribution": cloud_risk,
+        },
     }
 
 
@@ -442,6 +483,140 @@ def _get_findings_tags(con) -> dict:
 @app.get("/api/findings/tags", response_class=ORJSONResponse)
 def findings_tags(db=Depends(get_db)):
     return _get_findings_tags(db)
+
+
+# ---------------------------------------------------------------------------
+# API — AIMAP (AI Agent Discovery)
+# ---------------------------------------------------------------------------
+
+def _get_aimap(con, search: str, limit: int) -> dict:
+    where = ["finding_source = 'aimap'"]
+    params = []
+    if search:
+        where.append("(fqdn ILIKE ? OR finding_name ILIKE ? OR template_id ILIKE ?)")
+        params.extend([f"%{search}%"] * 3)
+
+    where_sql = " WHERE " + " AND ".join(where)
+    sql = f"SELECT * FROM v_findings{where_sql} LIMIT ?"
+    params.append(limit)
+    items = query_rows(con, sql, params)
+
+    # Protocol breakdown from tags
+    protocol_breakdown = safe_query(
+        con,
+        """
+        WITH aimap_tags AS (
+            SELECT UNNEST(tags) AS tag
+            FROM v_findings
+            WHERE finding_source = 'aimap' AND tags IS NOT NULL
+        )
+        SELECT tag AS protocol, COUNT(*) AS count
+        FROM aimap_tags
+        WHERE tag IN ('mcp', 'ollama', 'openai_compat', 'langserve', 'gradio',
+                      'streamlit', 'comfyui', 'textgen_webui', 'open_webui', 'openclaw')
+        GROUP BY tag
+        ORDER BY count DESC
+        """,
+    )
+
+    severity_summary = safe_query(
+        con,
+        """
+        SELECT severity, COUNT(*) AS count
+        FROM v_findings
+        WHERE finding_source = 'aimap'
+        GROUP BY severity
+        ORDER BY CASE severity
+            WHEN 'critical' THEN 1 WHEN 'high' THEN 2
+            WHEN 'medium' THEN 3 WHEN 'low' THEN 4
+            WHEN 'info' THEN 5 ELSE 6
+        END
+        """,
+    )
+
+    affected_hosts = safe_query(
+        con,
+        """
+        SELECT fqdn, COUNT(*) AS finding_count
+        FROM v_findings
+        WHERE finding_source = 'aimap'
+        GROUP BY fqdn
+        ORDER BY finding_count DESC
+        LIMIT 20
+        """,
+    )
+
+    return {
+        "items": items,
+        "protocols": protocol_breakdown,
+        "severity": severity_summary,
+        "affected_hosts": affected_hosts,
+        "total": sum(r["count"] for r in severity_summary),
+    }
+
+
+@app.get("/api/aimap", response_class=ORJSONResponse)
+def aimap_findings(
+    db=Depends(get_db),
+    search: str = Query(""),
+    limit: int = Query(200, ge=1, le=1000),
+):
+    return _get_aimap(db, search, limit)
+
+
+# ---------------------------------------------------------------------------
+# API — Cloud Endpoints
+# ---------------------------------------------------------------------------
+
+def _get_cloud(con, provider: str, service: str, risk: str, search: str, limit: int) -> dict:
+    where = []
+    params = []
+    if provider:
+        where.append("provider = ?")
+        params.append(provider)
+    if service:
+        where.append("service = ?")
+        params.append(service)
+    if risk:
+        where.append("risk = ?")
+        params.append(risk)
+    if search:
+        where.append("(fqdn ILIKE ? OR service_label ILIKE ? OR hostname ILIKE ? OR resource_name ILIKE ?)")
+        params.extend([f"%{search}%"] * 4)
+
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    items = safe_query(
+        con,
+        f"SELECT * FROM v_cloud_endpoints{where_sql} LIMIT ?",
+        params + [limit],
+    )
+
+    summary = safe_query(con, "SELECT * FROM v_cloud_summary")
+    providers = safe_query(con, "SELECT * FROM v_cloud_providers")
+    risk_dist = safe_query(con, "SELECT * FROM v_cloud_risk")
+
+    scan = query_one(con, "SELECT * FROM v_scan_stats LIMIT 1") or {}
+
+    return {
+        "items": items,
+        "summary": summary,
+        "providers": providers,
+        "risk_distribution": risk_dist,
+        "total_endpoints": sum(r["count"] for r in (summary or [])),
+        "total_hosts": scan.get("cloud_assets", 0),
+    }
+
+
+@app.get("/api/cloud", response_class=ORJSONResponse)
+def cloud_endpoints(
+    db=Depends(get_db),
+    provider: str = Query(""),
+    service: str = Query(""),
+    risk: str = Query(""),
+    search: str = Query(""),
+    limit: int = Query(500, ge=1, le=2000),
+):
+    return _get_cloud(db, provider, service, risk, search, limit)
 
 
 # ---------------------------------------------------------------------------
@@ -864,6 +1039,66 @@ def bounty_report(db=Depends(get_db)):
 @app.get("/api/bounty/export", response_class=ORJSONResponse)
 def bounty_export(db=Depends(get_db), format: str = Query("json")):
     return _export_bounty(db, format)
+
+
+# ---------------------------------------------------------------------------
+# API — Livecheck (CMDB scope governance)
+# ---------------------------------------------------------------------------
+
+def _get_livecheck(con) -> dict:
+    summary = safe_query(con, "SELECT * FROM v_livecheck_summary LIMIT 1")
+    summary = summary[0] if summary else {}
+
+    scope_removals = safe_query(
+        con,
+        "SELECT * FROM v_scope_removals ORDER BY days_unavailable DESC LIMIT 50",
+    )
+
+    cdn_exclusions = safe_query(
+        con,
+        "SELECT * FROM v_cdn_exclusions ORDER BY cdn_provider, fqdn LIMIT 50",
+    )
+
+    cname_bloat = safe_query(
+        con,
+        "SELECT * FROM v_cname_bloat ORDER BY cname_chain_depth DESC LIMIT 50",
+    )
+
+    leaf_domains = safe_query(
+        con,
+        "SELECT * FROM v_leaf_domains ORDER BY resolves, fqdn LIMIT 50",
+    )
+
+    third_party_ns = safe_query(
+        con,
+        "SELECT * FROM v_third_party_ns ORDER BY ns_provider, fqdn LIMIT 50",
+    )
+
+    # Scope action distribution
+    scope_actions = safe_query(
+        con,
+        """
+        SELECT scope_action, COUNT(*) AS count
+        FROM livecheck
+        GROUP BY scope_action
+        ORDER BY count DESC
+        """,
+    )
+
+    return {
+        "summary": summary,
+        "scope_removals": scope_removals,
+        "cdn_exclusions": cdn_exclusions,
+        "cname_bloat": cname_bloat,
+        "leaf_domains": leaf_domains,
+        "third_party_ns": third_party_ns,
+        "scope_actions": scope_actions,
+    }
+
+
+@app.get("/api/livecheck", response_class=ORJSONResponse)
+def livecheck_report(db=Depends(get_db)):
+    return _get_livecheck(db)
 
 
 # ---------------------------------------------------------------------------
@@ -1453,12 +1688,14 @@ def restore_scan(scan_id: str):
     if current.get("status") == "running":
         raise HTTPException(status_code=409, detail="A scan is currently running")
 
-    scan_dir = ARCHIVE_DIR / scan_id
-    archived_db = scan_dir / "easm.duckdb"
+    # Build the archive DB from JSONL if it doesn't exist yet
+    archived_db = _check_archive_path(scan_id)
     if not archived_db.exists():
         raise HTTPException(status_code=404, detail="Archived database not found")
 
-    import shutil
+    # Evict any cached connection for this scan before copying
+    _evict_archive_cache(scan_id)
+
     target = Path(DB_PATH)
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(str(archived_db), str(target))

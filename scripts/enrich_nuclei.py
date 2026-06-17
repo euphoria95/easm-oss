@@ -64,6 +64,9 @@ TECH_TAG_MAP = {
     "mikrotik": "mikrotik",
     "amazon s3": "s3,aws",
     "amazon web services": "aws",
+    "azure": "cloud,azure",
+    "microsoft azure": "cloud,azure",
+    "google cloud": "cloud,gcp",
     "php": "php",
     "java": "java",
 }

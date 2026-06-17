@@ -1,0 +1,38 @@
+id: azure-appservice-detect
+info:
+  name: Azure App Service Detection
+  author: easm-pipeline
+  severity: info
+  description: Detects Azure App Service (azurewebsites.net) endpoints and Kudu/SCM panels.
+  tags: cloud,azure,appservice
+  metadata:
+    provider: azure
+    service: app_service
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}"
+    matchers-condition: or
+    matchers:
+      - type: word
+        words:
+          - "azurewebsites.net"
+          - "Azure App Service"
+          - "Microsoft Azure App Service"
+        condition: or
+        part: body
+
+      - type: regex
+        regex:
+          - '(?i)\.azurewebsites\.net'
+          - '(?i)\.scm\.azurewebsites\.net'
+        condition: or
+        part: header
+
+      - type: word
+        words:
+          - "x-ms-request-id"
+          - "x-azure-ref"
+        condition: and
+        part: header

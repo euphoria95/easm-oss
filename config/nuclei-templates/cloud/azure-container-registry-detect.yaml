@@ -1,0 +1,36 @@
+id: azure-container-registry-detect
+info:
+  name: Azure Container Registry Detection
+  author: easm-pipeline
+  severity: medium
+  description: Detects Azure Container Registry (azurecr.io) endpoints.
+  tags: cloud,azure,container,registry
+  metadata:
+    provider: azure
+    service: container_registry
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/v2/"
+      - "{{BaseURL}}"
+    stop-at-first-match: true
+    matchers-condition: or
+    matchers:
+      - type: word
+        words:
+          - "azurecr.io"
+          - "Azure Container Registry"
+        condition: or
+        part: body
+
+      - type: regex
+        regex:
+          - '(?i)\.azurecr\.io'
+        part: header
+
+      - type: word
+        words:
+          - "Www-Authenticate"
+        part: header
+        condition: and

@@ -48,6 +48,22 @@ def read_jsonl(path: str) -> list[dict]:
     return records
 
 
+def iter_jsonl(path: str):
+    """Iterate over a JSONL file line-by-line without loading all into memory."""
+    p = Path(path)
+    if not p.exists():
+        return
+    with open(p, "rb") as f:
+        for line_no, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield orjson.loads(line)
+            except orjson.JSONDecodeError:
+                print(f"WARN: Skipping malformed JSON at {path}:{line_no}", file=sys.stderr)
+
+
 def read_json_file(path: str) -> Any:
     """Read a single JSON file."""
     p = Path(path)
@@ -155,6 +171,12 @@ class AssetStore:
                     "match_basis": [],
                     "in_cmdb": False,
                     "gap_type": None,
+                },
+                "cloud": {
+                    "endpoints": [],
+                    "providers": [],
+                    "services": [],
+                    "risk_summary": None,
                 },
             }
         return self.assets[fqdn]
@@ -765,6 +787,113 @@ class AssetStore:
             }
             asset["findings"].append(finding)
 
+    # --- AIMAP (AI Agent Discovery) ---
+    def ingest_aimap(self, records: list[dict]):
+        for rec in records:
+            host = rec.get("host", "")
+            # AIMAP outputs full URLs in "host" (e.g. "https://example.com:8443")
+            if "://" in host:
+                host = host.split("://")[1].split("/")[0].split(":")[0]
+            if not host:
+                matched = rec.get("matched-at", "") or rec.get("matched_at", "")
+                if "://" in matched:
+                    host = matched.split("://")[1].split("/")[0].split(":")[0]
+            if not host:
+                continue
+
+            asset = self._ensure(host)
+            if not asset:
+                continue
+            self._add_source(asset, "aimap")
+
+            info = rec.get("info", {})
+            tags = info.get("tags", [])
+            if isinstance(tags, str):
+                tags = tags.split(",")
+
+            finding = {
+                "source": "aimap",
+                "template_id": rec.get("template-id") or rec.get("template_id", ""),
+                "template": rec.get("template", ""),
+                "name": info.get("name", ""),
+                "severity": info.get("severity", "unknown"),
+                "matched_at": rec.get("matched-at") or rec.get("matched_at", ""),
+                "extracted_results": rec.get("extracted-results") or rec.get("extracted_results", []),
+                "tags": tags,
+                "description": info.get("description", ""),
+                "curl_command": rec.get("curl-command", ""),
+                "timestamp": rec.get("timestamp", self.timestamp),
+            }
+
+            # Tag asset with detected AI protocol if present
+            ai_protocols = {"mcp", "ollama", "openai_compat", "langserve",
+                            "gradio", "streamlit", "comfyui", "textgen_webui",
+                            "open_webui", "openclaw"}
+            detected = [t for t in tags if t in ai_protocols]
+            if detected:
+                if "ai_protocols" not in asset:
+                    asset["ai_protocols"] = []
+                for proto in detected:
+                    if proto not in asset["ai_protocols"]:
+                        asset["ai_protocols"].append(proto)
+
+            asset["findings"].append(finding)
+
+    # --- Cloud Enumeration ---
+    def ingest_cloud_enum(self, records):
+        """Ingest cloud endpoint enumeration results from cloud_enum.py."""
+        for rec in records:
+            fqdn = (rec.get("fqdn") or "").lower().strip()
+            if not fqdn:
+                continue
+
+            asset = self._ensure(fqdn)
+            if not asset:
+                continue
+            self._add_source(asset, "cloud_enum")
+
+            provider = rec.get("provider", "")
+            service = rec.get("service", "")
+            risk = rec.get("risk", "info")
+
+            endpoint = {
+                "provider": provider,
+                "service": service,
+                "service_label": rec.get("service_label", service),
+                "risk": risk,
+                "resource_name": rec.get("resource_name", ""),
+                "hostname": rec.get("hostname", ""),
+                "pattern": rec.get("pattern", ""),
+                "signals": rec.get("signals", []),
+            }
+
+            # Dedup
+            existing = {
+                f"{e['provider']}:{e['service']}"
+                for e in asset["cloud"]["endpoints"]
+            }
+            key = f"{provider}:{service}"
+            if key not in existing:
+                asset["cloud"]["endpoints"].append(endpoint)
+
+            if provider and provider not in asset["cloud"]["providers"]:
+                asset["cloud"]["providers"].append(provider)
+            if service and service not in asset["cloud"]["services"]:
+                asset["cloud"]["services"].append(service)
+
+            # Tag the asset
+            self._add_tag(asset, "cloud")
+            self._add_tag(asset, f"cloud_{provider}")
+
+        # Compute risk summary per asset
+        risk_order = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+        for fqdn, asset in self.assets.items():
+            endpoints = asset["cloud"]["endpoints"]
+            if not endpoints:
+                continue
+            max_risk = max(endpoints, key=lambda e: risk_order.get(e["risk"], 0))
+            asset["cloud"]["risk_summary"] = max_risk["risk"]
+
     # --- CMDB reconciliation ---
     def reconcile_cmdb(self, cmdb: dict[str, dict]):
         if not cmdb:
@@ -868,6 +997,8 @@ class AssetStore:
             1 for a in self.assets.values()
             if any(s.get("fingerprint", {}).get("cpe23") for s in a.get("services", []))
         )
+        cloud_assets = sum(1 for a in self.assets.values() if a["cloud"]["endpoints"])
+        cloud_endpoints = sum(len(a["cloud"]["endpoints"]) for a in self.assets.values())
 
         return {
             "total_assets": total,
@@ -882,6 +1013,8 @@ class AssetStore:
             "findings_by_severity": dict(sev_counts),
             "total_services": total_services,
             "with_fingerprints": with_fingerprints,
+            "cloud_assets": cloud_assets,
+            "cloud_endpoints": cloud_endpoints,
         }
 
 
@@ -1072,6 +1205,8 @@ def main():
     parser.add_argument("--service-detect", help="naabu service detection JSONL output")
     parser.add_argument("--zgrab", action="append", default=[], help="zgrab2 JSONL output (can repeat)")
     parser.add_argument("--nuclei", help="nuclei JSONL output")
+    parser.add_argument("--aimap", help="AIMAP AI agent discovery JSONL output")
+    parser.add_argument("--cloud-enum", help="Cloud endpoint enumeration JSONL output")
     parser.add_argument("--cmdb", help="CMDB CSV export")
     parser.add_argument("--output", required=True, help="Output JSONL path")
     parser.add_argument("--scan-id", default=now_iso(), help="Scan identifier")
@@ -1082,45 +1217,54 @@ def main():
     # Ingest in pipeline order
     if args.dns:
         print(f"Ingesting DNS: {args.dns}", file=sys.stderr)
-        store.ingest_dns(read_jsonl(args.dns))
+        store.ingest_dns(iter_jsonl(args.dns))
 
     if args.asn:
         print(f"Ingesting ASN: {args.asn}", file=sys.stderr)
-        store.ingest_asn(read_jsonl(args.asn))
+        store.ingest_asn(iter_jsonl(args.asn))
 
     if args.rdns:
         print(f"Ingesting rDNS: {args.rdns}", file=sys.stderr)
-        store.ingest_rdns(read_jsonl(args.rdns))
+        store.ingest_rdns(iter_jsonl(args.rdns))
 
     if args.ports:
         print(f"Ingesting ports: {args.ports}", file=sys.stderr)
-        store.ingest_ports(read_jsonl(args.ports))
+        store.ingest_ports(iter_jsonl(args.ports))
 
     if args.service_detect:
         print(f"Ingesting service detection: {args.service_detect}", file=sys.stderr)
-        store.ingest_service_detection(read_jsonl(args.service_detect))
+        store.ingest_service_detection(iter_jsonl(args.service_detect))
 
     if args.http:
         print(f"Ingesting HTTP: {args.http}", file=sys.stderr)
-        store.ingest_http(read_jsonl(args.http))
+        store.ingest_http(iter_jsonl(args.http))
 
     if args.tls:
         print(f"Ingesting TLS: {args.tls}", file=sys.stderr)
-        store.ingest_tls(read_jsonl(args.tls))
+        store.ingest_tls(iter_jsonl(args.tls))
 
     if args.nerva:
         print(f"Ingesting nerva: {args.nerva}", file=sys.stderr)
-        store.ingest_nerva(read_jsonl(args.nerva))
+        store.ingest_nerva(iter_jsonl(args.nerva))
 
     for zgrab_file in args.zgrab:
         # Extract module name from filename: zgrab_ssh.jsonl → ssh
         module = Path(zgrab_file).stem.replace("zgrab_", "")
         print(f"Ingesting zgrab2 ({module}): {zgrab_file}", file=sys.stderr)
-        store.ingest_zgrab(read_jsonl(zgrab_file), module)
+        store.ingest_zgrab(iter_jsonl(zgrab_file), module)
 
     if args.nuclei:
         print(f"Ingesting nuclei: {args.nuclei}", file=sys.stderr)
-        store.ingest_nuclei(read_jsonl(args.nuclei))
+        store.ingest_nuclei(iter_jsonl(args.nuclei))
+
+    if args.aimap:
+        print(f"Ingesting AIMAP: {args.aimap}", file=sys.stderr)
+        store.ingest_aimap(iter_jsonl(args.aimap))
+
+    cloud_enum_arg = getattr(args, 'cloud_enum', None)
+    if cloud_enum_arg:
+        print(f"Ingesting cloud enum: {cloud_enum_arg}", file=sys.stderr)
+        store.ingest_cloud_enum(iter_jsonl(cloud_enum_arg))
 
     # CDN enrichment (multi-signal, runs after all data sources ingested)
     try:

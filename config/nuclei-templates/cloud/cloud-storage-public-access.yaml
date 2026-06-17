@@ -1,0 +1,35 @@
+id: cloud-storage-public-access
+info:
+  name: Cloud Storage Public Access Check
+  author: easm-pipeline
+  severity: medium
+  description: |
+    Checks for publicly accessible cloud storage endpoints (Azure Blob, AWS S3, GCP Storage).
+    Publicly readable storage can lead to data disclosure.
+  tags: cloud,azure,aws,gcp,storage,exposure
+  metadata:
+    provider: multi-cloud
+    service: storage
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/?comp=list"
+      - "{{BaseURL}}/"
+    stop-at-first-match: true
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+
+      - type: word
+        words:
+          - "<EnumerationResults"
+          - "<ListBucketResult"
+          - "<ListAllMyBucketsResult"
+          - "\"items\":"
+          - "<Blobs>"
+          - "<Blob>"
+        condition: or
+        part: body

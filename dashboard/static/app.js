@@ -22,6 +22,7 @@ const PIPELINE_STAGES = [
     { id: 'tls',         name: 'TLS Analysis',           tool: 'tlsx' },
     { id: 'fingerprint', name: 'Fingerprinting',         tool: 'nerva' },
     { id: 'nuclei',      name: 'Vulnerability Scan',     tool: 'nuclei' },
+    { id: 'aimap',       name: 'AI Agent Discovery',     tool: 'aimap' },
     { id: 'normalize',   name: 'Normalization',          tool: 'normalize.py', required: true },
     { id: 'load',        name: 'DuckDB Load',            tool: 'load_duckdb.py', required: true },
     { id: 'verify',      name: 'Takeover Verification',  tool: 'verify.py' },
@@ -179,6 +180,9 @@ const ICONS = {
     eye: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class="w-3.5 h-3.5"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>',
     upload: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class="w-3.5 h-3.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>',
     bounty: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5"><circle cx="12" cy="8" r="6"/><path d="M15.477 12.89L17 22l-5-3-5 3 1.523-9.11"/></svg>',
+    aimap: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5"><path d="M12 2a4 4 0 0 1 4 4c0 1.95-1.4 3.58-3.25 3.93"/><path d="M12 2a4 4 0 0 0-4 4c0 1.95 1.4 3.58 3.25 3.93"/><circle cx="12" cy="12" r="2"/><path d="M12 14v4"/><path d="M8 18h8"/><path d="M9 22h6"/><circle cx="5" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/><line x1="6.5" y1="12" x2="10" y2="12"/><line x1="14" y1="12" x2="17.5" y2="12"/></svg>',
+    livecheck: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>',
+    cloud: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg>',
 };
 
 // ---------------------------------------------------------------------------
@@ -346,7 +350,10 @@ function renderSidebar() {
         { id: 'network', label: 'Network', icon: ICONS.network },
         { id: 'takeovers', label: 'Takeovers', icon: ICONS.takeovers },
         { id: 'services', label: 'Services', icon: ICONS.services },
+        { id: 'aimap', label: 'AI Agents', icon: ICONS.aimap },
+        { id: 'cloud', label: 'Cloud Assets', icon: ICONS.cloud },
         { id: 'bounty', label: 'Bug Bounty', icon: ICONS.bounty },
+        { id: 'livecheck', label: 'Livecheck', icon: ICONS.livecheck },
     ];
     return `
         <div class="px-5 py-5 flex items-center gap-3 border-b border-surface-border">
@@ -436,7 +443,10 @@ async function renderCurrentPage() {
             case 'network': await pageNetwork(content); break;
             case 'takeovers': await pageTakeovers(content); break;
             case 'services': await pageServices(content); break;
+            case 'aimap': await pageAimap(content); break;
+            case 'cloud': await pageCloud(content); break;
             case 'bounty': await pageBounty(content); break;
+            case 'livecheck': await pageLivecheck(content); break;
             case 'archive': await pageArchive(content, state.pageParams.id); break;
             case 'compare': await pageCompare(content, state.pageParams.id, state.pageParams.id2); break;
             default: await pageOverview(content); break;
@@ -458,6 +468,11 @@ async function pageOverview(el) {
     const shadowIt = s.shadow_it || 0;
     const coveragePct = totalAssets > 0 ? ((s.in_cmdb || 0) / totalAssets * 100) : 0;
 
+    const aimap = data.aimap || {};
+    const aimapTotal = aimap.total || 0;
+    const cloud = data.cloud || {};
+    const cloudTotal = cloud.total_endpoints || 0;
+
     el.innerHTML = `
         <div class="flex items-center justify-between mb-6">
             <div>
@@ -474,7 +489,7 @@ async function pageOverview(el) {
         </div>
 
         <!-- KPI Cards -->
-        <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-4 mb-6">
+        <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-4 mb-6">
             ${kpiCard('Total Assets', totalAssets, 'Discovered FQDNs', 'cyan', 'total')}
             ${kpiCard('Web Assets', s.web_assets, 'HTTP/HTTPS services', 'blue', 'web')}
             ${kpiCard('Shadow IT', shadowIt, totalAssets ? fmtPct(shadowIt / totalAssets * 100) + ' of total' : '', 'red', 'shadow')}
@@ -482,6 +497,8 @@ async function pageOverview(el) {
             ${kpiCard('TLS Issues', tls.issues_total, (tls.expired || 0) + ' expired', 'yellow', 'tls')}
             ${kpiCard('CMDB Coverage', fmtPct(coveragePct), (s.in_cmdb || 0) + ' matched', 'green', 'coverage', true)}
             ${kpiCard('Services', s.total_services, (s.assets_with_services || 0) + ' hosts', 'purple', 'services')}
+            ${aimapTotal > 0 ? kpiCard('AI Agents', aimapTotal, 'exposed endpoints', 'purple', 'aimap') : ''}
+            ${cloudTotal > 0 ? kpiCard('Cloud', cloudTotal, (cloud.total_hosts || 0) + ' hosts', 'blue', 'cloud') : ''}
         </div>
 
         <!-- Charts Row 1 -->
@@ -944,6 +961,8 @@ async function pageAssetDetail(el, fqdn) {
     const services = asset.services || [];
     const findings = asset.findings || [];
     const cmdb = asset.cmdb || {};
+    const cloudData = asset.cloud || {};
+    const cloudEndpoints = cloudData.endpoints || [];
 
     el.innerHTML = `
         <div class="mb-6">
@@ -1120,6 +1139,39 @@ async function pageAssetDetail(el, fqdn) {
                             </div>
                         `;
                     }).join('')}
+                </div>
+            </div>
+        ` : ''}
+
+        <!-- Cloud Endpoints -->
+        ${cloudEndpoints.length ? `
+            <div class="card p-5 mb-4">
+                <h3 class="text-sm font-semibold text-slate-300 mb-3">Cloud Endpoints (${cloudEndpoints.length})</h3>
+                <div class="overflow-x-auto">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Provider</th>
+                                <th>Service</th>
+                                <th>Risk</th>
+                                <th>Resource</th>
+                                <th>Hostname</th>
+                                <th>Signals</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${cloudEndpoints.map(ce => `
+                                <tr>
+                                    <td>${typeof providerBadge === 'function' ? providerBadge(ce.provider) : esc(ce.provider)}</td>
+                                    <td class="text-sm text-slate-300">${esc(ce.service_label || ce.service)}</td>
+                                    <td>${severityBadge(ce.risk)}</td>
+                                    <td class="font-mono text-xs text-slate-400">${esc(ce.resource_name || '-')}</td>
+                                    <td class="font-mono text-xs text-slate-500">${esc(ce.hostname || '-')}</td>
+                                    <td class="text-xs text-slate-500">${(ce.signals || []).map(s => esc(s)).join(', ') || '-'}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
                 </div>
             </div>
         ` : ''}
@@ -2662,6 +2714,11 @@ async function pageScans(el) {
                                    class="accent-[#00d4ff]" ${active ? 'disabled' : ''}>
                             <span class="text-xs text-slate-300">Bug Bounty Prepare</span>
                         </label>
+                        <label class="flex items-center gap-1.5 cursor-pointer">
+                            <input type="radio" name="scan-mode" value="livecheck"
+                                   class="accent-[#00d4ff]" ${active ? 'disabled' : ''}>
+                            <span class="text-xs text-slate-300">CMDB Livecheck</span>
+                        </label>
                     </div>
                     <div class="flex items-center justify-between">
                         <div class="flex items-center gap-2">
@@ -3032,7 +3089,8 @@ window.startScan = async function() {
     const modeEl = document.querySelector('input[name="scan-mode"]:checked');
     const mode = modeEl ? modeEl.value : 'recon';
     const stageInfo = stages ? `\nStages: ${stages}` : '\nAll pipeline stages will run.';
-    const modeInfo = mode === 'bounty' ? '\nMode: Bug Bounty Prepare (expanded scanning)' : '';
+    const modeInfo = mode === 'bounty' ? '\nMode: Bug Bounty Prepare (expanded scanning)'
+        : mode === 'livecheck' ? '\nMode: CMDB Livecheck (DNS-only scope validation)' : '';
 
     if (!confirm(`Start scan with ${lines.length} subdomain${lines.length !== 1 ? 's' : ''}?\n${stageInfo}${modeInfo}\n\nThis will archive the current scan data.`)) {
         return;
@@ -3200,6 +3258,479 @@ const BOUNTY_TIER_COLORS = {
     D: { bg: 'rgba(100,116,139,0.12)', border: '#475569', text: '#94a3b8', label: 'Background' },
 };
 
+// ---------------------------------------------------------------------------
+// Page: AI Agent Discovery (AIMAP)
+// ---------------------------------------------------------------------------
+const AI_PROTOCOL_LABELS = {
+    mcp: 'MCP', ollama: 'Ollama', openai_compat: 'OpenAI-Compatible',
+    langserve: 'LangServe', gradio: 'Gradio', streamlit: 'Streamlit',
+    comfyui: 'ComfyUI', textgen_webui: 'Text Gen WebUI',
+    open_webui: 'Open WebUI', openclaw: 'OpenClaw',
+};
+
+const AI_PROTOCOL_COLORS = {
+    mcp: '#8b5cf6', ollama: '#06b6d4', openai_compat: '#10b981',
+    langserve: '#f59e0b', gradio: '#ec4899', streamlit: '#ef4444',
+    comfyui: '#3b82f6', textgen_webui: '#6366f1',
+    open_webui: '#14b8a6', openclaw: '#f97316',
+};
+
+async function pageAimap(el) {
+    let data;
+    try {
+        data = await api('/aimap');
+    } catch (e) {
+        el.innerHTML = `
+            <div class="flex items-center justify-between mb-6">
+                <div>
+                    <h1 class="text-2xl font-bold text-white">AI Agent Discovery</h1>
+                    <p class="text-sm text-slate-500 mt-1">Exposed AI agents detected by AIMAP</p>
+                </div>
+            </div>
+            ${renderEmptyState('No AIMAP data', 'Run the pipeline with the aimap stage enabled to discover exposed AI agents.')}
+        `;
+        return;
+    }
+
+    const items = data.items || [];
+    const protocols = data.protocols || [];
+    const severity = data.severity || [];
+    const hosts = data.affected_hosts || [];
+    const total = data.total || 0;
+
+    el.innerHTML = `
+        <div class="flex items-center justify-between mb-6">
+            <div>
+                <h1 class="text-2xl font-bold text-white">AI Agent Discovery</h1>
+                <p class="text-sm text-slate-500 mt-1">${fmt(total)} exposed AI endpoints detected by AIMAP</p>
+            </div>
+        </div>
+
+        <!-- KPI Cards -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+            <div class="card kpi-card p-4" data-color="purple">
+                <div class="text-xs font-medium text-slate-500 uppercase tracking-wider mb-2">Total Findings</div>
+                <div class="text-2xl font-bold text-white" data-counter="${total}">0</div>
+                <div class="text-xs text-slate-500">${protocols.length} protocols detected</div>
+            </div>
+            <div class="card kpi-card p-4" data-color="cyan">
+                <div class="text-xs font-medium text-slate-500 uppercase tracking-wider mb-2">Affected Hosts</div>
+                <div class="text-2xl font-bold text-white" data-counter="${hosts.length}">0</div>
+                <div class="text-xs text-slate-500">unique FQDNs</div>
+            </div>
+            <div class="card kpi-card p-4" data-color="red">
+                <div class="text-xs font-medium text-slate-500 uppercase tracking-wider mb-2">Critical/High</div>
+                <div class="text-2xl font-bold text-white" data-counter="${severity.filter(s => s.severity === 'critical' || s.severity === 'high').reduce((a,s) => a + s.count, 0)}">0</div>
+                <div class="text-xs text-slate-500">high severity agents</div>
+            </div>
+            <div class="card kpi-card p-4" data-color="green">
+                <div class="text-xs font-medium text-slate-500 uppercase tracking-wider mb-2">Top Protocol</div>
+                <div class="text-lg font-bold text-white">${protocols.length ? (AI_PROTOCOL_LABELS[protocols[0].protocol] || protocols[0].protocol) : 'N/A'}</div>
+                <div class="text-xs text-slate-500">${protocols.length ? protocols[0].count + ' endpoints' : ''}</div>
+            </div>
+        </div>
+
+        <!-- Charts -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
+            ${protocols.length ? `
+                <div class="card p-5">
+                    <h3 class="text-sm font-semibold text-slate-300 mb-4">AI Protocols Detected</h3>
+                    <div class="chart-container" style="height: 260px;">
+                        <canvas id="chart-aimap-protocols"></canvas>
+                    </div>
+                </div>
+            ` : ''}
+            ${severity.length ? `
+                <div class="card p-5">
+                    <h3 class="text-sm font-semibold text-slate-300 mb-4">Findings by Severity</h3>
+                    <div class="chart-container" style="height: 260px;">
+                        <canvas id="chart-aimap-severity"></canvas>
+                    </div>
+                </div>
+            ` : ''}
+        </div>
+
+        <!-- Affected Hosts -->
+        ${hosts.length ? `
+            <div class="card p-5 mb-4">
+                <h3 class="text-sm font-semibold text-slate-300 mb-4">Top Affected Hosts</h3>
+                <div class="overflow-x-auto">
+                    <table class="data-table">
+                        <thead><tr><th>FQDN</th><th>AI Findings</th></tr></thead>
+                        <tbody>
+                            ${hosts.map(h => `
+                                <tr class="clickable" onclick="navigateTo('detail', {id: '${esc(h.fqdn)}'})">
+                                    <td class="font-mono text-xs text-accent">${esc(h.fqdn)}</td>
+                                    <td><span class="font-bold text-white">${fmt(h.finding_count)}</span></td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        ` : ''}
+
+        <!-- Findings Table -->
+        <div class="card overflow-hidden">
+            <div class="p-4 border-b border-surface-border">
+                <h3 class="text-sm font-semibold text-slate-300">AI Agent Findings</h3>
+            </div>
+            <div class="overflow-x-auto" style="max-height: 500px; overflow-y: auto;">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Severity</th>
+                            <th>FQDN</th>
+                            <th>Finding</th>
+                            <th>Template</th>
+                            <th>Tags</th>
+                            <th>Matched At</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${items.length ? items.map(f => {
+                            const fTags = (f.tags || []).filter(Boolean);
+                            return `
+                            <tr class="clickable" onclick="navigateTo('detail', {id: '${esc(f.fqdn)}'})">
+                                <td>${severityBadge(f.severity)}</td>
+                                <td class="font-mono text-xs text-accent">${esc(f.fqdn)}</td>
+                                <td>${esc(f.finding_name)}</td>
+                                <td class="font-mono text-xs text-slate-500">${esc(f.template_id)}</td>
+                                <td class="text-xs">${fTags.map(t => `<span class="inline-block ${AI_PROTOCOL_LABELS[t] ? 'bg-purple-900/40 text-purple-300' : 'bg-slate-800 text-slate-300'} rounded px-1.5 py-0.5 mr-1 mb-0.5">${esc(AI_PROTOCOL_LABELS[t] || t)}</span>`).join('')}</td>
+                                <td class="text-xs text-slate-400 max-w-[200px] truncate">${esc(f.matched_at)}</td>
+                            </tr>`;
+                        }).join('') : `<tr><td colspan="6">${renderEmptyState('No AI agent findings', 'Run the pipeline with --stage aimap to scan for exposed AI agents.')}</td></tr>`}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    `;
+
+    // Animate counters
+    requestAnimationFrame(() => {
+        document.querySelectorAll('[data-counter]').forEach(el => {
+            const raw = el.getAttribute('data-counter');
+            const val = parseFloat(raw);
+            if (!isNaN(val)) animateCounter(el, val);
+        });
+    });
+
+    // Protocol chart
+    if (protocols.length) {
+        createChart('chart-aimap-protocols', {
+            type: 'bar',
+            data: {
+                labels: protocols.map(p => AI_PROTOCOL_LABELS[p.protocol] || p.protocol),
+                datasets: [{
+                    data: protocols.map(p => p.count),
+                    backgroundColor: protocols.map(p => AI_PROTOCOL_COLORS[p.protocol] || '#6b7280'),
+                    borderRadius: 6,
+                    barThickness: 32,
+                }],
+            },
+            options: {
+                ...CHART_DEFAULTS,
+                indexAxis: 'y',
+                plugins: { ...CHART_DEFAULTS.plugins, legend: { display: false } },
+                scales: {
+                    x: { grid: { color: '#1e293b' }, ticks: { color: '#64748b' } },
+                    y: { grid: { display: false }, ticks: { color: '#94a3b8', font: { weight: '600' } } },
+                },
+            },
+        });
+    }
+
+    // Severity chart
+    if (severity.length) {
+        createChart('chart-aimap-severity', {
+            type: 'doughnut',
+            data: {
+                labels: severity.map(s => capitalize(s.severity)),
+                datasets: [{
+                    data: severity.map(s => s.count),
+                    backgroundColor: severity.map(s => SEVERITY_COLORS[s.severity] || '#6b7280'),
+                    borderWidth: 0,
+                }],
+            },
+            options: {
+                ...CHART_DEFAULTS,
+                cutout: '60%',
+                plugins: {
+                    ...CHART_DEFAULTS.plugins,
+                    legend: {
+                        position: 'right',
+                        labels: { color: '#94a3b8', padding: 16, usePointStyle: true, pointStyleWidth: 8 },
+                    },
+                },
+            },
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Page: Cloud Assets
+// ---------------------------------------------------------------------------
+const PROVIDER_COLORS = {
+    azure: { text: '#38bdf8', bg: '#38bdf815', border: '#38bdf830', label: 'Azure' },
+    aws: { text: '#f97316', bg: '#f9731615', border: '#f9731630', label: 'AWS' },
+    gcp: { text: '#34d399', bg: '#34d39915', border: '#34d39930', label: 'GCP' },
+};
+
+function providerBadge(provider) {
+    const s = PROVIDER_COLORS[provider] || { text: '#94a3b8', bg: '#94a3b815', border: '#94a3b830', label: provider };
+    return `<span class="text-[10px] px-2 py-0.5 rounded font-medium" style="color:${s.text};background:${s.bg};border:1px solid ${s.border}">${esc(s.label)}</span>`;
+}
+
+function cloudRiskBadge(risk) {
+    return severityBadge(risk);
+}
+
+async function pageCloud(el) {
+    let data;
+    try {
+        data = await api('/cloud');
+    } catch (e) {
+        el.innerHTML = renderErrorState(e.message);
+        return;
+    }
+
+    const items = data.items || [];
+    const providers = data.providers || [];
+    const summary = data.summary || [];
+    const riskDist = data.risk_distribution || [];
+
+    if (!items.length && !summary.length) {
+        el.innerHTML = `
+            <h1 class="text-2xl font-bold text-white mb-2">Cloud Assets</h1>
+            <p class="text-sm text-slate-500 mb-6">Azure, AWS & GCP endpoint discovery</p>
+            ${renderEmptyState('No cloud endpoints detected', 'Run the pipeline with cloud_enum stage to discover cloud assets')}
+        `;
+        return;
+    }
+
+    el.innerHTML = `
+        <div class="flex items-center justify-between mb-6">
+            <div>
+                <h1 class="text-2xl font-bold text-white">Cloud Assets</h1>
+                <p class="text-sm text-slate-500 mt-1">Azure, AWS & GCP endpoint discovery</p>
+            </div>
+            <div class="text-right">
+                <div class="text-xs text-slate-500">Total Endpoints</div>
+                <div class="text-2xl font-bold text-cyan-400">${data.total_endpoints || 0}</div>
+            </div>
+        </div>
+
+        <!-- KPI Cards -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+            ${providers.map(p => `
+                <div class="card p-4">
+                    <div class="flex items-center gap-2 mb-2">
+                        ${providerBadge(p.provider)}
+                    </div>
+                    <div class="text-2xl font-bold text-white">${fmt(p.host_count)}</div>
+                    <div class="text-xs text-slate-500">${fmtPct(p.pct || 0)} of assets</div>
+                </div>
+            `).join('')}
+        </div>
+
+        <!-- Charts Row -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+            <div class="card p-5">
+                <h3 class="text-sm font-semibold text-slate-300 mb-4">Provider Distribution</h3>
+                <div class="chart-container" style="height: 240px;">
+                    <canvas id="chart-cloud-providers"></canvas>
+                </div>
+            </div>
+            <div class="card p-5">
+                <h3 class="text-sm font-semibold text-slate-300 mb-4">Risk Distribution</h3>
+                <div class="chart-container" style="height: 240px;">
+                    <canvas id="chart-cloud-risk"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- Service Summary -->
+        <div class="card p-5 mb-6">
+            <h3 class="text-sm font-semibold text-slate-300 mb-4">Cloud Services Detected</h3>
+            <div class="overflow-x-auto">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Provider</th>
+                            <th>Service</th>
+                            <th>Description</th>
+                            <th>Risk</th>
+                            <th>Endpoints</th>
+                            <th>Hosts</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${summary.map(s => `
+                            <tr>
+                                <td>${providerBadge(s.provider)}</td>
+                                <td class="font-mono text-xs text-slate-300">${esc(s.service)}</td>
+                                <td class="text-slate-400 text-sm">${esc(s.service_label || s.service)}</td>
+                                <td>${cloudRiskBadge(s.risk)}</td>
+                                <td class="font-bold text-white">${fmt(s.count)}</td>
+                                <td class="text-slate-400">${fmt(s.affected_hosts)}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Filter Bar -->
+        <div class="card p-4 mb-4">
+            <div class="flex flex-wrap items-center gap-3">
+                <div class="flex items-center gap-2">
+                    ${ICONS.filter}
+                    <span class="text-xs text-slate-500">Filter:</span>
+                </div>
+                <select id="cloud-provider-filter" class="bg-surface-card border border-surface-border rounded px-3 py-1.5 text-sm text-slate-300">
+                    <option value="">All Providers</option>
+                    <option value="azure">Azure</option>
+                    <option value="aws">AWS</option>
+                    <option value="gcp">GCP</option>
+                </select>
+                <select id="cloud-risk-filter" class="bg-surface-card border border-surface-border rounded px-3 py-1.5 text-sm text-slate-300">
+                    <option value="">All Risk Levels</option>
+                    <option value="critical">Critical</option>
+                    <option value="high">High</option>
+                    <option value="medium">Medium</option>
+                    <option value="low">Low</option>
+                    <option value="info">Info</option>
+                </select>
+                <div class="relative flex-1 min-w-[200px]">
+                    <input id="cloud-search" type="text" placeholder="Search endpoints..." class="w-full bg-surface-card border border-surface-border rounded px-3 py-1.5 text-sm text-slate-300 pl-8"/>
+                    <div class="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-500">${ICONS.search}</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- All Endpoints Table -->
+        <div class="card p-5">
+            <h3 class="text-sm font-semibold text-slate-300 mb-4">All Cloud Endpoints (${items.length})</h3>
+            <div class="overflow-x-auto">
+                <table class="data-table" id="cloud-table">
+                    <thead>
+                        <tr>
+                            <th>FQDN</th>
+                            <th>Provider</th>
+                            <th>Service</th>
+                            <th>Risk</th>
+                            <th>Resource</th>
+                            <th>Cloud Hostname</th>
+                            <th>Signals</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${items.map(i => `
+                            <tr class="clickable" onclick="navigateTo('detail', {id: '${esc(i.fqdn)}'})">
+                                <td class="font-mono text-xs text-accent">${esc(i.fqdn)}</td>
+                                <td>${providerBadge(i.provider)}</td>
+                                <td class="text-sm text-slate-300">${esc(i.service_label || i.service)}</td>
+                                <td>${cloudRiskBadge(i.risk)}</td>
+                                <td class="font-mono text-xs text-slate-400">${esc(i.resource_name || '-')}</td>
+                                <td class="font-mono text-xs text-slate-500">${esc(i.hostname || '-')}</td>
+                                <td class="text-xs text-slate-500">${(i.signals || []).map(s => `<span class="inline-block bg-surface-card border border-surface-border rounded px-1.5 py-0.5 mr-1 mb-1">${esc(s)}</span>`).join('')}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    `;
+
+    // Charts
+    if (providers.length) {
+        const provPalette = providers.map(p => {
+            const c = PROVIDER_COLORS[p.provider];
+            return c ? c.text : '#94a3b8';
+        });
+        createChart('chart-cloud-providers', {
+            type: 'doughnut',
+            data: {
+                labels: providers.map(p => (PROVIDER_COLORS[p.provider] || {}).label || p.provider),
+                datasets: [{
+                    data: providers.map(p => p.host_count),
+                    backgroundColor: provPalette,
+                    borderWidth: 0,
+                    hoverOffset: 6,
+                }],
+            },
+            options: {
+                ...CHART_DEFAULTS,
+                cutout: '65%',
+                plugins: {
+                    ...CHART_DEFAULTS.plugins,
+                    legend: { ...CHART_DEFAULTS.plugins.legend, position: 'right' },
+                },
+            },
+        });
+    }
+
+    if (riskDist.length) {
+        createChart('chart-cloud-risk', {
+            type: 'bar',
+            data: {
+                labels: riskDist.map(r => capitalize(r.risk)),
+                datasets: [{
+                    label: 'Endpoints',
+                    data: riskDist.map(r => r.count),
+                    backgroundColor: riskDist.map(r => SEVERITY_COLORS[r.risk] || '#6b7280'),
+                    borderWidth: 0,
+                    borderRadius: 4,
+                }],
+            },
+            options: {
+                ...CHART_DEFAULTS,
+                plugins: { ...CHART_DEFAULTS.plugins, legend: { display: false } },
+                scales: {
+                    x: { grid: { display: false }, ticks: { color: '#94a3b8', font: { size: 11 } } },
+                    y: { grid: { color: '#1e293b' }, ticks: { color: '#64748b', font: { size: 10 } } },
+                },
+            },
+        });
+    }
+
+    // Filter handlers
+    const filterCloud = async () => {
+        const provider = document.getElementById('cloud-provider-filter').value;
+        const risk = document.getElementById('cloud-risk-filter').value;
+        const search = document.getElementById('cloud-search').value;
+        const filtered = await api('/cloud', { provider, risk, search });
+        const tbody = document.querySelector('#cloud-table tbody');
+        if (tbody) {
+            tbody.innerHTML = (filtered.items || []).map(i => `
+                <tr class="clickable" onclick="navigateTo('detail', {id: '${esc(i.fqdn)}'})">
+                    <td class="font-mono text-xs text-accent">${esc(i.fqdn)}</td>
+                    <td>${providerBadge(i.provider)}</td>
+                    <td class="text-sm text-slate-300">${esc(i.service_label || i.service)}</td>
+                    <td>${cloudRiskBadge(i.risk)}</td>
+                    <td class="font-mono text-xs text-slate-400">${esc(i.resource_name || '-')}</td>
+                    <td class="font-mono text-xs text-slate-500">${esc(i.hostname || '-')}</td>
+                    <td class="text-xs text-slate-500">${(i.signals || []).map(s => `<span class="inline-block bg-surface-card border border-surface-border rounded px-1.5 py-0.5 mr-1 mb-1">${esc(s)}</span>`).join('')}</td>
+                </tr>
+            `).join('');
+        }
+    };
+
+    document.getElementById('cloud-provider-filter')?.addEventListener('change', filterCloud);
+    document.getElementById('cloud-risk-filter')?.addEventListener('change', filterCloud);
+    const searchInput = document.getElementById('cloud-search');
+    if (searchInput) {
+        let debounceTimer;
+        searchInput.addEventListener('input', () => {
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(filterCloud, 300);
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Page: Bug Bounty
+// ---------------------------------------------------------------------------
 async function pageBounty(el) {
     let data;
     try {
@@ -4116,6 +4647,380 @@ window._compareTab = function(group, tab) {
         }
     }
 };
+
+// ---------------------------------------------------------------------------
+// Page: CMDB Livecheck
+// ---------------------------------------------------------------------------
+
+const SCOPE_ACTION_STYLES = {
+    keep:                { bg: 'rgba(34,197,94,0.12)',  border: '#22c55e', text: '#4ade80', label: 'Keep' },
+    remove:              { bg: 'rgba(239,68,68,0.15)',  border: '#ef4444', text: '#fca5a5', label: 'Remove' },
+    review_remove:       { bg: 'rgba(249,115,22,0.12)', border: '#f97316', text: '#fdba74', label: 'Review → Remove' },
+    exclude_cdn:         { bg: 'rgba(139,92,246,0.12)', border: '#8b5cf6', text: '#c4b5fd', label: 'CDN Exclude' },
+    review_cname_bloat:  { bg: 'rgba(234,179,8,0.12)',  border: '#eab308', text: '#fde047', label: 'CNAME Bloat' },
+    monitor:             { bg: 'rgba(100,116,139,0.12)',border: '#64748b', text: '#94a3b8', label: 'Monitor' },
+};
+
+function scopeActionBadge(action) {
+    const s = SCOPE_ACTION_STYLES[action] || SCOPE_ACTION_STYLES.monitor;
+    return `<span class="text-[10px] px-2 py-0.5 rounded font-medium" style="color:${s.text};background:${s.bg};border:1px solid ${s.border}">${esc(s.label)}</span>`;
+}
+
+async function pageLivecheck(el) {
+    let data;
+    try {
+        data = await api('/livecheck');
+    } catch (e) {
+        el.innerHTML = `
+            <div class="flex items-center justify-between mb-6">
+                <div>
+                    <h1 class="text-2xl font-bold text-white">CMDB Livecheck</h1>
+                    <p class="text-sm text-slate-500 mt-1">DNS liveness &amp; Tenable scope governance</p>
+                </div>
+            </div>
+            <div class="card p-10 text-center">
+                <div class="text-slate-600 mb-4 flex justify-center">${ICONS.livecheck}</div>
+                <p class="text-slate-300 font-medium mb-2">No livecheck data available</p>
+                <p class="text-sm text-slate-500 mb-4">Run the pipeline in livecheck mode to validate CMDB scope.</p>
+                <code class="text-xs text-accent bg-slate-800 px-3 py-1 rounded">./run.sh --mode livecheck</code>
+            </div>
+        `;
+        return;
+    }
+
+    const s = data.summary || {};
+    const scopeActions = data.scope_actions || [];
+    const removals = data.scope_removals || [];
+    const cdnExcl = data.cdn_exclusions || [];
+    const cnameBloat = data.cname_bloat || [];
+    const leaves = data.leaf_domains || [];
+    const thirdPartyNs = data.third_party_ns || [];
+
+    el.innerHTML = `
+        <div class="flex items-center justify-between mb-6">
+            <div>
+                <h1 class="text-2xl font-bold text-white">CMDB Livecheck</h1>
+                <p class="text-sm text-slate-500 mt-1">DNS liveness, CDN detection &amp; Tenable scope governance</p>
+            </div>
+        </div>
+
+        <!-- KPI Cards -->
+        <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3 mb-6">
+            ${_lcKpi('Total FQDNs', s.total_fqdns, '', 'cyan')}
+            ${_lcKpi('Resolving', s.resolving, s.total_fqdns ? fmtPct((s.resolving||0)/(s.total_fqdns)*100) : '', 'green')}
+            ${_lcKpi('Not Resolving', s.not_resolving, '', 'red')}
+            ${_lcKpi('CDN Excluded', s.cdn_excluded, 'proposed', 'purple')}
+            ${_lcKpi('Removal Candidates', s.removal_candidates, '≥30d down', 'orange')}
+            ${_lcKpi('CNAME Bloat', s.cname_bloated, '>3 hops', 'yellow')}
+            ${_lcKpi('3rd-Party NS', s.third_party_ns, 'delegated', 'blue')}
+        </div>
+
+        <!-- Scope Action Distribution -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+            <div class="card p-5">
+                <h3 class="text-sm font-semibold text-slate-300 mb-4">Scope Action Distribution</h3>
+                <div class="chart-container" style="height: 260px;">
+                    <canvas id="chart-scope-actions"></canvas>
+                </div>
+            </div>
+            <div class="card p-5">
+                <h3 class="text-sm font-semibold text-slate-300 mb-4">Resolution Status</h3>
+                <div class="chart-container" style="height: 260px;">
+                    <canvas id="chart-resolution"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tabs -->
+        <div class="flex items-center gap-1 mb-4 border-b border-surface-border pb-px">
+            <button class="lc-tab active" data-lc-tab="removals" onclick="switchLcTab('removals')">
+                Scope Removals <span class="ml-1 text-[10px] text-red-400">${removals.length}</span>
+            </button>
+            <button class="lc-tab" data-lc-tab="cdn" onclick="switchLcTab('cdn')">
+                CDN Exclusions <span class="ml-1 text-[10px] text-purple-400">${cdnExcl.length}</span>
+            </button>
+            <button class="lc-tab" data-lc-tab="cname" onclick="switchLcTab('cname')">
+                CNAME Bloat <span class="ml-1 text-[10px] text-yellow-400">${cnameBloat.length}</span>
+            </button>
+            <button class="lc-tab" data-lc-tab="leaves" onclick="switchLcTab('leaves')">
+                Leaf Domains <span class="ml-1 text-[10px] text-slate-400">${leaves.length}</span>
+            </button>
+            <button class="lc-tab" data-lc-tab="ns" onclick="switchLcTab('ns')">
+                3rd-Party NS <span class="ml-1 text-[10px] text-blue-400">${thirdPartyNs.length}</span>
+            </button>
+        </div>
+
+        <div id="lc-tab-content">
+            ${_lcRemovalsTable(removals)}
+        </div>
+    `;
+
+    // --- Charts ---
+    const actionLabels = scopeActions.map(a => (SCOPE_ACTION_STYLES[a.scope_action] || {}).label || a.scope_action);
+    const actionCounts = scopeActions.map(a => a.count);
+    const actionColors = scopeActions.map(a => (SCOPE_ACTION_STYLES[a.scope_action] || SCOPE_ACTION_STYLES.monitor).text);
+
+    createChart('chart-scope-actions', {
+        type: 'doughnut',
+        data: {
+            labels: actionLabels,
+            datasets: [{ data: actionCounts, backgroundColor: actionColors, borderWidth: 0 }],
+        },
+        options: {
+            ...CHART_DEFAULTS,
+            cutout: '55%',
+            plugins: {
+                ...CHART_DEFAULTS.plugins,
+                legend: { ...CHART_DEFAULTS.plugins.legend, position: 'right' },
+            },
+        },
+    });
+
+    createChart('chart-resolution', {
+        type: 'doughnut',
+        data: {
+            labels: ['Resolving', 'Not Resolving'],
+            datasets: [{
+                data: [s.resolving || 0, s.not_resolving || 0],
+                backgroundColor: ['#22c55e', '#ef4444'],
+                borderWidth: 0,
+            }],
+        },
+        options: {
+            ...CHART_DEFAULTS,
+            cutout: '55%',
+            plugins: {
+                ...CHART_DEFAULTS.plugins,
+                legend: { ...CHART_DEFAULTS.plugins.legend, position: 'right' },
+            },
+        },
+    });
+
+    // Store tab data for switching
+    window._lcData = { removals, cdnExcl, cnameBloat, leaves, thirdPartyNs };
+}
+
+function _lcKpi(label, value, sub, color) {
+    const colors = {
+        cyan: 'text-cyan-400', green: 'text-green-400', red: 'text-red-400',
+        orange: 'text-orange-400', yellow: 'text-yellow-400', blue: 'text-blue-400',
+        purple: 'text-purple-400',
+    };
+    const c = colors[color] || 'text-slate-300';
+    return `
+        <div class="card p-4">
+            <div class="text-[10px] text-slate-500 uppercase tracking-wider mb-1">${esc(label)}</div>
+            <div class="text-2xl font-bold ${c}">${fmt(value)}</div>
+            ${sub ? `<div class="text-[10px] text-slate-600 mt-0.5">${esc(sub)}</div>` : ''}
+        </div>
+    `;
+}
+
+window.switchLcTab = function(tab) {
+    document.querySelectorAll('.lc-tab').forEach(b => b.classList.toggle('active', b.dataset.lcTab === tab));
+    const content = document.getElementById('lc-tab-content');
+    if (!content || !window._lcData) return;
+    const d = window._lcData;
+    switch (tab) {
+        case 'removals': content.innerHTML = _lcRemovalsTable(d.removals); break;
+        case 'cdn':      content.innerHTML = _lcCdnTable(d.cdnExcl); break;
+        case 'cname':    content.innerHTML = _lcCnameTable(d.cnameBloat); break;
+        case 'leaves':   content.innerHTML = _lcLeavesTable(d.leaves); break;
+        case 'ns':       content.innerHTML = _lcNsTable(d.thirdPartyNs); break;
+    }
+};
+
+function _lcRemovalsTable(items) {
+    if (!items.length) return _lcEmpty('No scope removal candidates', 'All CMDB assets are resolving or within the 30-day monitoring window.');
+    return `
+        <div class="card overflow-hidden">
+            <div class="px-5 py-3 border-b border-surface-border flex items-center justify-between">
+                <h3 class="text-sm font-semibold text-slate-300">Scope Removal Candidates (≥30 days unavailable)</h3>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-xs">
+                    <thead><tr class="border-b border-surface-border text-slate-500 uppercase tracking-wider">
+                        <th class="px-4 py-2 text-left">FQDN</th>
+                        <th class="px-4 py-2 text-left">CI ID</th>
+                        <th class="px-4 py-2 text-left">Owner</th>
+                        <th class="px-4 py-2 text-right">Days Down</th>
+                        <th class="px-4 py-2 text-right">Scans Down</th>
+                        <th class="px-4 py-2 text-left">Deadline</th>
+                        <th class="px-4 py-2 text-center">Action</th>
+                    </tr></thead>
+                    <tbody>
+                        ${items.map(r => `
+                            <tr class="border-b border-surface-border hover:bg-white/[0.02]">
+                                <td class="px-4 py-2.5 font-mono text-slate-200">${esc(r.fqdn)}</td>
+                                <td class="px-4 py-2.5 text-slate-400">${esc(r.ci_id || '-')}</td>
+                                <td class="px-4 py-2.5 text-slate-400">${esc(r.owner || '-')}</td>
+                                <td class="px-4 py-2.5 text-right text-red-400 font-bold">${fmt(r.days_unavailable)}</td>
+                                <td class="px-4 py-2.5 text-right text-slate-300">${fmt(r.consecutive_scans_down)}</td>
+                                <td class="px-4 py-2.5 text-slate-400">${esc(r.removal_deadline || '-')}</td>
+                                <td class="px-4 py-2.5 text-center">${scopeActionBadge(r.scope_action)}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    `;
+}
+
+function _lcCdnTable(items) {
+    if (!items.length) return _lcEmpty('No CDN exclusion proposals', 'No CMDB assets are behind a CDN with high enough confidence for exclusion.');
+    return `
+        <div class="card overflow-hidden">
+            <div class="px-5 py-3 border-b border-surface-border">
+                <h3 class="text-sm font-semibold text-slate-300">CDN/WAF Exclusion Proposals</h3>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-xs">
+                    <thead><tr class="border-b border-surface-border text-slate-500 uppercase tracking-wider">
+                        <th class="px-4 py-2 text-left">FQDN</th>
+                        <th class="px-4 py-2 text-left">CI ID</th>
+                        <th class="px-4 py-2 text-left">CDN Provider</th>
+                        <th class="px-4 py-2 text-right">Confidence</th>
+                        <th class="px-4 py-2 text-left">Signals</th>
+                        <th class="px-4 py-2 text-center">Action</th>
+                    </tr></thead>
+                    <tbody>
+                        ${items.map(r => `
+                            <tr class="border-b border-surface-border hover:bg-white/[0.02]">
+                                <td class="px-4 py-2.5 font-mono text-slate-200">${esc(r.fqdn)}</td>
+                                <td class="px-4 py-2.5 text-slate-400">${esc(r.ci_id || '-')}</td>
+                                <td class="px-4 py-2.5">
+                                    <span class="text-purple-400 font-medium">${esc(r.cdn_provider || '-')}</span>
+                                </td>
+                                <td class="px-4 py-2.5 text-right ${confidenceClass(r.cdn_confidence)}">${r.cdn_confidence != null ? (r.cdn_confidence * 100).toFixed(0) + '%' : '-'}</td>
+                                <td class="px-4 py-2.5 text-slate-500 max-w-[300px] truncate" title="${esc((r.cdn_signals||[]).join(', '))}">${esc((r.cdn_signals||[]).join(', '))}</td>
+                                <td class="px-4 py-2.5 text-center">${scopeActionBadge(r.scope_action)}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    `;
+}
+
+function _lcCnameTable(items) {
+    if (!items.length) return _lcEmpty('No CNAME chain bloat detected', 'All FQDN CNAME chains are within the configured depth threshold.');
+    return `
+        <div class="card overflow-hidden">
+            <div class="px-5 py-3 border-b border-surface-border">
+                <h3 class="text-sm font-semibold text-slate-300">CNAME Chain Bloat</h3>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-xs">
+                    <thead><tr class="border-b border-surface-border text-slate-500 uppercase tracking-wider">
+                        <th class="px-4 py-2 text-left">FQDN</th>
+                        <th class="px-4 py-2 text-right">Chain Depth</th>
+                        <th class="px-4 py-2 text-left">CNAME Chain</th>
+                        <th class="px-4 py-2 text-left">Fan-In Target</th>
+                        <th class="px-4 py-2 text-right">Fan-In Count</th>
+                        <th class="px-4 py-2 text-center">Resolves</th>
+                        <th class="px-4 py-2 text-left">CDN</th>
+                    </tr></thead>
+                    <tbody>
+                        ${items.map(r => `
+                            <tr class="border-b border-surface-border hover:bg-white/[0.02]">
+                                <td class="px-4 py-2.5 font-mono text-slate-200">${esc(r.fqdn)}</td>
+                                <td class="px-4 py-2.5 text-right text-yellow-400 font-bold">${fmt(r.cname_chain_depth)}</td>
+                                <td class="px-4 py-2.5 text-slate-500 max-w-[300px] truncate font-mono text-[10px]" title="${esc((r.cname_chain||[]).join(' → '))}">${esc((r.cname_chain||[]).join(' → '))}</td>
+                                <td class="px-4 py-2.5 font-mono text-slate-400 text-[10px]">${esc(r.cname_fan_in_target || '-')}</td>
+                                <td class="px-4 py-2.5 text-right text-slate-300">${r.cname_fan_in_count || '-'}</td>
+                                <td class="px-4 py-2.5 text-center">${r.resolves ? '<span class="text-green-400">✓</span>' : '<span class="text-red-400">✗</span>'}</td>
+                                <td class="px-4 py-2.5 text-purple-400">${esc(r.cdn_provider || '-')}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    `;
+}
+
+function _lcLeavesTable(items) {
+    if (!items.length) return _lcEmpty('No leaf domains found', 'All FQDNs have child subdomains.');
+    return `
+        <div class="card overflow-hidden">
+            <div class="px-5 py-3 border-b border-surface-border">
+                <h3 class="text-sm font-semibold text-slate-300">Leaf Domains (no child subdomains)</h3>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-xs">
+                    <thead><tr class="border-b border-surface-border text-slate-500 uppercase tracking-wider">
+                        <th class="px-4 py-2 text-left">FQDN</th>
+                        <th class="px-4 py-2 text-center">In CMDB</th>
+                        <th class="px-4 py-2 text-center">Resolves</th>
+                        <th class="px-4 py-2 text-left">DNS Status</th>
+                        <th class="px-4 py-2 text-left">CDN</th>
+                        <th class="px-4 py-2 text-right">Days Down</th>
+                        <th class="px-4 py-2 text-center">Action</th>
+                    </tr></thead>
+                    <tbody>
+                        ${items.map(r => `
+                            <tr class="border-b border-surface-border hover:bg-white/[0.02]">
+                                <td class="px-4 py-2.5 font-mono text-slate-200">${esc(r.fqdn)}</td>
+                                <td class="px-4 py-2.5 text-center">${r.in_cmdb ? '<span class="text-green-400">✓</span>' : '<span class="text-slate-600">-</span>'}</td>
+                                <td class="px-4 py-2.5 text-center">${r.resolves ? '<span class="text-green-400">✓</span>' : '<span class="text-red-400">✗</span>'}</td>
+                                <td class="px-4 py-2.5 text-slate-400">${esc(r.dns_status || '-')}</td>
+                                <td class="px-4 py-2.5 text-purple-400">${esc(r.cdn_provider || '-')}</td>
+                                <td class="px-4 py-2.5 text-right ${(r.days_unavailable||0) > 0 ? 'text-orange-400' : 'text-slate-500'}">${r.days_unavailable || '-'}</td>
+                                <td class="px-4 py-2.5 text-center">${scopeActionBadge(r.scope_action)}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    `;
+}
+
+function _lcNsTable(items) {
+    if (!items.length) return _lcEmpty('No 3rd-party nameservers detected', 'All FQDNs use first-party nameservers.');
+    return `
+        <div class="card overflow-hidden">
+            <div class="px-5 py-3 border-b border-surface-border">
+                <h3 class="text-sm font-semibold text-slate-300">3rd-Party Nameserver Delegation</h3>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-xs">
+                    <thead><tr class="border-b border-surface-border text-slate-500 uppercase tracking-wider">
+                        <th class="px-4 py-2 text-left">FQDN</th>
+                        <th class="px-4 py-2 text-left">NS Provider</th>
+                        <th class="px-4 py-2 text-center">In CMDB</th>
+                        <th class="px-4 py-2 text-center">Resolves</th>
+                        <th class="px-4 py-2 text-left">CDN</th>
+                    </tr></thead>
+                    <tbody>
+                        ${items.map(r => `
+                            <tr class="border-b border-surface-border hover:bg-white/[0.02]">
+                                <td class="px-4 py-2.5 font-mono text-slate-200">${esc(r.fqdn)}</td>
+                                <td class="px-4 py-2.5">
+                                    <span class="text-blue-400 font-medium">${esc(r.ns_provider || 'unknown')}</span>
+                                </td>
+                                <td class="px-4 py-2.5 text-center">${r.in_cmdb ? '<span class="text-green-400">✓</span>' : '<span class="text-slate-600">-</span>'}</td>
+                                <td class="px-4 py-2.5 text-center">${r.resolves ? '<span class="text-green-400">✓</span>' : '<span class="text-red-400">✗</span>'}</td>
+                                <td class="px-4 py-2.5 text-purple-400">${esc(r.cdn_provider || '-')}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    `;
+}
+
+function _lcEmpty(title, desc) {
+    return `
+        <div class="card p-8 text-center">
+            <p class="text-slate-400 font-medium">${esc(title)}</p>
+            <p class="text-xs text-slate-600 mt-1">${esc(desc)}</p>
+        </div>
+    `;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers

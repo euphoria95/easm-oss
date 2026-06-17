@@ -44,6 +44,15 @@ def load_assets(con: duckdb.DuckDBPyConnection, jsonl_path: str, scan_id: str):
     return count
 
 
+def _has_column(con: duckdb.DuckDBPyConnection, table: str, column: str) -> bool:
+    """Check if a column exists in a DuckDB table."""
+    try:
+        con.execute(f"SELECT \"{column}\" FROM \"{table}\" LIMIT 0")
+        return True
+    except Exception:
+        return False
+
+
 def create_views(con: duckdb.DuckDBPyConnection):
     """Create analytical views (must be called after assets table exists).
 
@@ -52,7 +61,19 @@ def create_views(con: duckdb.DuckDBPyConnection):
     struct fields via alias.field in the outer query.
     """
 
-    con.execute("""
+    has_cloud = _has_column(con, "assets", "cloud")
+
+    cloud_summary_cols = (
+        "len(cloud.endpoints) AS cloud_endpoint_count,\n"
+        "            cloud.risk_summary AS cloud_risk,\n"
+        "            cloud.providers AS cloud_providers,"
+    ) if has_cloud else (
+        "0 AS cloud_endpoint_count,\n"
+        "            NULL AS cloud_risk,\n"
+        "            NULL AS cloud_providers,"
+    )
+
+    con.execute(f"""
         CREATE OR REPLACE VIEW v_asset_summary AS
         SELECT
             fqdn,
@@ -76,6 +97,7 @@ def create_views(con: duckdb.DuckDBPyConnection):
             len(tls) AS tls_cert_count,
             len(findings) AS finding_count,
             len(services) AS service_count,
+            {cloud_summary_cols}
             cmdb.in_cmdb AS in_cmdb,
             cmdb.gap_type AS gap_type,
             cmdb.matched_ci AS ci_id
@@ -306,7 +328,15 @@ def create_views(con: duckdb.DuckDBPyConnection):
     except Exception:
         pass
 
-    con.execute("""
+    cloud_stats_cols = (
+        "COUNT(*) FILTER (WHERE len(cloud.endpoints) > 0) AS cloud_assets,\n"
+        "            SUM(len(cloud.endpoints)) AS cloud_endpoints"
+    ) if has_cloud else (
+        "0 AS cloud_assets,\n"
+        "            0 AS cloud_endpoints"
+    )
+
+    con.execute(f"""
         CREATE OR REPLACE VIEW v_scan_stats AS
         SELECT
             scan_id,
@@ -324,12 +354,233 @@ def create_views(con: duckdb.DuckDBPyConnection):
                 1
             ) AS shadow_it_pct,
             SUM(len(services)) AS total_services,
-            COUNT(*) FILTER (WHERE len(services) > 0) AS assets_with_services
+            COUNT(*) FILTER (WHERE len(services) > 0) AS assets_with_services,
+            {cloud_stats_cols}
         FROM assets
         GROUP BY scan_id
     """)
 
+    if has_cloud:
+        create_cloud_views(con)
     create_bounty_views(con)
+    create_livecheck_views(con)
+
+
+def create_cloud_views(con: duckdb.DuckDBPyConnection):
+    """Create cloud endpoint analysis views.
+
+    Caller must verify that the 'cloud' column exists before calling.
+    """
+    try:
+        con.execute("""
+            CREATE OR REPLACE VIEW v_cloud_endpoints AS
+            WITH expanded AS (
+                SELECT fqdn, UNNEST(cloud.endpoints) AS e
+                FROM assets
+                WHERE len(cloud.endpoints) > 0
+            )
+            SELECT
+                fqdn,
+                e.provider,
+                e.service,
+                e.service_label,
+                e.risk,
+                e.resource_name,
+                e.hostname,
+                e.pattern,
+                e.signals
+            FROM expanded
+            ORDER BY
+                CASE e.risk
+                    WHEN 'critical' THEN 1
+                    WHEN 'high' THEN 2
+                    WHEN 'medium' THEN 3
+                    WHEN 'low' THEN 4
+                    WHEN 'info' THEN 5
+                    ELSE 6
+                END,
+                e.provider, fqdn
+        """)
+    except Exception as e:
+        print(f"WARN: Could not create v_cloud_endpoints view: {e}", file=sys.stderr)
+
+    try:
+        con.execute("""
+            CREATE OR REPLACE VIEW v_cloud_summary AS
+            WITH expanded AS (
+                SELECT fqdn, UNNEST(cloud.endpoints) AS e
+                FROM assets
+                WHERE len(cloud.endpoints) > 0
+            )
+            SELECT
+                e.provider,
+                e.service,
+                e.service_label,
+                e.risk,
+                COUNT(*) AS count,
+                COUNT(DISTINCT fqdn) AS affected_hosts
+            FROM expanded
+            GROUP BY e.provider, e.service, e.service_label, e.risk
+            ORDER BY count DESC
+        """)
+    except Exception as e:
+        print(f"WARN: Could not create v_cloud_summary view: {e}", file=sys.stderr)
+
+    try:
+        con.execute("""
+            CREATE OR REPLACE VIEW v_cloud_providers AS
+            WITH expanded AS (
+                SELECT fqdn, UNNEST(cloud.providers) AS provider
+                FROM assets
+                WHERE len(cloud.providers) > 0
+            )
+            SELECT
+                provider,
+                COUNT(DISTINCT fqdn) AS host_count,
+                ROUND(COUNT(DISTINCT fqdn) * 100.0 /
+                    NULLIF((SELECT COUNT(*) FROM assets), 0), 1) AS pct
+            FROM expanded
+            GROUP BY provider
+            ORDER BY host_count DESC
+        """)
+    except Exception as e:
+        print(f"WARN: Could not create v_cloud_providers view: {e}", file=sys.stderr)
+
+    try:
+        con.execute("""
+            CREATE OR REPLACE VIEW v_cloud_risk AS
+            WITH expanded AS (
+                SELECT fqdn, UNNEST(cloud.endpoints) AS e
+                FROM assets
+                WHERE len(cloud.endpoints) > 0
+            )
+            SELECT
+                e.risk,
+                COUNT(*) AS count,
+                COUNT(DISTINCT fqdn) AS affected_hosts
+            FROM expanded
+            GROUP BY e.risk
+            ORDER BY
+                CASE e.risk
+                    WHEN 'critical' THEN 1
+                    WHEN 'high' THEN 2
+                    WHEN 'medium' THEN 3
+                    WHEN 'low' THEN 4
+                    WHEN 'info' THEN 5
+                    ELSE 6
+                END
+        """)
+    except Exception as e:
+        print(f"WARN: Could not create v_cloud_risk view: {e}", file=sys.stderr)
+
+
+def create_livecheck_views(con: duckdb.DuckDBPyConnection):
+    """Create livecheck views if livecheck table exists."""
+    try:
+        has_table = con.execute("""
+            SELECT 1 FROM information_schema.tables WHERE table_name = 'livecheck'
+        """).fetchone()
+        if not has_table:
+            return
+
+        con.execute("""
+            CREATE OR REPLACE VIEW v_livecheck_summary AS
+            SELECT
+                COUNT(*) AS total_fqdns,
+                COUNT(*) FILTER (WHERE resolves) AS resolving,
+                COUNT(*) FILTER (WHERE NOT resolves) AS not_resolving,
+                ROUND(COUNT(*) FILTER (WHERE resolves) * 100.0 / NULLIF(COUNT(*), 0), 1) AS resolution_pct,
+                COUNT(*) FILTER (WHERE in_cmdb) AS in_cmdb,
+                COUNT(*) FILTER (WHERE exclude_proposal) AS cdn_excluded,
+                COUNT(*) FILTER (WHERE recommend_remove) AS removal_candidates,
+                COUNT(*) FILTER (WHERE cname_bloated) AS cname_bloated,
+                COUNT(*) FILTER (WHERE is_leaf) AS leaf_domains,
+                COUNT(*) FILTER (WHERE ns_is_third_party) AS third_party_ns
+            FROM livecheck
+        """)
+
+        con.execute("""
+            CREATE OR REPLACE VIEW v_scope_removals AS
+            SELECT
+                fqdn,
+                ci_id,
+                owner,
+                days_unavailable,
+                days_remaining,
+                consecutive_scans_down,
+                removal_deadline,
+                scope_action,
+                dns_status
+            FROM livecheck
+            WHERE recommend_remove = true
+            ORDER BY days_unavailable DESC, fqdn
+        """)
+
+        con.execute("""
+            CREATE OR REPLACE VIEW v_cname_bloat AS
+            SELECT
+                fqdn,
+                cname_chain_depth,
+                cname_chain,
+                cname_fan_in_target,
+                cname_fan_in_count,
+                resolves,
+                cdn_provider,
+                in_cmdb
+            FROM livecheck
+            WHERE cname_bloated = true
+            ORDER BY cname_chain_depth DESC, fqdn
+        """)
+
+        con.execute("""
+            CREATE OR REPLACE VIEW v_cdn_exclusions AS
+            SELECT
+                fqdn,
+                ci_id,
+                owner,
+                cdn_provider,
+                cdn_confidence,
+                cdn_signals,
+                a_records,
+                cname_chain,
+                scope_action
+            FROM livecheck
+            WHERE exclude_proposal = true
+            ORDER BY cdn_provider, fqdn
+        """)
+
+        con.execute("""
+            CREATE OR REPLACE VIEW v_leaf_domains AS
+            SELECT
+                fqdn,
+                in_cmdb,
+                resolves,
+                dns_status,
+                scope_action,
+                days_unavailable,
+                cdn_provider
+            FROM livecheck
+            WHERE is_leaf = true
+            ORDER BY resolves, fqdn
+        """)
+
+        con.execute("""
+            CREATE OR REPLACE VIEW v_third_party_ns AS
+            SELECT
+                fqdn,
+                ns_provider,
+                ns_is_third_party,
+                ns_records,
+                in_cmdb,
+                resolves,
+                cdn_provider
+            FROM livecheck
+            WHERE ns_is_third_party = true
+            ORDER BY ns_provider, fqdn
+        """)
+
+    except Exception as e:
+        print(f"WARN: Could not create livecheck views: {e}", file=sys.stderr)
 
 
 def create_bounty_views(con: duckdb.DuckDBPyConnection):

@@ -1,0 +1,31 @@
+id: gcp-cloud-storage-detect
+info:
+  name: GCP Cloud Storage Detection
+  author: easm-pipeline
+  severity: info
+  description: Detects Google Cloud Platform Cloud Storage endpoints.
+  tags: cloud,gcp,storage
+  metadata:
+    provider: gcp
+    service: cloud_storage
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}"
+    matchers-condition: or
+    matchers:
+      - type: word
+        words:
+          - "storage.googleapis.com"
+          - "UploadServer"
+          - "NoSuchKey"
+        condition: or
+        part: body
+
+      - type: word
+        words:
+          - "x-goog-generation"
+          - "x-goog-stored-content-length"
+        condition: or
+        part: header

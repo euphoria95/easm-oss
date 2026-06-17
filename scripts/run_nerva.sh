@@ -37,26 +37,43 @@ if [[ ! -f "${PORTS_JSONL}" ]]; then
 fi
 
 # Build target list: fqdn:port when dns.jsonl available, else ip:port
+NERVA_TARGETS_FILE=$(mktemp "${TMPDIR:-/tmp}/nerva_targets.XXXXXX")
+trap 'rm -f "${NERVA_TARGETS_FILE}"' EXIT
+
 if [[ -n "${DNS_JSONL}" && -f "${DNS_JSONL}" ]]; then
-    TARGETS=$(jq -rs \
-        --slurpfile dns "${DNS_JSONL}" \
-        '($dns | map(.host as $f | (.a // [])[] | {(.): $f}) | add // {}) as $ip_map |
-         .[] |
-         (($ip_map[(.host // .ip)] // (.host // .ip))) as $h |
-         "\($h):\(.port)"' \
-        "${PORTS_JSONL}" 2>/dev/null | sort -u)
+    python3 -c "
+import sys, json
+ip_map = {}
+with open('${DNS_JSONL}') as f:
+    for line in f:
+        rec = json.loads(line)
+        fqdn = rec.get('host','')
+        for a in (rec.get('a') or []):
+            ip_map[a] = fqdn
+with open('${PORTS_JSONL}') as f:
+    seen = set()
+    for line in f:
+        rec = json.loads(line)
+        h = rec.get('host') or rec.get('ip','')
+        p = rec.get('port','')
+        fqdn = ip_map.get(h, h)
+        t = f'{fqdn}:{p}'
+        if t not in seen:
+            seen.add(t)
+            print(t)
+" > "${NERVA_TARGETS_FILE}" 2>/dev/null
     echo "nerva: FQDN-resolved targets from ${DNS_JSONL}" >&2
 else
-    TARGETS=$(jq -r '"\(.host // .ip):\(.port)"' "${PORTS_JSONL}" 2>/dev/null | sort -u)
+    jq -r '"\(.host // .ip):\(.port)"' "${PORTS_JSONL}" 2>/dev/null | sort -u > "${NERVA_TARGETS_FILE}"
 fi
 
-if [[ -z "${TARGETS}" ]]; then
+if [[ ! -s "${NERVA_TARGETS_FILE}" ]]; then
     echo "WARN: No targets extracted from ${PORTS_JSONL}" >&2
     > "${OUTPUT_JSONL}"
     exit 0
 fi
 
-TARGET_COUNT=$(echo "${TARGETS}" | wc -l | tr -d ' ')
+TARGET_COUNT=$(wc -l < "${NERVA_TARGETS_FILE}" | tr -d ' ')
 echo "nerva: scanning ${TARGET_COUNT} targets (timeout=${NERVA_TIMEOUT}s, workers=${NERVA_THREADS})" >&2
 
 TIMEOUT_MS=$(( NERVA_TIMEOUT * 1000 ))
@@ -72,7 +89,7 @@ CMD=(nerva
 [[ "${NERVA_VERBOSE}" == "true" ]]    && CMD+=(-v)
 [[ "${NERVA_MISCONFIGS}" == "true" ]] && CMD+=(--misconfigs)
 
-echo "${TARGETS}" | "${CMD[@]}" > "${OUTPUT_JSONL}" 2>/dev/null
+"${CMD[@]}" < "${NERVA_TARGETS_FILE}" > "${OUTPUT_JSONL}" 2>/dev/null
 
 RESULT_COUNT=$(wc -l < "${OUTPUT_JSONL}" | tr -d ' ')
 echo "nerva: complete — ${RESULT_COUNT} fingerprints" >&2

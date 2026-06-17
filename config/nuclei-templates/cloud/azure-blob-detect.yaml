@@ -1,0 +1,39 @@
+id: azure-blob-storage-detect
+info:
+  name: Azure Blob Storage Endpoint Detection
+  author: easm-pipeline
+  severity: info
+  description: Detects Azure Blob Storage endpoints via CNAME or direct hostname patterns.
+  tags: cloud,azure,storage,blob
+  metadata:
+    provider: azure
+    service: blob_storage
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}"
+    matchers-condition: or
+    matchers:
+      - type: word
+        words:
+          - "blob.core.windows.net"
+          - "BlobNotFound"
+          - "ContainerNotFound"
+          - "AuthenticationFailed"
+          - "ResourceNotFound"
+          - "InvalidQueryParameterValue"
+        condition: or
+        part: body
+
+      - type: word
+        words:
+          - "x-ms-request-id"
+          - "x-ms-version"
+        condition: or
+        part: header
+
+      - type: regex
+        regex:
+          - '(?i)\.blob\.core\.windows\.net'
+        part: header

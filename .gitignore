@@ -24,6 +24,15 @@ data/.scan_state.json
 # OS
 .DS_Store
 Thumbs.db
+# macOS AppleDouble / resource-fork files
+._*
+
+# Tooling / agent metadata
+.serena/
+aimap/
+
+# Scratch / scan logs
+tmp/
 
 # Python
 __pycache__/

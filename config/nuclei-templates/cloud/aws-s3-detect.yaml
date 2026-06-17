@@ -1,0 +1,38 @@
+id: aws-s3-bucket-detect
+info:
+  name: AWS S3 Bucket Detection
+  author: easm-pipeline
+  severity: info
+  description: Detects AWS S3 bucket endpoints.
+  tags: cloud,aws,s3,storage
+  metadata:
+    provider: aws
+    service: s3
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}"
+    matchers-condition: or
+    matchers:
+      - type: word
+        words:
+          - "s3.amazonaws.com"
+          - "NoSuchBucket"
+          - "AccessDenied"
+          - "AllAccessDisabled"
+          - "NoSuchKey"
+        condition: or
+        part: body
+
+      - type: word
+        words:
+          - "x-amz-request-id"
+          - "x-amz-id-2"
+        condition: and
+        part: header
+
+      - type: word
+        words:
+          - "AmazonS3"
+        part: header

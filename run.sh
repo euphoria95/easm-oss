@@ -69,13 +69,15 @@ IP_TARGETS="${OUTPUT_DIR}/ip_targets.txt"
 FQDN_TARGETS="${OUTPUT_DIR}/fqdn_targets.txt"
 ASN_JSONL="${OUTPUT_DIR}/asn.jsonl"
 RDNS_JSONL="${OUTPUT_DIR}/rdns.jsonl"
+AIMAP_JSONL="${OUTPUT_DIR}/aimap.jsonl"
+CLOUD_ENUM_JSONL="${OUTPUT_DIR}/cloud_enum.jsonl"
 
 SCAN_ID="$(date -u +%Y%m%d_%H%M%S)"
 SCAN_LOG="${LOG_DIR}/scan_${SCAN_ID}.log"
 SCAN_MARKER="${OUTPUT_DIR}/scan_id.txt"
 
 # CLI args
-STAGE_ORDER="dns,asn,rdns,ports,http,tls,fingerprint,nuclei,normalize,load,verify"
+STAGE_ORDER="dns,asn,rdns,ports,http,tls,fingerprint,nuclei,cloud_enum,aimap,normalize,load,verify"
 STAGE_FILTER=""
 FROM_STAGE=""
 DRY_RUN=false
@@ -94,11 +96,11 @@ while [[ $# -gt 0 ]]; do
         --dry-run)      DRY_RUN=true; shift ;;
         --debug)        DEBUG_MODE=true; shift ;;
         -h|--help)
-            echo "Usage: $0 [--stage STAGE1,STAGE2 | --from STAGE] [--mode recon|bounty] [--dry-run] [--debug]"
+            echo "Usage: $0 [--stage STAGE1,STAGE2 | --from STAGE] [--mode recon|bounty|livecheck] [--dry-run] [--debug]"
             echo ""
             echo "  --stage STAGES  Run only the specified comma-separated stages"
             echo "  --from  STAGE   Run from STAGE through the end of the pipeline"
-            echo "  --mode  MODE    Pipeline mode: recon (default) or bounty"
+            echo "  --mode  MODE    Pipeline mode: recon (default), bounty, or livecheck"
             echo "  --debug         Enable debug mode (detailed timing and diagnostics)"
             echo ""
             echo "Stages (in order): ${STAGE_ORDER}"
@@ -240,18 +242,9 @@ if [[ "${DEBUG_MODE}" == "true" ]]; then
     log "DEBUG MODE enabled — detailed timing and diagnostics will be logged"
 fi
 
-if ${DRY_RUN}; then
-    log "DRY RUN — printing stages that would execute"
-    [[ -n "${FROM_STAGE}" ]] && log "Resuming from: ${FROM_STAGE} (resolved to: ${STAGE_FILTER})"
-    IFS=',' read -ra _DRY_STAGES <<< "${STAGE_ORDER}"
-    for s in "${_DRY_STAGES[@]}"; do
-        if should_run "$s"; then echo "  Would run: $s"; fi
-    done
-    exit 0
-fi
-
-PIPELINE_START=$(date +%s)
 BOUNTY_REPORT_JSONL="${OUTPUT_DIR}/bounty_report.jsonl"
+LIVECHECK_JSONL="${OUTPUT_DIR}/livecheck_report.jsonl"
+LIVECHECK_STATE="${OUTPUT_DIR}/livecheck_state.json"
 
 # ---------------------------------------------------------------------------
 # Bounty mode overrides
@@ -265,6 +258,29 @@ if [[ "${PIPELINE_MODE}" == "bounty" ]]; then
     NERVA_FAST_MODE=false
     NUCLEI_CONFIG="${CONFIG_DIR}/nuclei-bounty.yaml"
 fi
+
+# ---------------------------------------------------------------------------
+# Livecheck mode overrides — DNS-only pass for CMDB scope governance
+# ---------------------------------------------------------------------------
+if [[ "${PIPELINE_MODE}" == "livecheck" ]]; then
+    log "LIVECHECK MODE — lightweight DNS-only CMDB scope validation"
+    # If no explicit --stage filter, restrict to DNS + enrichment + livecheck stages
+    if [[ -z "${STAGE_FILTER}" ]]; then
+        STAGE_FILTER="dns,asn,rdns,normalize,load"
+    fi
+fi
+
+if ${DRY_RUN}; then
+    log "DRY RUN — printing stages that would execute"
+    [[ -n "${FROM_STAGE}" ]] && log "Resuming from: ${FROM_STAGE} (resolved to: ${STAGE_FILTER})"
+    IFS=',' read -ra _DRY_STAGES <<< "${STAGE_ORDER}"
+    for s in "${_DRY_STAGES[@]}"; do
+        if should_run "$s"; then echo "  Would run: $s"; fi
+    done
+    exit 0
+fi
+
+PIPELINE_START=$(date +%s)
 
 # ---------------------------------------------------------------------------
 # Scan isolation: archive orphaned outputs from any previous run, then write
@@ -291,10 +307,10 @@ if [[ -z "${STAGE_FILTER}" ]] && [[ -z "${FROM_STAGE}" ]]; then
                     log "WARN: Orphan archive failed — cleaning output directory anyway"
                 # Guarantee clean slate even if archive failed mid-move
                 rm -f "${TARGETS_FILE}" "${IP_TARGETS}" "${FQDN_TARGETS}" \
-                      "${ASN_JSONL}" "${RDNS_JSONL}" "${DNS_JSONL}" "${LIVE_HOSTS}" \
+                      "${ASN_JSONL}" "${RDNS_JSONL}" "${DNS_JSONL}" "${LIVE_HOSTS}" "${AIMAP_JSONL}" \
                       "${PORTS_JSONL}" "${WEB_TARGETS}" "${HTTPX_JSONL}" \
                       "${TLS_JSONL}" "${NERVA_JSONL}" "${SERVICE_DETECT_JSONL}" \
-                      "${NUCLEI_JSONL}" "${ASSETS_JSONL}" "${VERIFY_JSONL}"
+                      "${NUCLEI_JSONL}" "${ASSETS_JSONL}" "${VERIFY_JSONL}" "${CLOUD_ENUM_JSONL}"
                 mkdir -p "${ZGRAB_DIR}"
             fi
         fi
@@ -345,18 +361,27 @@ if should_run "dns"; then
     stage_start=$(date +%s)
     debug_stage_start "dns"
 
-    dnsx -l "${FQDN_TARGETS}" \
+    # Remove stale output
+    rm -f "${DNS_JSONL}"
+
+    # Use stdin pipe instead of -l/-o flags — dnsx 1.2.3 hangs with -l FILE on
+    # large inputs (>100 hosts) combined with multi-record-type queries.
+    cat "${FQDN_TARGETS}" | dnsx \
         -a -aaaa -cname -ns -mx -resp \
         -r "${RESOLVERS}" \
         -rate-limit "${DNS_RATE_LIMIT:-500}" \
         -retry "${DNS_RETRIES:-2}" \
         -silent -json \
-        -o "${DNS_JSONL}" 2>>"${SCAN_LOG}"
+        2>>"${SCAN_LOG}" > "${DNS_JSONL}" || {
+        log "ERROR: dnsx failed (exit $?) — aborting DNS stage"
+        exit 1
+    }
 
     debug_substep "dnsx completed: input=$(count_lines "${FQDN_TARGETS}") output=$(count_lines "${DNS_JSONL}")"
 
-    # Extract live hostnames
-    jq -r '.host // empty' "${DNS_JSONL}" | sort -u > "${LIVE_HOSTS}"
+    # Extract live hostnames — only FQDNs that actually resolved (have A or AAAA records)
+    # Excluding NXDOMAIN/SOA-only entries prevents naabu from failing with "no valid targets"
+    jq -r 'select(((.a // []) | length > 0) or ((.aaaa // []) | length > 0)) | .host' "${DNS_JSONL}" | sort -u > "${LIVE_HOSTS}"
 
     # Merge direct IP targets into live hosts
     if [[ -s "${IP_TARGETS}" ]]; then
@@ -427,13 +452,13 @@ if should_run "rdns"; then
     if [[ "${IP_COUNT}" -gt 0 ]]; then
         log "Reverse DNS: ${IP_COUNT} IPs"
         debug_substep "IP count: ${IP_COUNT}"
-        dnsx -l "${RDNS_INPUT}" \
+        cat "${RDNS_INPUT}" | dnsx \
             -ptr -resp \
             -r "${RESOLVERS}" \
             -rate-limit "${DNS_RATE_LIMIT:-500}" \
             -retry "${DNS_RETRIES:-2}" \
             -silent -json \
-            -o "${RDNS_JSONL}" 2>>"${SCAN_LOG}"
+            2>>"${SCAN_LOG}" > "${RDNS_JSONL}"
 
         debug_substep "PTR records found: $(count_lines "${RDNS_JSONL}")"
         debug_stage_end "rdns" "$(elapsed ${stage_start})"
@@ -471,11 +496,16 @@ if should_run "ports"; then
         else
             NAABU_ARGS+=(-top-ports "${NAABU_TOP_PORTS:-100}")
         fi
-        if [[ "${NAABU_EXCLUDE_CDN:-true}" == "true" ]]; then
+        # CDN exclusion disabled by default: for EASM we want to discover web services
+        # even on CDN-fronted hosts. Set NAABU_EXCLUDE_CDN=true to override.
+        if [[ "${NAABU_EXCLUDE_CDN:-false}" == "true" ]]; then
             NAABU_ARGS+=(-exclude-cdn)
         fi
 
-        naabu "${NAABU_ARGS[@]}" 2>>"${SCAN_LOG}"
+        naabu "${NAABU_ARGS[@]}" 2>>"${SCAN_LOG}" || {
+            log "WARN: naabu port scan failed (non-fatal) — continuing with empty port list"
+            echo -n "" > "${PORTS_JSONL}"
+        }
 
         # Build web target list
         WEB_PORTS_PATTERN=$(echo "${WEB_PORTS}" | sed 's/,/|/g')
@@ -499,8 +529,19 @@ if should_run "http"; then
     stage_start=$(date +%s)
     debug_stage_start "http"
 
+    # Fallback: if port scan found no web targets but we have live hosts,
+    # feed LIVE_HOSTS directly to httpx (it probes 80+443 by default).
+    # This handles CDN/WAF hosts that block SYN scans but accept full HTTP connects.
+    HTTPX_FALLBACK=false
+    if [[ (! -f "${WEB_TARGETS}" || $(count_lines "${WEB_TARGETS}") -eq 0) && -f "${LIVE_HOSTS}" && $(count_lines "${LIVE_HOSTS}") -gt 0 ]]; then
+        log "INFO: No web targets from port scan — falling back to LIVE_HOSTS (httpx will probe 80,443)"
+        cp "${LIVE_HOSTS}" "${WEB_TARGETS}"
+        HTTPX_FALLBACK=true
+        debug_substep "Fallback web_targets from LIVE_HOSTS: $(count_lines "${WEB_TARGETS}")"
+    fi
+
     if [[ ! -f "${WEB_TARGETS}" ]] || [[ $(count_lines "${WEB_TARGETS}") -eq 0 ]]; then
-        log "WARN: No web targets — skipping HTTP probe"
+        log "WARN: No web targets (and no live hosts) — skipping HTTP probe"
         debug_stage_end "http" "$(elapsed ${stage_start})" "(skipped)"
     else
         debug_substep "web_targets input: $(count_lines "${WEB_TARGETS}")"
@@ -513,7 +554,6 @@ if should_run "http"; then
             -tls-grab -http2
             -follow-redirects
             -include-response-header
-            -no-fallback
             -threads "${HTTPX_THREADS:-50}"
             -rate-limit "${HTTPX_RATE_LIMIT:-150}"
             -timeout "${HTTPX_TIMEOUT:-10}"
@@ -521,14 +561,31 @@ if should_run "http"; then
             -max-host-error "${HTTPX_MAX_HOST_ERROR:-30}"
             -H "User-Agent: ${USER_AGENT}"
             -silent -json
-            -o "${HTTPX_JSONL}"
         )
+
+        # When web_targets come from naabu (host:port format), disable fallback probing.
+        # When using LIVE_HOSTS fallback (bare FQDNs), let httpx probe both 80 and 443.
+        if [[ "${HTTPX_FALLBACK}" != "true" ]]; then
+            HTTPX_ARGS+=(-no-fallback)
+        fi
 
         if [[ "${HTTPX_SCREENSHOTS:-true}" == "true" ]]; then
             HTTPX_ARGS+=(-screenshot -system-chrome -srd "${SCREENSHOT_DIR}")
         fi
 
-        httpx "${HTTPX_ARGS[@]}" 2>>"${SCAN_LOG}"
+        # Use stdout pipe (not -o) so partial output survives timeouts.
+        # Timeout prevents Chromium/go-rod deadlocks (default 10 min).
+        HTTPX_TOTAL_TIMEOUT="${HTTPX_TOTAL_TIMEOUT:-600}"
+        timeout "${HTTPX_TOTAL_TIMEOUT}" httpx "${HTTPX_ARGS[@]}" 2>>"${SCAN_LOG}" > "${HTTPX_JSONL}" || {
+            httpx_exit=$?
+            if [[ ${httpx_exit} -eq 124 ]]; then
+                log "WARN: httpx killed after ${HTTPX_TOTAL_TIMEOUT}s timeout (non-fatal)"
+            else
+                log "WARN: httpx exited with code ${httpx_exit} (non-fatal)"
+            fi
+        }
+        # Ensure output file exists even if httpx produced nothing
+        touch "${HTTPX_JSONL}"
 
         SCREENSHOTS_COUNT=$(find "${SCREENSHOT_DIR}" -name '*.png' 2>/dev/null | wc -l | tr -d ' ')
         debug_substep "httpx output: $(count_lines "${HTTPX_JSONL}") screenshots: ${SCREENSHOTS_COUNT}"
@@ -539,27 +596,28 @@ if should_run "http"; then
         if [[ "${SERVICE_DETECT_FALLBACK:-false}" == "true" ]] && [[ -f "${PORTS_JSONL}" ]] && [[ -f "${HTTPX_JSONL}" ]]; then
             debug_substep "Computing unprobed ports for service detection fallback"
 
-            # Build list of host:port that httpx successfully probed
-            PROBED_SET=$(jq -r '
+            # Build list of host:port that httpx successfully probed (use temp files, not variables)
+            PROBED_SET_FILE="${OUTPUT_DIR}/_probed_set.txt"
+            jq -r '
                 (.input // ((.host // "") + ":" + ((.port // 443) | tostring))) as $hp |
                 if ($hp | contains(":")) then $hp
                 else ((.host // "") + ":" + ((.port // 443) | tostring))
                 end
-            ' "${HTTPX_JSONL}" 2>/dev/null | sort -u)
+            ' "${HTTPX_JSONL}" 2>/dev/null | sort -u > "${PROBED_SET_FILE}"
 
             # All web target host:port pairs
-            ALL_WEB=$(cat "${WEB_TARGETS}" 2>/dev/null | sort -u)
+            ALL_WEB_FILE="${OUTPUT_DIR}/_all_web_sorted.txt"
+            sort -u "${WEB_TARGETS}" > "${ALL_WEB_FILE}"
 
             # Compute unprobed = all_web - probed
-            UNPROBED=$(comm -23 <(echo "${ALL_WEB}") <(echo "${PROBED_SET}"))
-            UNPROBED_COUNT=$(echo "${UNPROBED}" | grep -c . || true)
+            UNPROBED_FILE="${OUTPUT_DIR}/unprobed_targets.txt"
+            comm -23 "${ALL_WEB_FILE}" "${PROBED_SET_FILE}" > "${UNPROBED_FILE}"
+            rm -f "${PROBED_SET_FILE}" "${ALL_WEB_FILE}"
+            UNPROBED_COUNT=$(count_lines "${UNPROBED_FILE}")
 
             if [[ "${UNPROBED_COUNT}" -gt 0 ]]; then
                 log "Service detection fallback: ${UNPROBED_COUNT} unprobed web targets"
                 debug_substep "Running naabu -sV on ${UNPROBED_COUNT} targets"
-
-                UNPROBED_FILE="${OUTPUT_DIR}/unprobed_targets.txt"
-                echo "${UNPROBED}" > "${UNPROBED_FILE}"
 
                 NAABU_SV_ARGS=(
                     -list "${UNPROBED_FILE}"
@@ -596,18 +654,20 @@ if should_run "tls"; then
         debug_stage_end "tls" "$(elapsed ${stage_start})" "(skipped)"
     else
         TLS_PORTS_PATTERN=$(echo "${TLS_PORTS}" | sed 's/,/|/g')
-        TLS_TARGETS=$(jq -r --arg ports "${TLS_PORTS_PATTERN}" \
+        TLS_TARGETS_FILE="${OUTPUT_DIR}/_tls_targets.txt"
+        jq -r --arg ports "${TLS_PORTS_PATTERN}" \
             'select(.port | tostring | test("^(" + $ports + ")$")) | "\(.host):\(.port)"' \
-            "${PORTS_JSONL}" | sort -u)
+            "${PORTS_JSONL}" | sort -u > "${TLS_TARGETS_FILE}"
 
-        if [[ -z "${TLS_TARGETS}" ]]; then
+        if [[ ! -s "${TLS_TARGETS_FILE}" ]]; then
             log "WARN: No TLS targets found"
+            rm -f "${TLS_TARGETS_FILE}"
             debug_stage_end "tls" "$(elapsed ${stage_start})" "(skipped)"
         else
-            TLS_TARGET_COUNT=$(echo "${TLS_TARGETS}" | grep -c . || true)
+            TLS_TARGET_COUNT=$(count_lines "${TLS_TARGETS_FILE}")
             debug_substep "TLS targets: ${TLS_TARGET_COUNT}"
-            echo "${TLS_TARGETS}" | \
             tlsx \
+                -l "${TLS_TARGETS_FILE}" \
                 -ja3 -jarm -so -tv -cipher -serial \
                 -hash sha256 \
                 -expired -self-signed -mismatched -revoked -untrusted -wc \
@@ -616,6 +676,7 @@ if should_run "tls"; then
                 -silent -json \
                 -o "${TLS_JSONL}" 2>>"${SCAN_LOG}" || \
                 log "WARN: tlsx had errors (partial results may be available)"
+            rm -f "${TLS_TARGETS_FILE}"
 
             debug_substep "Certs found: $(count_lines "${TLS_JSONL}")"
             debug_stage_end "tls" "$(elapsed ${stage_start})"
@@ -645,21 +706,58 @@ if should_run "fingerprint"; then
         # Prefer fqdn:port over ip:port so nerva results map to FQDN-keyed assets.
         # Join ports.jsonl with dns.jsonl (ip → fqdn). Fall back to ip:port when
         # no FQDN is known for an IP.
+        # NOTE: Uses temp file instead of bash variable to avoid OOM on large scans.
+        NERVA_TARGETS_FILE="${OUTPUT_DIR}/_nerva_targets.txt"
         if [[ -f "${DNS_JSONL}" ]]; then
-            TARGETS=$(jq -rs \
-                --slurpfile dns "${DNS_JSONL}" \
-                '($dns | map(.host as $f | (.a // [])[] | {(.): $f}) | add // {}) as $ip_map |
-                 .[] |
-                 (($ip_map[(.host // .ip)] // (.host // .ip))) as $h |
-                 "\($h):\(.port)"' \
-                "${PORTS_JSONL}" 2>/dev/null | sort -u)
-        else
-            TARGETS=$(jq -r '"\(.host // .ip):\(.port)"' "${PORTS_JSONL}" 2>/dev/null | sort -u)
-        fi
-        TARGET_COUNT=$(echo "${TARGETS}" | wc -l | tr -d ' ')
+            python3 -c "
+import sys, os
+try:
+    import orjson as json_mod
+    def loads(b): return json_mod.loads(b)
+except ImportError:
+    import json as json_mod
+    def loads(b): return json_mod.loads(b)
 
-        if [[ -z "${TARGETS}" || "${TARGET_COUNT}" -eq 0 ]]; then
+ip_map = {}
+with open(sys.argv[1], 'rb') as f:
+    for line in f:
+        line = line.strip()
+        if not line: continue
+        try:
+            rec = loads(line)
+            host = rec.get('host', '')
+            for a in (rec.get('a') or []):
+                if a and host:
+                    ip_map[a] = host
+        except Exception:
+            pass
+
+seen = set()
+with open(sys.argv[2], 'rb') as f, open(sys.argv[3], 'w') as out:
+    for line in f:
+        line = line.strip()
+        if not line: continue
+        try:
+            rec = loads(line)
+            h = rec.get('host') or rec.get('ip', '')
+            port = rec.get('port')
+            if not h or port is None: continue
+            resolved = ip_map.get(h, h)
+            key = f'{resolved}:{port}'
+            if key not in seen:
+                seen.add(key)
+                out.write(key + '\n')
+        except Exception:
+            pass
+" "${DNS_JSONL}" "${PORTS_JSONL}" "${NERVA_TARGETS_FILE}"
+        else
+            jq -r '"\(.host // .ip):\(.port)"' "${PORTS_JSONL}" 2>/dev/null | sort -u > "${NERVA_TARGETS_FILE}"
+        fi
+        TARGET_COUNT=$(count_lines "${NERVA_TARGETS_FILE}")
+
+        if [[ ! -s "${NERVA_TARGETS_FILE}" || "${TARGET_COUNT}" -eq 0 ]]; then
             log "WARN: No targets for fingerprinting"
+            rm -f "${NERVA_TARGETS_FILE}"
             debug_stage_end "fingerprint" "$(elapsed ${stage_start})" "(skipped)"
         else
             TIMEOUT_MS=$(( NERVA_TIMEOUT * 1000 ))
@@ -675,8 +773,9 @@ if should_run "fingerprint"; then
             [[ "${NERVA_UDP}" == "true" ]]         && NERVA_CMD+=(-U)
             [[ "${NERVA_MISCONFIGS}" == "true" ]]  && NERVA_CMD+=(--misconfigs)
 
-            echo "${TARGETS}" | "${NERVA_CMD[@]}" > "${NERVA_JSONL}" 2>>"${SCAN_LOG}" || \
+            "${NERVA_CMD[@]}" < "${NERVA_TARGETS_FILE}" > "${NERVA_JSONL}" 2>>"${SCAN_LOG}" || \
                 log "WARN: nerva had errors (partial results may be available)"
+            rm -f "${NERVA_TARGETS_FILE}"
 
             debug_substep "nerva fingerprints: $(count_lines "${NERVA_JSONL}")"
             debug_stage_end "fingerprint" "$(elapsed ${stage_start})"
@@ -742,21 +841,24 @@ if should_run "nuclei"; then
         log "WARN: No HTTP data — skipping nuclei (run from 'http' stage first)"
         debug_stage_end "nuclei" "$(elapsed ${stage_start})" "(skipped)"
     else
-        URLS=$(jq -r '.url // empty' "${HTTPX_JSONL}" | sort -u)
-        URL_COUNT=$(echo "${URLS}" | grep -c . || true)
-        if [[ -z "${URLS}" ]] || [[ "${URL_COUNT}" -eq 0 ]]; then
+        NUCLEI_URLS_FILE="${OUTPUT_DIR}/_nuclei_urls.txt"
+        jq -r '.url // empty' "${HTTPX_JSONL}" | sort -u > "${NUCLEI_URLS_FILE}"
+        URL_COUNT=$(count_lines "${NUCLEI_URLS_FILE}")
+        if [[ ! -s "${NUCLEI_URLS_FILE}" ]] || [[ "${URL_COUNT}" -eq 0 ]]; then
             log "WARN: No URLs extracted from ${HTTPX_JSONL}"
+            rm -f "${NUCLEI_URLS_FILE}"
             debug_stage_end "nuclei" "$(elapsed ${stage_start})" "(skipped)"
         else
             debug_substep "URLs for pass 1: ${URL_COUNT}"
             # --- Pass 1: Generic broad scan ---
             log "Nuclei pass 1 (generic): scanning ${URL_COUNT} URLs"
-            echo "${URLS}" | \
             nuclei \
                 -config "${NUCLEI_CONFIG}" \
+                -l "${NUCLEI_URLS_FILE}" \
                 -H "User-Agent: ${USER_AGENT}" \
                 -o "${NUCLEI_JSONL}" 2>>"${SCAN_LOG}" || \
                 log "WARN: nuclei pass 1 had errors"
+            rm -f "${NUCLEI_URLS_FILE}"
 
             debug_substep "Pass 1 findings: $(count_lines "${NUCLEI_JSONL}")"
             log "Pass 1 complete | findings=$(count_lines "${NUCLEI_JSONL}")"
@@ -808,9 +910,102 @@ if should_run "nuclei"; then
             fi
 
             debug_substep "Pass 2 findings: $(count_lines "${NUCLEI_JSONL}")"
+
+            # --- Pass 3: Cloud endpoint detection (Azure, AWS, GCP templates) ---
+            CLOUD_TEMPLATES="${SCRIPT_DIR}/config/nuclei-templates/cloud"
+            if [[ -d "${CLOUD_TEMPLATES}" ]]; then
+                CLOUD_TMPL_COUNT=$(find "${CLOUD_TEMPLATES}" -name "*.yaml" 2>/dev/null | wc -l | tr -d ' ')
+                if [[ "${CLOUD_TMPL_COUNT}" -gt 0 ]]; then
+                    log "Nuclei pass 3 (cloud): ${CLOUD_TMPL_COUNT} cloud templates against ${URL_COUNT:-0} URLs"
+                    NUCLEI_URLS_FILE="${OUTPUT_DIR}/_nuclei_urls.txt"
+                    if [[ ! -f "${NUCLEI_URLS_FILE}" ]]; then
+                        jq -r '.url // empty' "${HTTPX_JSONL}" | sort -u > "${NUCLEI_URLS_FILE}"
+                    fi
+                    PASS3_OUT="${OUTPUT_DIR}/nuclei_cloud.jsonl"
+                    nuclei \
+                        -t "${CLOUD_TEMPLATES}" \
+                        -l "${NUCLEI_URLS_FILE}" \
+                        -H "User-Agent: ${USER_AGENT}" \
+                        -o "${PASS3_OUT}" 2>>"${SCAN_LOG}" || \
+                        log "WARN: nuclei pass 3 (cloud) had errors"
+
+                    if [[ -f "${PASS3_OUT}" ]] && [[ $(count_lines "${PASS3_OUT}") -gt 0 ]]; then
+                        cat "${PASS3_OUT}" >> "${NUCLEI_JSONL}"
+                        log "  Cloud: $(count_lines "${PASS3_OUT}") findings"
+                    fi
+                    rm -f "${PASS3_OUT}" "${NUCLEI_URLS_FILE}"
+                fi
+            fi
+
             debug_stage_end "nuclei" "$(elapsed ${stage_start})"
             log "Nuclei complete | findings=$(count_lines "${NUCLEI_JSONL}") elapsed=$(elapsed ${stage_start})s"
         fi
+    fi
+fi
+
+# ===========================================================================
+# STAGE 6.5: Cloud Enumeration — Identify Azure/AWS/GCP endpoints
+#   Scans DNS, HTTP, and TLS data for cloud provider patterns (blob storage,
+#   azurewebsites, S3, App Engine, etc.) and outputs cloud_enum.jsonl.
+# ===========================================================================
+if should_run "cloud_enum"; then
+    log_stage "CLOUD ENUMERATION"
+    stage_start=$(date +%s)
+    debug_stage_start "cloud_enum"
+
+    CLOUD_ENUM_ARGS=(--output "${CLOUD_ENUM_JSONL}")
+    [[ -f "${DNS_JSONL}" ]]   && CLOUD_ENUM_ARGS+=(--dns "${DNS_JSONL}")
+    [[ -f "${HTTPX_JSONL}" ]] && CLOUD_ENUM_ARGS+=(--http "${HTTPX_JSONL}")
+    [[ -f "${TLS_JSONL}" ]]   && CLOUD_ENUM_ARGS+=(--tls "${TLS_JSONL}")
+
+    python3 "${SCRIPT_DIR}/scripts/cloud_enum.py" "${CLOUD_ENUM_ARGS[@]}" 2>>"${SCAN_LOG}" || \
+        log "WARN: Cloud enumeration had errors (partial results may be available)"
+
+    CLOUD_ENUM_COUNT=$(count_lines "${CLOUD_ENUM_JSONL}")
+    debug_substep "Cloud endpoints: ${CLOUD_ENUM_COUNT}"
+    debug_stage_end "cloud_enum" "$(elapsed ${stage_start})"
+    log "Cloud enumeration complete | endpoints=${CLOUD_ENUM_COUNT} elapsed=$(elapsed ${stage_start})s"
+fi
+
+# ===========================================================================
+# STAGE 7.5: AIMAP — AI Agent Discovery
+#   Detects exposed AI agents (MCP, Ollama, OpenAI-compat, LangServe,
+#   Gradio, Streamlit, ComfyUI, etc.) using AIMAP Nuclei templates and
+#   Python HTTP probes against the pipeline's discovered web targets.
+# ===========================================================================
+if should_run "aimap"; then
+    log_stage "AI AGENT DISCOVERY (aimap)"
+    stage_start=$(date +%s)
+    debug_stage_start "aimap"
+
+    AIMAP_TEMPLATES="${SCRIPT_DIR}/aimap/templates"
+
+    if [[ ! -d "${AIMAP_TEMPLATES}" ]]; then
+        log "WARN: AIMAP templates not found at ${AIMAP_TEMPLATES} — skipping"
+        debug_stage_end "aimap" "$(elapsed ${stage_start})" "(skipped)"
+    elif [[ (! -f "${HTTPX_JSONL}" || $(count_lines "${HTTPX_JSONL}") -eq 0) && \
+            (! -f "${WEB_TARGETS}" || $(count_lines "${WEB_TARGETS}") -eq 0) ]]; then
+        log "WARN: No HTTP data or web targets — skipping AIMAP"
+        debug_stage_end "aimap" "$(elapsed ${stage_start})" "(skipped)"
+    else
+        AIMAP_ARGS=(
+            --output "${AIMAP_JSONL}"
+            --templates-dir "${AIMAP_TEMPLATES}"
+            --scan-id "${SCAN_ID}"
+            --workers "${AIMAP_WORKERS:-20}"
+            --probe-timeout "${AIMAP_PROBE_TIMEOUT:-5}"
+            --nuclei-rate-limit "${AIMAP_NUCLEI_RATE:-100}"
+        )
+        [[ -f "${HTTPX_JSONL}" ]]   && AIMAP_ARGS+=(--httpx "${HTTPX_JSONL}")
+        [[ -f "${WEB_TARGETS}" ]]   && AIMAP_ARGS+=(--web-targets "${WEB_TARGETS}")
+
+        python3 "${SCRIPT_DIR}/scripts/run_aimap.py" "${AIMAP_ARGS[@]}" 2>>"${SCAN_LOG}" || \
+            log "WARN: AIMAP stage had errors (partial results may be available)"
+
+        AIMAP_COUNT=$(count_lines "${AIMAP_JSONL}")
+        debug_substep "AIMAP findings: ${AIMAP_COUNT}"
+        debug_stage_end "aimap" "$(elapsed ${stage_start})"
+        log "AIMAP complete | findings=${AIMAP_COUNT} elapsed=$(elapsed ${stage_start})s"
     fi
 fi
 
@@ -834,6 +1029,8 @@ if should_run "normalize"; then
     [[ -f "${NERVA_JSONL}" ]] && NORMALIZE_ARGS+=(--nerva "${NERVA_JSONL}")
     [[ -f "${SERVICE_DETECT_JSONL}" ]] && NORMALIZE_ARGS+=(--service-detect "${SERVICE_DETECT_JSONL}")
     [[ -f "${NUCLEI_JSONL}" ]] && NORMALIZE_ARGS+=(--nuclei "${NUCLEI_JSONL}")
+    [[ -f "${AIMAP_JSONL}" ]] && NORMALIZE_ARGS+=(--aimap "${AIMAP_JSONL}")
+    [[ -f "${CLOUD_ENUM_JSONL}" ]] && NORMALIZE_ARGS+=(--cloud-enum "${CLOUD_ENUM_JSONL}")
     [[ -f "${CMDB_EXPORT}" ]] && NORMALIZE_ARGS+=(--cmdb "${CMDB_EXPORT}")
     [[ -f "${ASN_JSONL}" ]]   && NORMALIZE_ARGS+=(--asn "${ASN_JSONL}")
     [[ -f "${RDNS_JSONL}" ]]  && NORMALIZE_ARGS+=(--rdns "${RDNS_JSONL}")
@@ -956,6 +1153,62 @@ if [[ "${PIPELINE_MODE}" == "bounty" ]] && should_run "load"; then
 fi
 
 # ===========================================================================
+# STAGE 12: Livecheck Analysis (livecheck mode only)
+# ===========================================================================
+if [[ "${PIPELINE_MODE}" == "livecheck" ]] && should_run "load"; then
+    log_stage "LIVECHECK ANALYSIS"
+    stage_start=$(date +%s)
+    debug_stage_start "livecheck"
+
+    LIVECHECK_ARGS=(
+        --scan-id "${SCAN_ID}"
+        --output "${LIVECHECK_JSONL}"
+        --state "${LIVECHECK_STATE}"
+        --deadline-days "${LIVECHECK_DEADLINE_DAYS:-30}"
+        --cname-depth-threshold "${LIVECHECK_CNAME_DEPTH_THRESHOLD:-3}"
+    )
+    [[ -f "${DNS_JSONL}" ]]    && LIVECHECK_ARGS+=(--dns "${DNS_JSONL}")
+    [[ -f "${ASN_JSONL}" ]]    && LIVECHECK_ARGS+=(--asn "${ASN_JSONL}")
+    [[ -f "${CMDB_EXPORT}" ]]  && LIVECHECK_ARGS+=(--cmdb "${CMDB_EXPORT}")
+
+    python3 "${SCRIPT_DIR}/scripts/livecheck.py" "${LIVECHECK_ARGS[@]}" 2>>"${SCAN_LOG}" || \
+        log "WARN: livecheck analysis completed with warnings"
+
+    debug_substep "Livecheck report: $(count_lines "${LIVECHECK_JSONL}")"
+
+    # Generate Tenable scope files
+    if [[ -f "${LIVECHECK_JSONL}" ]]; then
+        python3 "${SCRIPT_DIR}/scripts/cmdb_scope_export.py" \
+            --report "${LIVECHECK_JSONL}" \
+            --output-dir "${OUTPUT_DIR}" 2>>"${SCAN_LOG}" || \
+            log "WARN: Tenable scope export completed with warnings"
+        debug_substep "Tenable include: $(count_lines "${OUTPUT_DIR}/tenable_include.txt") exclude: $(count_lines "${OUTPUT_DIR}/tenable_exclude.txt")"
+    fi
+
+    # Load livecheck results into DuckDB
+    if [[ -f "${DUCKDB_PATH}" ]] && [[ -f "${LIVECHECK_JSONL}" ]]; then
+        python3 -c "
+import duckdb, sys
+con = duckdb.connect('${DUCKDB_PATH}')
+try:
+    con.execute('DROP TABLE IF EXISTS livecheck')
+    con.execute(\"\"\"
+        CREATE TABLE livecheck AS
+        SELECT * FROM read_ndjson_auto('${LIVECHECK_JSONL}',
+            maximum_object_size=10485760, ignore_errors=true)
+    \"\"\")
+    cnt = con.execute('SELECT COUNT(*) FROM livecheck').fetchone()[0]
+    print(f'Loaded {cnt} livecheck records into DuckDB', file=sys.stderr)
+finally:
+    con.close()
+" 2>>"${SCAN_LOG}" || log "WARN: livecheck DuckDB load failed"
+    fi
+
+    debug_stage_end "livecheck" "$(elapsed ${stage_start})"
+    log "Livecheck complete | records=$(count_lines "${LIVECHECK_JSONL}") elapsed=$(elapsed ${stage_start})s"
+fi
+
+# ===========================================================================
 # Summary
 # ===========================================================================
 PIPELINE_ELAPSED=$(elapsed ${PIPELINE_START})
@@ -973,6 +1226,7 @@ log "  TLS certs:    $(count_lines "${TLS_JSONL}" 2>/dev/null || echo 0)"
 log "  Nuclei finds: $(count_lines "${NUCLEI_JSONL}" 2>/dev/null || echo 0)"
 log "  Assets:       $(count_lines "${ASSETS_JSONL}" 2>/dev/null || echo 0)"
 log "  Takeover chk: $(count_lines "${VERIFY_JSONL}" 2>/dev/null || echo 0) verified"
+log "  Livecheck:    $(count_lines "${LIVECHECK_JSONL}" 2>/dev/null || echo 0) checked"
 log "  Screenshots:  $(find "${SCREENSHOT_DIR}" -name '*.png' 2>/dev/null | wc -l | tr -d ' ')"
 log "  DuckDB:       ${DUCKDB_PATH}"
 log "  Log:          ${SCAN_LOG}"

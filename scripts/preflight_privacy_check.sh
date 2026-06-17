@@ -14,7 +14,12 @@ fi
 
 # Patterns that often indicate private/profiling metadata.
 # Intentionally focused on high-signal markers to avoid noisy false positives.
-PATTERN='(/Users/|@[A-Za-z0-9._%+-]+\.[A-Za-z]{2,}|REDACTED|workspaceStorage)'
+# Set PRIVACY_EXTRA_PATTERN to a real target/org marker to also flag it,
+# without hardcoding any target identity in this repo.
+PATTERN='(/Users/|@[A-Za-z0-9._%+-]+\.[A-Za-z]{2,}|workspaceStorage)'
+if [[ -n "${PRIVACY_EXTRA_PATTERN:-}" ]]; then
+  PATTERN="${PATTERN%)}|${PRIVACY_EXTRA_PATTERN})"
+fi
 
 EXCLUDES=(
   --exclude-dir=.git

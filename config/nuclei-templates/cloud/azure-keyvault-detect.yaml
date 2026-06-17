@@ -1,0 +1,29 @@
+id: azure-keyvault-detect
+info:
+  name: Azure Key Vault Detection
+  author: easm-pipeline
+  severity: high
+  description: Detects Azure Key Vault endpoints. Exposed Key Vault endpoints may lead to credential disclosure.
+  tags: cloud,azure,keyvault,credentials
+  metadata:
+    provider: azure
+    service: key_vault
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}"
+    matchers-condition: or
+    matchers:
+      - type: word
+        words:
+          - "vault.azure.net"
+          - "AKV"
+          - "KeyVault"
+        condition: or
+        part: body
+
+      - type: regex
+        regex:
+          - '(?i)\.vault\.azure\.net'
+        part: header

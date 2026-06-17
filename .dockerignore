@@ -11,13 +11,8 @@ __pycache__/
 .pytest_cache/
 
 # Local runtime data (mounted as volumes in docker-compose)
-data/output/
-data/screenshots/
-data/cache/
+data/
 logs/
-*.log
-oss_data/
-data/input/
 
 # OS artifacts
 .DS_Store
