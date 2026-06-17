@@ -5,7 +5,7 @@ Open-source EASM discovery and CMDB reconciliation pipeline built on the Project
 ## Architecture
 
 ```
-subdomains.txt ──────────────────────────────────────→ targets.txt
+subdomains.txt / IPs / CIDRs ────────────────────────→ targets.txt
                                                           │
                                                           ▼
                                                     ┌──────────┐
@@ -25,7 +25,7 @@ subdomains.txt ─────────────────────�
                                                          ▼
                                                     ┌──────────┐
                                                     │  naabu    │  Port Scanning
-                                                    └────┬─────┘  (top ports)
+                                                    └────┬─────┘  (top ports, CDN-aware)
                                                          │ ports.jsonl
                                          ┌───────────────┴──────────────┐
                                          ▼                              ▼
@@ -44,18 +44,36 @@ subdomains.txt ─────────────────────�
                                    │ (low noise)   │               │
                                    └────┬──────────┘               │
                                         │                          │
+                                   ┌────┴──────────┐               │
+                                   │ cloud_enum    │               │  Azure/AWS/GCP
+                                   │ (CNAME/host)  │               │  endpoint detection
+                                   └────┬──────────┘               │
+                                        │                          │
+                                   ┌────┴──────────┐               │
+                                   │ aimap         │               │  Exposed AI agents
+                                   │ (AI endpoints)│               │  (MCP/Ollama/...)
+                                   └────┬──────────┘               │
+                                        │                          │
                                         ▼                          ▼
                             ┌────────────────────────────────────────┐
                             │   normalize.py                         │  Merge all JSONL
                             │   + CMDB reconciliation                │  + CDN detection
-                            │   + schema validation                  │  1 record/FQDN
+                            │   1 record/FQDN                        │
                             └────────────┬─────────────────────────┘
                                          │ assets.jsonl
                                          ▼
                                     ┌──────────┐
                                     │  DuckDB  │  + Parquet archive
                                     │ + views  │  + Dashboard API
-                                    └──────────┘
+                                    └────┬─────┘
+                                         │
+                                         ▼
+                            ┌────────────────────────────────────────┐
+                            │  verify_takeovers.py                    │  Live DNS + HTTP
+                            │  (mode: recon)                          │  takeover confirmation
+                            │  score_bounty.py    (mode: bounty)      │  S/A/B/C/D tiering
+                            │  livecheck.py       (mode: livecheck)   │  Tenable scope export
+                            └────────────────────────────────────────┘
 ```
 
 ## Quick Start
@@ -133,16 +151,18 @@ go install github.com/projectdiscovery/httpx/cmd/httpx@latest
 go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest
 go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 go install github.com/sensepost/gowitness/v3@latest
-go install github.com/PentestPad/subzy@latest
 go install github.com/praetorian-inc/nerva/cmd/nerva@latest
 # optional: zgrab2 fallback (set FINGERPRINT_BACKEND=zgrab2 in pipeline.env to use)
 # go install github.com/zmap/zgrab2/cmd/zgrab2@latest
+# optional: aimap (exposed-AI-agent discovery stage) — vendored separately into aimap/
 
 # Run
 chmod +x run.sh scripts/*.sh
-./run.sh
-./run.sh --from tls        # resume from TLS onwards
-./run.sh --stage normalize # re-run normalization only
+./run.sh                     # full recon pipeline
+./run.sh --from tls          # resume from TLS onwards
+./run.sh --stage normalize   # re-run normalization only
+./run.sh --mode bounty       # expanded bug-bounty scan + scoring
+./run.sh --mode livecheck    # DNS-only CMDB scope governance
 ```
 
 ### 5. Test with Synthetic Data
@@ -171,9 +191,11 @@ python3 scripts/load_duckdb.py \
 
 ## Pipeline Stages
 
+Stage order: `dns,asn,rdns,ports,http,tls,fingerprint,nuclei,cloud_enum,aimap,normalize,load,verify`
+
 | Stage | Name | Tool | Purpose |
 |-------|------|------|---------|
-| 1 | `dns` | dnsx | Resolve A/AAAA/CNAME/NS/MX, filter to live hosts |
+| 1 | `dns` | dnsx | Resolve A/AAAA/CNAME/NS/MX/TXT, filter to live hosts |
 | 2 | `asn` | pyasn | Enrich IPs with ASN, prefix, organization (offline BGP RIB) |
 | 3 | `rdns` | getdns | Reverse DNS lookup on IP addresses → PTR records |
 | 4 | `ports` | naabu | TCP SYN scan top-100 ports, CDN-aware |
@@ -181,10 +203,13 @@ python3 scripts/load_duckdb.py \
 | 6 | `tls` | tlsx | Deep cert analysis: SANs, expiry, misconfig flags |
 | 7 | `fingerprint` | nerva | Auto-detect all protocols: SSH, FTP, DB, Redis, SMB — CPE/vendor/version/OS fingerprints. Alias: `zgrab` |
 | 8 | `nuclei` | nuclei | Low-noise scan: takeovers, exposed panels, misconfigs |
-| 9 | `takeover` | subzy | Subdomain takeover verification |
-| 10 | `normalize` | normalize.py | Merge all JSONL → unified asset record per FQDN + CDN detection |
-| 11 | `load` | load_duckdb.py | Load into DuckDB with analytical views |
-| 12 | `verify` | validate_schema.py | Schema validation and data integrity checks |
+| 9 | `cloud_enum` | cloud_enum.py | Detect Azure/AWS/GCP cloud endpoints (storage, web apps, DBs, CDN) from DNS/HTTP/TLS data |
+| 10 | `aimap` | run_aimap.py | Discover exposed AI agent endpoints (MCP, Ollama, LangServe, Gradio, ComfyUI…). Requires vendored `aimap/` tool |
+| 11 | `normalize` | normalize.py | Merge all JSONL → unified asset record per FQDN + CDN detection |
+| 12 | `load` | load_duckdb.py | Load into DuckDB with analytical views + Parquet archive |
+| 13 | `verify` | verify_takeovers.py | Live DNS + HTTP fingerprint verification of takeover candidates |
+
+`cloud_enum` and `aimap` are best-effort enrichment stages — they are skipped (non-fatal) if no inputs or the `aimap` tool is unavailable.
 
 ### Partial runs and resuming
 
@@ -209,18 +234,56 @@ Use `--stage` to run one or more specific stages, or `--from` to run from a give
 
 `--stage` and `--from` are mutually exclusive. `--from` resolves to all stages from the named stage to `load` inclusive.
 
+## Pipeline Modes
+
+Select with `--mode` (or `PIPELINE_MODE` in `config/pipeline.env`). Default is `recon`.
+
+| Mode | Flag | Behavior |
+|------|------|----------|
+| `recon` | _(default)_ | Full pipeline with conservative, low-noise settings. Ends with takeover verification. |
+| `bounty` | `--mode bounty` | Expanded attack-surface scan: top-1000 ports, no CDN exclusion, Nerva misconfigs + UDP, broader `nuclei-bounty.yaml` template set. Runs `score_bounty.py` to assign each asset an S/A/B/C/D priority tier. |
+| `livecheck` | `--mode livecheck` | Lightweight DNS-only CMDB scope governance (`dns,asn,rdns,normalize,load`). Validates registered FQDNs for liveness, CDN/WAF fronting, CNAME bloat, stale records, and 3rd-party nameservers, then exports Tenable include/exclude scope files. |
+
+```bash
+./run.sh --mode bounty          # expanded scan + bounty scoring
+./run.sh --mode livecheck       # CMDB scope validation + Tenable export
+```
+
+### Bug Bounty Scoring (`bounty` mode)
+
+`score_bounty.py` reads the unified asset table and computes a 0–100 priority score per subdomain from attack-surface breadth, technology stack, security posture, and criticality signals (admin panels, sensitive subdomain names, vulnerable frameworks). Results are tiered **S/A/B/C/D** and surfaced via the dashboard **Bounty** tab and the `v_bounty_*` DuckDB views.
+
+```bash
+python3 scripts/score_bounty.py \
+    --db data/output/easm.duckdb \
+    --output data/output/bounty_report.jsonl
+```
+
+### CMDB Livecheck & Tenable Scope Export (`livecheck` mode)
+
+`livecheck.py` validates CMDB-registered FQDNs for DNS liveness, detects CDN/WAF presence, analyzes CNAME-chain bloat, identifies leaf domains, tracks unavailability over time (via `livecheck_state.json`), and classifies 3rd-party nameservers. `cmdb_scope_export.py` then emits `tenable_include.txt` / `tenable_exclude.txt` for scanning-scope governance.
+
+```bash
+# Tunables (config/pipeline.env)
+LIVECHECK_DEADLINE_DAYS=30           # grace period before stale records are flagged
+LIVECHECK_CNAME_DEPTH_THRESHOLD=3    # CNAME hops considered "bloated"
+```
+
 ## Querying
 
 ```bash
 # List available queries
 python3 scripts/query.py --db data/output/easm.duckdb --query list
 
-# Run a query
+# Run a query (keys: stats, gaps, shadow_it, tls_issues, tls_expiring,
+#   findings, findings_critical, tech, tech_summary, ports, port_heatmap,
+#   cdn_distribution, asn_distribution, favicon_clusters, takeovers,
+#   verified_takeovers)
 python3 scripts/query.py --db data/output/easm.duckdb --query stats
 python3 scripts/query.py --db data/output/easm.duckdb --query shadow_it
 python3 scripts/query.py --db data/output/easm.duckdb --query tls_issues
 python3 scripts/query.py --db data/output/easm.duckdb --query findings_critical
-python3 scripts/query.py --db data/output/easm.duckdb --query tech_summary
+python3 scripts/query.py --db data/output/easm.duckdb --query verified_takeovers
 python3 scripts/query.py --db data/output/easm.duckdb --query port_heatmap
 
 # Custom SQL
@@ -263,16 +326,28 @@ bash scripts/diff_scans.sh data/output/assets_prev.jsonl data/output/assets.json
 | `v_asset_summary` | One-row-per-asset overview with service_count, CDN status, ASN |
 | `v_cmdb_gaps` | Assets missing from CMDB |
 | `v_tls_issues` | Expired, self-signed, expiring certs |
-| `v_findings` | All nuclei/subzy/nerva findings by severity |
+| `v_findings` | All nuclei/nerva findings by severity |
 | `v_tech_stack` | Technology detected per asset |
 | `v_open_ports` | All open ports with service info |
 | `v_services` | Per-port fingerprints: vendor, product, version, CPE, OS, certainty |
 | `v_software_inventory` | Unique software across the estate, grouped by product/version with host count |
 | `v_scan_stats` | Aggregate scan statistics including total_services |
-| `v_network_overview` | IP ranges, CDN distribution, ASN summary |
-| `v_asn_distribution` | Unique ASNs with organization and host count |
-| `v_cdn_providers` | CDN detection results with confidence scoring |
-| `v_rdns_records` | Reverse DNS mappings for infrastructure analysis |
+| `v_reverse_dns` | Reverse DNS mappings for infrastructure analysis |
+| `v_cdn_analysis` | CDN detection results with confidence scoring |
+| `v_cdn_exclusions` | Assets behind CDN (candidate scan exclusions) |
+| `v_cloud_endpoints` | Detected Azure/AWS/GCP cloud endpoints |
+| `v_cloud_providers` | Cloud provider distribution |
+| `v_cloud_risk` | Cloud endpoints ranked by exposure risk |
+| `v_cloud_summary` | Aggregate cloud-endpoint statistics |
+| `v_bounty_scores` | Per-asset bug-bounty priority score and S/A/B/C/D tier |
+| `v_bounty_highlights` | Top-priority bounty targets with score rationale |
+| `v_bounty_summary` | Aggregate bounty scoring statistics |
+| `v_livecheck_summary` | CMDB livecheck results: liveness, CDN fronting, staleness |
+| `v_scope_removals` | Stale/dead FQDNs proposed for scan-scope removal |
+| `v_cname_bloat` | FQDNs with excessive CNAME-chain depth |
+| `v_leaf_domains` | Leaf (non-delegated) domains |
+| `v_third_party_ns` | FQDNs served by 3rd-party nameservers |
+| `v_shared_hosting` | IPs hosting multiple distinct FQDNs |
 
 ## Data Model
 
@@ -293,9 +368,11 @@ fqdn, scan_id, first_seen, last_seen, source[], tags[]
 │               fingerprint: { vendor, product, version, cpe23,
 │                              os_vendor, os_product, os_version,
 │                              certainty, source } }
-├── findings[]: { source, template_id, severity, matched_at, ... }
+├── findings[]: { source, template_id, severity, matched_at, ... }   # nuclei, nerva, aimap, cloud_enum
 └── cmdb: { matched_ci, match_basis[], in_cmdb, gap_type }
 ```
+
+`cloud_enum` (Azure/AWS/GCP endpoint detection) and `aimap` (exposed AI agent discovery) emit findings in Nuclei JSONL format, so they merge into `findings[]` alongside nuclei/nerva results.
 
 ## Project Structure
 
@@ -306,9 +383,11 @@ easm-oss/
 ├── docker-compose.yml           # Docker Compose stack
 ├── requirements.txt             # Python dependencies
 ├── config/
-│   ├── pipeline.env             # Pipeline configuration (NERVA_*, ASN_*, FINGERPRINT_BACKEND)
+│   ├── pipeline.env             # Pipeline configuration (PIPELINE_MODE, NERVA_*, ASN_*, LIVECHECK_*)
 │   ├── resolvers.txt            # DNS resolvers
-│   ├── nuclei-config.yaml       # Nuclei scanning profile
+│   ├── nuclei-config.yaml       # Nuclei scanning profile (recon mode)
+│   ├── nuclei-bounty.yaml       # Expanded Nuclei profile (bounty mode)
+│   ├── nuclei-templates/        # Custom local Nuclei templates (e.g. cloud)
 │   └── zgrab2-modules.ini       # zgrab2 module config (deprecated — kept for fallback)
 ├── scripts/
 │   ├── normalize.py             # JSONL merger & asset normalizer + CDN detection
@@ -317,6 +396,12 @@ easm-oss/
 │   ├── detect_cdn.py            # Multi-signal CDN detection (CNAME, IP, headers, ASN)
 │   ├── enrich_asn.py            # Offline ASN enrichment using pyasn
 │   ├── enrich_nuclei.py         # Nuclei finding aggregation and enrichment
+│   ├── cloud_enum.py            # Azure/AWS/GCP cloud endpoint enumeration
+│   ├── run_aimap.py             # Exposed AI-agent endpoint discovery stage
+│   ├── verify_takeovers.py      # Live verification of subdomain takeover candidates
+│   ├── score_bounty.py          # Bug-bounty priority scoring engine (S/A/B/C/D)
+│   ├── livecheck.py             # CMDB DNS-liveness / scope governance analysis
+│   ├── cmdb_scope_export.py     # Tenable include/exclude scope file exporter
 │   ├── archive_scan.py          # Archive scan results to Parquet
 │   ├── validate_schema.py       # Schema validation and data integrity checks
 │   ├── cmdb_report.py           # CMDB gap analysis report
@@ -325,14 +410,20 @@ easm-oss/
 │   ├── test_nerva_ingest.py     # Unit tests for Nerva ingestion
 │   ├── test_pipeline_nerva.sh   # Integration test: normalize + DuckDB with mock Nerva data
 │   ├── test_ip_implementation.py # IP scanning and enrichment tests
+│   ├── test_livecheck.py        # Livecheck unit tests
+│   ├── test_verify_takeovers.py # Takeover verification unit tests
 │   ├── diff_scans.sh            # Scan-to-scan diff
 │   ├── cache.sh                 # Cache manager
 │   └── export.sh                # Export to CSV/JSON/Parquet
 ├── dashboard/
-│   ├── app.py                   # FastAPI dashboard with IP/ASN/RDNS endpoints
+│   ├── app.py                   # FastAPI dashboard + scan orchestration API
 │   └── static/
-│       ├── app.js               # Frontend: Services, Network Intel, CDN Detection tabs
-│       └── ...                  # CSS and templates
+│       ├── index.html           # Single-page UI shell
+│       ├── app.js               # Frontend: Overview, Assets, Services, Network,
+│       │                        #   Cloud, AIMAP, Takeovers, Bounty, Livecheck,
+│       │                        #   Scans (history/compare) tabs
+│       └── styles.css           # Styles
+├── aimap/                       # Vendored AI-agent discovery tool (git-ignored, optional)
 ├── data/
 │   ├── input/
 │   │   ├── subdomains.txt       # Your subdomain list
@@ -354,8 +445,10 @@ Per live asset, the pipeline makes approximately:
 - TLS: 1 connection per TLS port
 - Nerva: 1 TCP/UDP connection per open port (concurrent, auto-detects protocol)
 - Nuclei: 5–20 requests (rate-limited to 50 rps total)
+- Cloud enum: 0 network requests (pattern-matches existing DNS/HTTP/TLS data)
+- AIMAP: a handful of HTTP probes per web target (only when the stage runs)
 
-Note: ASN enrichment is offline (no network requests). Reverse DNS may be subject to rate limits depending on your resolver.
+Note: ASN enrichment and cloud enumeration are offline (no network requests). Reverse DNS may be subject to rate limits depending on your resolver.
 
 ## IP Address Scanning & Enrichment
 
@@ -436,7 +529,7 @@ ZGRAB2_FALLBACK=false     # set to "true" to run both nerva and zgrab2
 
 ### Stage alias
 
-`--stage fingerprint` and `--stage zgrab` both run Stage 5.
+`--stage fingerprint` and `--stage zgrab` both run the fingerprint stage (stage 7).
 
 ### Testing
 
@@ -451,69 +544,85 @@ bash scripts/test_pipeline_nerva.sh
 python3 scripts/test_ip_implementation.py
 ```
 
-## Schema Validation & Integrity Checks
+## Takeover Verification
 
-The `verify` stage (stage 12) validates the final asset dataset against the expected schema and performs data integrity checks:
+The `verify` stage (stage 13) reads takeover candidates from the DuckDB assets table (nuclei `takeovers`-tagged findings already confirmed live), then performs live DNS CNAME resolution and HTTP fingerprint checks to confirm whether the dangling resource is actually claimable. Confirmed candidates are written to `takeover_verifications.jsonl` and surfaced via the dashboard **Takeovers** tab and the `takeovers` / `verified_takeovers` queries.
 
 ```bash
-# Run schema validation
+# Run takeover verification (requires an existing DuckDB)
 ./run.sh --stage verify
 
-# Or automatically after a full pipeline run
+# Or automatically at the end of a full recon run
 ./run.sh
+
+# Standalone
+python3 scripts/verify_takeovers.py \
+    --db data/output/easm.duckdb \
+    --out data/output/takeover_verifications.jsonl
 ```
 
-The validator checks:
-- Required fields presence and type correctness
-- Nested object structure consistency
-- IP address format validity
-- ASN/CIDR notation compliance
-- Data completeness and mutually-dependent field validation
+### Schema validation (standalone)
 
-Validation results are logged and summarized in `logs/verify.log`.
+`validate_schema.py` checks the normalized asset dataset for required-field presence, type correctness, nested-object consistency, and IP/ASN/CIDR format validity:
+
+```bash
+python3 scripts/validate_schema.py --input data/output/assets.jsonl
+```
 
 ## Dashboard
 
-A web-based dashboard provides real-time visualization of scan results:
+The FastAPI dashboard provides real-time visualization **and** in-browser scan orchestration — you configure stages, enter targets, pick a mode, and start a scan without touching the CLI.
 
 ```bash
-# Launch dashboard
-python3 dashboard/app.py
+# Docker (recommended) — exposed on host port 9990
+docker compose up -d --build
+open http://127.0.0.1:9990
 
-# Navigate to http://localhost:8000
+# Native — served on port 8443
+python3 -m uvicorn dashboard.app:app --host 0.0.0.0 --port 8443
+open http://127.0.0.1:8443
 ```
 
-### Dashboard Features
+### Dashboard Tabs
 
 - **Overview**: Risk scoring, asset count, service inventory, critical findings
 - **Assets**: Searchable, sortable list of discovered assets with detailed records
 - **Services**: Fingerprinted services with vendor/product/version/CPE, software inventory
-- **Network Intelligence**: ASN distribution, IP ranges, RDNS records, infrastructure mapping
-- **CDN Detection**: Provider detection with confidence scoring and signal breakdown
-- **TLS Issues**: Certificate expiry, self-signed certs, misconfiguration flags
+- **Network**: ASN distribution, IP ranges, RDNS records, ports, tech, CDN detection
+- **Cloud**: Detected Azure/AWS/GCP cloud endpoints with risk ranking
+- **AIMAP**: Exposed AI agent endpoints (MCP, Ollama, LangServe, Gradio, …)
+- **TLS**: Certificate expiry, self-signed certs, misconfiguration flags
 - **Findings**: Searchable vulnerability findings filtered by severity and source
+- **Takeovers**: Subdomain takeover candidates and live-verification results
+- **Bounty**: S/A/B/C/D-tiered bug-bounty target scores (bounty mode)
+- **Livecheck**: CMDB scope governance results (livecheck mode)
 - **CMDB Gaps**: Assets missing from your configuration database
+- **Scans**: Scan history, restore/import/export archived scans, and diff two scans (Compare)
+
+Live scans stream stage progress and a debug log viewer in the browser.
 
 ### Dashboard API
 
 | Endpoint | Description |
 |----------|-------------|
 | `GET /api/overview` | Asset stats, risk scores, service counts, top software |
-| `GET /api/assets` | Paginated asset list with filtering and sorting |
-| `GET /api/assets/{fqdn}` | Detailed asset record: DNS, network, services, TLS, findings, CMDB |
-| `GET /api/services` | Fingerprinted services. Params: `service=`, `search=`, `limit=` |
-| `GET /api/services/inventory` | Unique software across the estate (product/vendor/version/CPE, host count) |
-| `GET /api/findings` | Security findings with severity filtering and tagging |
-| `GET /api/findings/tags` | Available finding tags and summary stats |
+| `GET /api/assets` / `GET /api/assets/{fqdn}` | Asset list / detailed asset record |
+| `GET /api/services` / `GET /api/services/inventory` | Fingerprinted services / unique software inventory |
+| `GET /api/findings` / `GET /api/findings/tags` | Security findings / available finding tags |
 | `GET /api/tls` | TLS certificate issues: expiry, misconfigs, self-signed |
-| `GET /api/cmdb-gaps` | Assets missing from CMDB with gap analysis |
-| `GET /api/network/ports` | Port distribution and open port summary |
-| `GET /api/network/tech` | Technology stack distribution across assets |
-| `GET /api/network/cdn` | CDN provider distribution and detection results |
-| `GET /api/network/asn` | ASN distribution with organization details and IP ranges |
-| `GET /api/network/rdns` | Reverse DNS records and PTR mappings |
-
-The dashboard now features separate tabs for **Services**, **Network Intelligence** (IP/ASN/RDNS), and **CDN Detection**.
+| `GET /api/cmdb` | Assets missing from CMDB with gap analysis |
+| `GET /api/cloud` | Detected cloud endpoints (Azure/AWS/GCP) |
+| `GET /api/aimap` | Exposed AI agent endpoints |
+| `GET /api/takeovers` | Takeover candidates and verification status |
+| `GET /api/bounty` / `GET /api/bounty/export` | Bounty scores and tiers / export |
+| `GET /api/livecheck` | CMDB livecheck / scope governance results |
+| `GET /api/network/ports\|tech\|cdn\|asn\|rdns` | Network intelligence breakdowns |
+| `GET /api/search` | Cross-asset search |
+| `POST /api/scans/new` | Launch a new scan (targets, stages, mode) |
+| `GET /api/scans` / `GET /api/scans/active` / `GET /api/scans/logs` | Scan history / running scan / live logs |
+| `GET\|POST\|DELETE /api/scans/{scan_id}...` | Inspect, restore, delete archived scans |
+| `POST /api/scans/import` / `GET /api/scans/{scan_id}/export` | Import / export scan archives |
+| `GET /api/compare/{scan_a}/{scan_b}` | Diff two scans |
 
 ## Security Notes
 
