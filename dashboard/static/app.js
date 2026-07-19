@@ -7,6 +7,76 @@
 // ---------------------------------------------------------------------------
 const API = '/api';
 
+// ---------------------------------------------------------------------------
+// Auth — optional shared-secret header (matches DASHBOARD_TOKEN on the server).
+// When the server has no token configured, /api/ never returns 401 and none of
+// this engages. The token lives in sessionStorage (cleared when the tab closes).
+// ---------------------------------------------------------------------------
+const AUTH_HEADER = 'X-EASM-Token';
+const AUTH_STORE_KEY = 'easm_token';
+
+function getToken() { return sessionStorage.getItem(AUTH_STORE_KEY) || ''; }
+function setToken(t) {
+    if (t) sessionStorage.setItem(AUTH_STORE_KEY, t);
+    else sessionStorage.removeItem(AUTH_STORE_KEY);
+}
+function promptToken(message) {
+    const t = window.prompt(message || 'Enter the dashboard access token:', '');
+    if (t !== null) setToken(t.trim());
+    return getToken();
+}
+
+function _isApiUrl(input) {
+    const s = (typeof input === 'string') ? input : (input && (input.href || input.url)) || '';
+    return /^(https?:\/\/[^/]+)?\/api\//.test(s);
+}
+function _withToken(init) {
+    const opts = { ...(init || {}) };
+    const headers = new Headers(opts.headers || {});
+    const tok = getToken();
+    if (tok) headers.set(AUTH_HEADER, tok);
+    opts.headers = headers;
+    return opts;
+}
+
+// Wrap fetch so every same-origin /api/ request carries the token, and a single
+// 401 re-prompts and retries. Non-API requests (static assets) pass through
+// untouched. Must run before any fetch() call is made.
+const _origFetch = window.fetch.bind(window);
+let _authPrompting = false;
+window.fetch = async function(input, init) {
+    if (!_isApiUrl(input)) return _origFetch(input, init);
+    let res = await _origFetch(input, _withToken(init));
+    if (res.status === 401 && !_authPrompting) {
+        _authPrompting = true;
+        try {
+            promptToken('Access denied. Enter the dashboard access token:');
+        } finally {
+            _authPrompting = false;
+        }
+        if (getToken()) res = await _origFetch(input, _withToken(init));
+    }
+    return res;
+};
+
+// Probe once at boot so first-time users are prompted immediately instead of
+// seeing a wall of failed requests. Uses the raw fetch to avoid double-prompting.
+async function ensureAuth() {
+    for (let i = 0; i < 3; i++) {
+        let res;
+        try {
+            res = await _origFetch('/api/scans/active', _withToken({}));
+        } catch (_) {
+            return; // network/server error — let the normal flow surface it
+        }
+        if (res.status !== 401) return; // authorized, or no token required
+        promptToken(i === 0
+            ? 'This dashboard requires an access token:'
+            : 'Invalid token. Try again:');
+        if (!getToken()) return; // user cancelled
+    }
+}
+
 const SEVERITY_COLORS = {
     critical: '#ef4444', high: '#f97316', medium: '#eab308',
     low: '#3b82f6', info: '#6b7280',
@@ -99,7 +169,7 @@ const PORT_DICT = {
 };
 
 const PORT_CATEGORY_COLORS = {
-    web:            { bg: 'rgba(6,182,212,0.15)',   border: '#06b6d4', text: '#22d3ee' },
+    web:            { bg: 'rgba(47,217,176,0.15)',   border: '#2FD9B0', text: '#5FE8C6' },
     database:       { bg: 'rgba(239,68,68,0.15)',   border: '#ef4444', text: '#fca5a5' },
     remote_access:  { bg: 'rgba(249,115,22,0.15)',  border: '#f97316', text: '#fdba74' },
     email:          { bg: 'rgba(234,179,8,0.15)',   border: '#eab308', text: '#fde047' },
@@ -110,10 +180,10 @@ const PORT_CATEGORY_COLORS = {
     container:      { bg: 'rgba(139,92,246,0.15)',  border: '#8b5cf6', text: '#c4b5fd' },
     monitoring:     { bg: 'rgba(234,179,8,0.15)',   border: '#eab308', text: '#fde047' },
     management:     { bg: 'rgba(234,179,8,0.15)',   border: '#eab308', text: '#fde047' },
-    infrastructure: { bg: 'rgba(100,116,139,0.15)', border: '#64748b', text: '#94a3b8' },
+    infrastructure: { bg: 'rgba(100,116,139,0.15)', border: '#6E827A', text: '#93A69E' },
     message_queue:  { bg: 'rgba(249,115,22,0.15)',  border: '#f97316', text: '#fdba74' },
     suspicious:     { bg: 'rgba(239,68,68,0.25)',   border: '#ef4444', text: '#fca5a5' },
-    default:        { bg: 'rgba(100,116,139,0.12)', border: '#475569', text: '#94a3b8' },
+    default:        { bg: 'rgba(100,116,139,0.12)', border: '#54655E', text: '#93A69E' },
 };
 
 const PORT_RISK_BADGE = {
@@ -132,17 +202,24 @@ function portCategoryStyle(category) {
     return PORT_CATEGORY_COLORS[category] || PORT_CATEGORY_COLORS.default;
 }
 
+// Deep Field chart theme tokens
+const CHART_INK = '#93A69E';
+const CHART_INK_FAINT = '#667A72';
+const CHART_GRID = 'rgba(31, 43, 38, 0.9)';
+const CHART_SIGNAL = '#2FD9B0';
+const CHART_PANEL = '#101613';
+
 const CHART_DEFAULTS = {
     responsive: true,
     maintainAspectRatio: false,
     plugins: {
-        legend: { labels: { color: '#94a3b8', font: { family: 'Inter', size: 11 } } },
+        legend: { labels: { color: CHART_INK, font: { family: 'IBM Plex Mono', size: 11 }, boxWidth: 10, boxHeight: 10, padding: 12 } },
         tooltip: {
-            backgroundColor: '#1e293b', titleColor: '#e2e8f0',
-            bodyColor: '#cbd5e1', borderColor: '#334155', borderWidth: 1,
+            backgroundColor: CHART_PANEL, titleColor: '#E4EDE9',
+            bodyColor: '#C6D3CD', borderColor: '#2C3B34', borderWidth: 1,
             padding: 10, cornerRadius: 8,
-            titleFont: { family: 'Inter', weight: '600' },
-            bodyFont: { family: 'Inter' },
+            titleFont: { family: 'Space Grotesk', weight: '600' },
+            bodyFont: { family: 'IBM Plex Mono' },
         },
     },
 };
@@ -327,7 +404,7 @@ function renderApp() {
     destroyCharts();
     const app = document.getElementById('app');
     app.innerHTML = `
-        <aside id="sidebar" class="fixed left-0 top-0 bottom-0 w-60 bg-[#0a0e1a] border-r border-surface-border flex flex-col z-30">
+        <aside id="sidebar" class="fixed left-0 top-0 bottom-0 w-60 bg-[#0B100E] border-r border-surface-border flex flex-col z-30">
             ${renderSidebar()}
         </aside>
         <main id="main" class="ml-60 flex-1 min-h-screen">
@@ -340,45 +417,64 @@ function renderApp() {
 }
 
 function renderSidebar() {
-    const links = [
-        { id: 'overview', label: 'Overview', icon: ICONS.overview },
-        { id: 'scans', label: 'New Scan', icon: ICONS.newScan },
-        { id: 'assets', label: 'Assets', icon: ICONS.assets },
-        { id: 'findings', label: 'Findings', icon: ICONS.findings },
-        { id: 'tls', label: 'TLS Health', icon: ICONS.tls },
-        { id: 'cmdb', label: 'CMDB Gaps', icon: ICONS.cmdb },
-        { id: 'network', label: 'Network', icon: ICONS.network },
-        { id: 'takeovers', label: 'Takeovers', icon: ICONS.takeovers },
-        { id: 'services', label: 'Services', icon: ICONS.services },
-        { id: 'aimap', label: 'AI Agents', icon: ICONS.aimap },
-        { id: 'cloud', label: 'Cloud Assets', icon: ICONS.cloud },
-        { id: 'bounty', label: 'Bug Bounty', icon: ICONS.bounty },
-        { id: 'livecheck', label: 'Livecheck', icon: ICONS.livecheck },
+    // Grouped by the recon workflow: Discover the surface, Analyze what's on it,
+    // Respond to what matters.
+    const groups = [
+        { label: 'Field', links: [
+            { id: 'overview', label: 'Overview', icon: ICONS.overview },
+            { id: 'scans', label: 'New Scan', icon: ICONS.newScan },
+        ]},
+        { label: 'Discover', links: [
+            { id: 'assets', label: 'Assets', icon: ICONS.assets },
+            { id: 'network', label: 'Network', icon: ICONS.network },
+            { id: 'services', label: 'Services', icon: ICONS.services },
+            { id: 'cloud', label: 'Cloud Assets', icon: ICONS.cloud },
+            { id: 'aimap', label: 'AI Agents', icon: ICONS.aimap },
+        ]},
+        { label: 'Analyze', links: [
+            { id: 'findings', label: 'Findings', icon: ICONS.findings },
+            { id: 'tls', label: 'TLS Health', icon: ICONS.tls },
+            { id: 'cmdb', label: 'CMDB Gaps', icon: ICONS.cmdb },
+        ]},
+        { label: 'Respond', links: [
+            { id: 'takeovers', label: 'Takeovers', icon: ICONS.takeovers },
+            { id: 'bounty', label: 'Bug Bounty', icon: ICONS.bounty },
+            { id: 'livecheck', label: 'Livecheck', icon: ICONS.livecheck },
+        ]},
     ];
     return `
         <div class="px-5 py-5 flex items-center gap-3 border-b border-surface-border">
-            <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-cyan-500 to-blue-600 flex items-center justify-center">
-                <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" class="w-4 h-4">
-                    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+            <div class="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0"
+                 style="background: radial-gradient(circle at 30% 30%, rgba(47,217,176,0.22), rgba(47,217,176,0.04)); border: 1px solid rgba(47,217,176,0.35); box-shadow: 0 0 18px rgba(47,217,176,0.12);">
+                <svg viewBox="0 0 24 24" fill="none" stroke="#2FD9B0" stroke-width="1.75" style="width:1.15rem;height:1.15rem">
+                    <circle cx="12" cy="12" r="9"/>
+                    <line x1="12" y1="1" x2="12" y2="5"/>
+                    <line x1="12" y1="19" x2="12" y2="23"/>
+                    <line x1="1" y1="12" x2="5" y2="12"/>
+                    <line x1="19" y1="12" x2="23" y2="12"/>
+                    <circle cx="12" cy="12" r="2" fill="#2FD9B0" stroke="none"/>
                 </svg>
             </div>
             <div>
-                <div class="font-bold text-sm text-white tracking-tight">EASM</div>
-                <div class="text-[10px] text-slate-500 font-medium tracking-wider uppercase">Attack Surface</div>
+                <div class="font-semibold text-sm text-white tracking-tight leading-none">EASM</div>
+                <div class="text-[10px] text-slate-500 font-mono tracking-[0.18em] uppercase mt-1">Deep Field</div>
             </div>
         </div>
-        <nav class="flex-1 px-3 py-4 space-y-0.5 overflow-y-auto">
-            ${links.map(l => `
-                <a href="#/${l.id}" class="sidebar-link ${state.page === l.id ? 'active' : ''}" data-page="${l.id}">
-                    ${l.icon}
-                    <span>${l.label}</span>
-                </a>
+        <nav class="flex-1 px-3 py-3 overflow-y-auto">
+            ${groups.map(g => `
+                <div class="nav-group-label">${g.label}</div>
+                ${g.links.map(l => `
+                    <a href="#/${l.id}" class="sidebar-link ${state.page === l.id ? 'active' : ''}" data-page="${l.id}">
+                        ${l.icon}
+                        <span>${l.label}</span>
+                    </a>
+                `).join('')}
             `).join('')}
         </nav>
         <div class="px-4 py-4 border-t border-surface-border">
             <div class="flex items-center gap-2">
-                <div class="pulse-dot bg-accent"></div>
-                <span class="text-xs text-slate-500">Pipeline connected</span>
+                <div class="pulse-dot"></div>
+                <span class="text-xs text-slate-500 font-mono tracking-wide">Pipeline connected</span>
             </div>
         </div>
     `;
@@ -474,19 +570,12 @@ async function pageOverview(el) {
     const cloudTotal = cloud.total_endpoints || 0;
 
     el.innerHTML = `
-        <div class="flex items-center justify-between mb-6">
-            <div>
-                <h1 class="text-2xl font-bold text-white">Attack Surface Overview</h1>
-                <p class="text-sm text-slate-500 mt-1">Scan: ${esc(s.scan_id || 'N/A')}</p>
-            </div>
-            <div class="flex items-center gap-3">
-                <div class="text-right">
-                    <div class="text-xs text-slate-500">Risk Score</div>
-                    <div class="text-2xl font-bold ${riskColor(data.risk_score)}">${data.risk_score}</div>
-                </div>
-                ${renderRiskGauge(data.risk_score)}
-            </div>
+        <div class="mb-5">
+            <div class="eyebrow mb-2">Surface Readout${s.scan_id ? ' · Scan ' + esc(s.scan_id) : ''}</div>
+            <h1 class="text-2xl font-semibold text-white tracking-tight">Attack Surface Overview</h1>
         </div>
+
+        ${renderSurfaceReadout(data, sev)}
 
         <!-- KPI Cards -->
         <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-4 mb-6">
@@ -626,13 +715,83 @@ async function pageOverview(el) {
     initOverviewCharts(data);
 }
 
+function riskZone(score) {
+    if (score >= 75) return 'Critical';
+    if (score >= 50) return 'High';
+    if (score >= 25) return 'Elevated';
+    return 'Nominal';
+}
+
+function renderSurfaceReadout(data, sev) {
+    const score = Math.max(0, Math.min(100, Number(data.risk_score) || 0));
+    const color = riskGaugeColor(score);
+    const zone = riskZone(score);
+    const counts = SEVERITY_ORDER.map(k => ({ sev: k, count: sev[k] || 0 }));
+    const totalFindings = counts.reduce((a, c) => a + c.count, 0);
+
+    const spectrumSegments = totalFindings > 0
+        ? counts.filter(c => c.count > 0).map(c =>
+            `<span style="flex-grow:${c.count};background:${SEVERITY_COLORS[c.sev]};box-shadow:inset 0 0 6px rgba(0,0,0,0.25)" title="${capitalize(c.sev)}: ${c.count}"></span>`
+          ).join('')
+        : `<span style="flex-grow:1;background:var(--field-sunken)"></span>`;
+
+    const legend = counts.map(c => `
+        <div class="item">
+            <span class="dot" style="background:${SEVERITY_COLORS[c.sev]}"></span>
+            <span>${capitalize(c.sev)}</span>
+            <span class="val">${fmt(c.count)}</span>
+        </div>
+    `).join('');
+
+    return `
+        <div class="readout reticle mb-6">
+            <div class="grid grid-cols-1 lg:grid-cols-[300px_1px_1fr] gap-6 lg:gap-8 items-center">
+                <!-- Risk meter -->
+                <div>
+                    <div class="flex items-baseline justify-between mb-3">
+                        <span class="eyebrow" style="letter-spacing:0.18em">Composite Risk</span>
+                        <span class="text-[0.66rem] font-mono uppercase tracking-widest px-2 py-0.5 rounded"
+                              style="color:${color};background:${color}1f;border:1px solid ${color}44">${zone}</span>
+                    </div>
+                    <div class="flex items-end gap-3 mb-3">
+                        <span class="kpi-value text-5xl leading-none" style="color:${color}">${score}</span>
+                        <span class="text-slate-500 font-mono text-xs mb-1">/ 100</span>
+                    </div>
+                    <div class="tick-meter">
+                        <div class="tick-meter-track">
+                            <div class="tick-meter-fill" style="width:${score}%;background:${color};color:${color}"></div>
+                            <div class="tick-meter-needle" style="left:calc(${score}% - 1px)"></div>
+                        </div>
+                        <div class="tick-meter-ticks">
+                            <span>0</span><span>25</span><span>50</span><span>75</span><span>100</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Divider -->
+                <div class="hidden lg:block self-stretch" style="background:var(--hairline)"></div>
+
+                <!-- Severity return spectrum -->
+                <div>
+                    <div class="flex items-baseline justify-between mb-3">
+                        <span class="eyebrow" style="letter-spacing:0.18em">Severity Returns</span>
+                        <span class="font-mono text-xs text-slate-400">${fmt(totalFindings)} total</span>
+                    </div>
+                    <div class="spectrum">${spectrumSegments}</div>
+                    <div class="spectrum-legend">${legend}</div>
+                </div>
+            </div>
+        </div>
+    `;
+}
+
 function kpiCard(title, value, subtitle, color, id, isPercent = false) {
     const displayVal = isPercent ? value : fmt(value);
     const counterVal = isPercent ? '' : `data-counter="${value || 0}"`;
     return `
         <div class="card kpi-card p-4" data-color="${color}">
-            <div class="text-xs font-medium text-slate-500 uppercase tracking-wider mb-2">${esc(title)}</div>
-            <div class="text-2xl font-bold text-white mb-1" ${counterVal}>${isPercent ? esc(displayVal) : '0'}</div>
+            <div class="text-[0.62rem] font-mono text-slate-500 uppercase tracking-[0.14em] mb-2">${esc(title)}</div>
+            <div class="kpi-value text-2xl mb-1" ${counterVal}>${isPercent ? esc(displayVal) : '0'}</div>
             <div class="text-xs text-slate-500">${esc(subtitle || '')}</div>
         </div>
     `;
@@ -729,8 +888,8 @@ function initOverviewCharts(data) {
                 labels: tech.map(t => t.name),
                 datasets: [{
                     data: tech.map(t => t.count),
-                    backgroundColor: 'rgba(6, 182, 212, 0.6)',
-                    borderColor: '#06b6d4',
+                    backgroundColor: 'rgba(47, 217, 176, 0.6)',
+                    borderColor: '#2FD9B0',
                     borderWidth: 1,
                     borderRadius: 4,
                     barThickness: 18,
@@ -741,8 +900,8 @@ function initOverviewCharts(data) {
                 indexAxis: 'y',
                 plugins: { ...CHART_DEFAULTS.plugins, legend: { display: false } },
                 scales: {
-                    x: { grid: { color: '#1e293b' }, ticks: { color: '#64748b', font: { size: 10 } } },
-                    y: { grid: { display: false }, ticks: { color: '#94a3b8', font: { family: 'Inter', size: 11 } } },
+                    x: { grid: { color: '#1F2B26' }, ticks: { color: '#6E827A', font: { size: 10 } } },
+                    y: { grid: { display: false }, ticks: { color: '#93A69E', font: { family: 'IBM Plex Mono', size: 11 } } },
                 },
             },
         });
@@ -766,8 +925,8 @@ function initOverviewCharts(data) {
                 ...CHART_DEFAULTS,
                 plugins: { ...CHART_DEFAULTS.plugins, legend: { display: false } },
                 scales: {
-                    x: { grid: { display: false }, ticks: { color: '#94a3b8', font: { family: 'JetBrains Mono', size: 10 } } },
-                    y: { grid: { color: '#1e293b' }, ticks: { color: '#64748b', font: { size: 10 } } },
+                    x: { grid: { display: false }, ticks: { color: '#93A69E', font: { family: 'IBM Plex Mono', size: 10 } } },
+                    y: { grid: { color: '#1F2B26' }, ticks: { color: '#6E827A', font: { size: 10 } } },
                 },
             },
         });
@@ -775,7 +934,7 @@ function initOverviewCharts(data) {
 
     const cdn = data.cdn_distribution || [];
     if (cdn.length) {
-        const palette = ['#06b6d4', '#3b82f6', '#8b5cf6', '#ec4899', '#f97316', '#10b981', '#eab308', '#64748b'];
+        const palette = ['#2FD9B0', '#3b82f6', '#8b5cf6', '#ec4899', '#f97316', '#10b981', '#eab308', '#6E827A'];
         createChart('chart-cdn', {
             type: 'doughnut',
             data: {
@@ -1016,7 +1175,7 @@ async function pageAssetDetail(el, fqdn) {
                 <h3 class="text-sm font-semibold text-slate-300 mb-3">Web Services (${web.length})</h3>
                 <div class="space-y-3">
                     ${web.map(w => `
-                        <div class="bg-[#0a0e1a] rounded-lg p-4 border border-surface-border">
+                        <div class="bg-[#0B100E] rounded-lg p-4 border border-surface-border">
                             <div class="flex items-center gap-3 mb-2">
                                 <span class="font-mono text-xs text-accent">${esc(w.url)}</span>
                                 <span class="badge ${(w.status_code >= 200 && w.status_code < 400) ? 'badge-low' : 'badge-high'}">${w.status_code}</span>
@@ -1083,7 +1242,7 @@ async function pageAssetDetail(el, fqdn) {
                         const os = [fp.os_vendor, fp.os_product, fp.os_version].filter(Boolean).join(' ');
                         const hasFp = fp.product || fp.version || fp.cpe23 || os;
                         return `
-                            <div class="bg-[#0a0e1a] rounded-lg p-4 border border-surface-border">
+                            <div class="bg-[#0B100E] rounded-lg p-4 border border-surface-border">
                                 <div class="flex items-center gap-3 mb-2">
                                     <span class="badge badge-info">${esc(s.service || 'unknown')}</span>
                                     <span class="font-mono text-xs text-slate-400">
@@ -1133,7 +1292,7 @@ async function pageAssetDetail(el, fqdn) {
                                 ${s.banner ? `
                                     <div class="mt-2">
                                         <span class="text-[10px] text-slate-500 uppercase tracking-wider">Banner</span>
-                                        <code class="block text-slate-400 text-xs font-mono bg-[#060912] rounded p-2 mt-1 overflow-x-auto whitespace-pre-wrap break-all">${esc(s.banner)}</code>
+                                        <code class="block text-slate-400 text-xs font-mono bg-[#070A09] rounded p-2 mt-1 overflow-x-auto whitespace-pre-wrap break-all">${esc(s.banner)}</code>
                                     </div>
                                 ` : ''}
                             </div>
@@ -1327,8 +1486,8 @@ async function pageFindings(el) {
                 ...CHART_DEFAULTS,
                 plugins: { ...CHART_DEFAULTS.plugins, legend: { display: false } },
                 scales: {
-                    x: { grid: { display: false }, ticks: { color: '#94a3b8', font: { weight: '600' } } },
-                    y: { grid: { color: '#1e293b' }, ticks: { color: '#64748b' } },
+                    x: { grid: { display: false }, ticks: { color: '#93A69E', font: { weight: '600' } } },
+                    y: { grid: { color: '#1F2B26' }, ticks: { color: '#6E827A' } },
                 },
             },
         });
@@ -1434,7 +1593,7 @@ async function pageTLS(el) {
                 labels: categories,
                 datasets: [{
                     data: values,
-                    backgroundColor: ['#ef4444', '#f97316', '#eab308', '#8b5cf6', '#ec4899', '#64748b'],
+                    backgroundColor: ['#ef4444', '#f97316', '#eab308', '#8b5cf6', '#ec4899', '#6E827A'],
                     borderRadius: 6,
                     barThickness: 36,
                 }],
@@ -1443,8 +1602,8 @@ async function pageTLS(el) {
                 ...CHART_DEFAULTS,
                 plugins: { ...CHART_DEFAULTS.plugins, legend: { display: false } },
                 scales: {
-                    x: { grid: { display: false }, ticks: { color: '#94a3b8', font: { weight: '500' } } },
-                    y: { grid: { color: '#1e293b' }, ticks: { color: '#64748b', precision: 0 } },
+                    x: { grid: { display: false }, ticks: { color: '#93A69E', font: { weight: '500' } } },
+                    y: { grid: { color: '#1F2B26' }, ticks: { color: '#6E827A', precision: 0 } },
                 },
             },
         });
@@ -1865,8 +2024,8 @@ async function renderPortsTab(el) {
                     },
                 },
                 scales: {
-                    x: { grid: { display: false }, ticks: { color: '#94a3b8', font: { family: 'JetBrains Mono', size: 10 } } },
-                    y: { grid: { color: '#1e293b' }, ticks: { color: '#64748b', precision: 0 } },
+                    x: { grid: { display: false }, ticks: { color: '#93A69E', font: { family: 'IBM Plex Mono', size: 10 } } },
+                    y: { grid: { color: '#1F2B26' }, ticks: { color: '#6E827A', precision: 0 } },
                 },
             },
         });
@@ -1986,14 +2145,14 @@ function renderAssetPanelContent(asset) {
 
         <!-- Summary grid -->
         <div class="grid grid-cols-2 gap-2 mb-4">
-            <div class="bg-[#0a0e1a] rounded-lg p-3 border border-surface-border">
+            <div class="bg-[#0B100E] rounded-lg p-3 border border-surface-border">
                 <div class="text-[10px] text-slate-500 uppercase tracking-wider mb-1">IP Addresses</div>
                 <div class="font-mono text-xs text-white">${(dns.a || []).join(', ') || '—'}</div>
                 ${dns.cname_chain && dns.cname_chain.length ? `
                     <div class="text-[10px] text-slate-500 mt-1">CNAME: ${dns.cname_chain.slice(0,2).join(' → ')}</div>
                 ` : ''}
             </div>
-            <div class="bg-[#0a0e1a] rounded-lg p-3 border border-surface-border">
+            <div class="bg-[#0B100E] rounded-lg p-3 border border-surface-border">
                 <div class="text-[10px] text-slate-500 uppercase tracking-wider mb-1">Network</div>
                 <div class="text-xs text-white">${esc(net.cdn || 'Direct')}</div>
                 <div class="text-[10px] text-slate-500 mt-0.5">${esc(asn.org || '—')}</div>
@@ -2048,7 +2207,7 @@ function renderAssetPanelContent(asset) {
                 <div class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Web Services (${web.length})</div>
                 <div class="space-y-2">
                     ${web.slice(0, 3).map(w => `
-                        <div class="bg-[#0a0e1a] rounded-lg p-3 border border-surface-border">
+                        <div class="bg-[#0B100E] rounded-lg p-3 border border-surface-border">
                             <div class="flex items-center gap-2 mb-1">
                                 <a href="${esc(w.url)}" target="_blank" rel="noopener noreferrer"
                                    onclick="event.stopPropagation()"
@@ -2094,7 +2253,7 @@ function renderAssetPanelContent(asset) {
                     ${services.slice(0, 6).map(s => {
                         const fp = s.fingerprint || {};
                         return `
-                            <div class="bg-[#0a0e1a] rounded-lg p-3 border border-surface-border">
+                            <div class="bg-[#0B100E] rounded-lg p-3 border border-surface-border">
                                 <div class="flex items-center gap-2 mb-1">
                                     <span class="badge badge-info text-[10px]">${esc(s.service || 'unknown')}</span>
                                     <span class="font-mono text-[11px] text-slate-500">:${s.port}</span>
@@ -2171,8 +2330,8 @@ async function renderTechTab(el) {
                 labels: top20.map(t => t.name),
                 datasets: [{
                     data: top20.map(t => t.count),
-                    backgroundColor: 'rgba(6, 182, 212, 0.6)',
-                    borderColor: '#06b6d4',
+                    backgroundColor: 'rgba(47, 217, 176, 0.6)',
+                    borderColor: '#2FD9B0',
                     borderWidth: 1,
                     borderRadius: 4,
                     barThickness: 16,
@@ -2183,8 +2342,8 @@ async function renderTechTab(el) {
                 indexAxis: 'y',
                 plugins: { ...CHART_DEFAULTS.plugins, legend: { display: false } },
                 scales: {
-                    x: { grid: { color: '#1e293b' }, ticks: { color: '#64748b', precision: 0 } },
-                    y: { grid: { display: false }, ticks: { color: '#94a3b8', font: { size: 11 } } },
+                    x: { grid: { color: '#1F2B26' }, ticks: { color: '#6E827A', precision: 0 } },
+                    y: { grid: { display: false }, ticks: { color: '#93A69E', font: { size: 11 } } },
                 },
             },
         });
@@ -2230,7 +2389,7 @@ async function renderCDNTab(el) {
     `;
 
     if (items.length) {
-        const palette = ['#06b6d4', '#3b82f6', '#8b5cf6', '#ec4899', '#f97316', '#10b981', '#eab308', '#64748b'];
+        const palette = ['#2FD9B0', '#3b82f6', '#8b5cf6', '#ec4899', '#f97316', '#10b981', '#eab308', '#6E827A'];
         createChart('chart-cdn-detail', {
             type: 'doughnut',
             data: {
@@ -2307,8 +2466,8 @@ async function renderASNTab(el) {
                 indexAxis: 'y',
                 plugins: { ...CHART_DEFAULTS.plugins, legend: { display: false } },
                 scales: {
-                    x: { grid: { color: '#1e293b' }, ticks: { color: '#64748b', precision: 0 } },
-                    y: { grid: { display: false }, ticks: { color: '#94a3b8', font: { size: 10 } } },
+                    x: { grid: { color: '#1F2B26' }, ticks: { color: '#6E827A', precision: 0 } },
+                    y: { grid: { display: false }, ticks: { color: '#93A69E', font: { size: 10 } } },
                 },
             },
         });
@@ -2362,7 +2521,7 @@ async function pageTakeovers(el) {
                 <div class="text-5xl mb-4">🔗</div>
                 <p class="text-slate-300 font-medium mb-2">No verification data yet</p>
                 <p class="text-sm text-slate-500 mb-4">Run the verify stage to perform live DNS + HTTP fingerprint checks on takeover candidates.</p>
-                <code class="text-xs font-mono bg-[#0a0e1a] px-4 py-2 rounded border border-surface-border text-accent">./run.sh --stage verify</code>
+                <code class="text-xs font-mono bg-[#0B100E] px-4 py-2 rounded border border-surface-border text-accent">./run.sh --stage verify</code>
             </div>
         ` : `
 
@@ -2706,17 +2865,17 @@ async function pageScans(el) {
                         <span class="text-xs text-slate-400 whitespace-nowrap">Mode:</span>
                         <label class="flex items-center gap-1.5 cursor-pointer">
                             <input type="radio" name="scan-mode" value="recon" checked
-                                   class="accent-[#00d4ff]" ${active ? 'disabled' : ''}>
+                                   class="accent-[#5FE8C6]" ${active ? 'disabled' : ''}>
                             <span class="text-xs text-slate-300">Recon</span>
                         </label>
                         <label class="flex items-center gap-1.5 cursor-pointer">
                             <input type="radio" name="scan-mode" value="bounty"
-                                   class="accent-[#00d4ff]" ${active ? 'disabled' : ''}>
+                                   class="accent-[#5FE8C6]" ${active ? 'disabled' : ''}>
                             <span class="text-xs text-slate-300">Bug Bounty Prepare</span>
                         </label>
                         <label class="flex items-center gap-1.5 cursor-pointer">
                             <input type="radio" name="scan-mode" value="livecheck"
-                                   class="accent-[#00d4ff]" ${active ? 'disabled' : ''}>
+                                   class="accent-[#5FE8C6]" ${active ? 'disabled' : ''}>
                             <span class="text-xs text-slate-300">CMDB Livecheck</span>
                         </label>
                     </div>
@@ -2741,14 +2900,14 @@ async function pageScans(el) {
                             <span class="text-[11px] text-slate-500">Full Pipeline</span>
                             <input type="checkbox" id="scan-full-pipeline" checked
                                    onchange="toggleFullPipeline(this)"
-                                   class="w-3.5 h-3.5 rounded accent-[#00d4ff]"
+                                   class="w-3.5 h-3.5 rounded accent-[#5FE8C6]"
                                    ${active ? 'disabled' : ''}>
                         </label>
                     </div>
                     <div id="stage-checkboxes" class="space-y-1 text-xs" style="display:none">
                         ${PIPELINE_STAGES.map(s => `
                             <label class="flex items-center gap-2.5 cursor-pointer py-1 px-1 rounded hover:bg-white/[0.03] transition-colors select-none ${s.required ? 'opacity-60' : ''}">
-                                <input type="checkbox" class="stage-checkbox w-3.5 h-3.5 rounded accent-[#00d4ff]"
+                                <input type="checkbox" class="stage-checkbox w-3.5 h-3.5 rounded accent-[#5FE8C6]"
                                        value="${s.id}" checked
                                        ${s.required || active ? 'disabled' : ''}>
                                 <span class="text-slate-300 flex-1">${s.name}</span>
@@ -2767,9 +2926,9 @@ async function pageScans(el) {
                     <p class="text-xs text-slate-500 mb-3">Load an archived <code class="text-slate-300">.duckdb</code> or <code class="text-slate-300">.parquet</code> file into the scan history.</p>
                     <div class="space-y-2">
                         <input id="import-scan-id" type="text" placeholder="Scan ID (YYYYMMDD_HHMMSS) — optional"
-                               class="w-full text-xs bg-[#0a0e1a] border border-slate-700 rounded px-2 py-1.5 text-slate-300 placeholder-slate-600 focus:outline-none focus:border-accent" />
+                               class="w-full text-xs bg-[#0B100E] border border-slate-700 rounded px-2 py-1.5 text-slate-300 placeholder-slate-600 focus:outline-none focus:border-accent" />
                         <input id="import-notes" type="text" placeholder="Notes — optional"
-                               class="w-full text-xs bg-[#0a0e1a] border border-slate-700 rounded px-2 py-1.5 text-slate-300 placeholder-slate-600 focus:outline-none focus:border-accent" />
+                               class="w-full text-xs bg-[#0B100E] border border-slate-700 rounded px-2 py-1.5 text-slate-300 placeholder-slate-600 focus:outline-none focus:border-accent" />
                         <label class="block">
                             <input id="import-file" type="file" accept=".duckdb,.parquet" class="hidden" onchange="importScan()" />
                             <span onclick="document.getElementById('import-file').click()"
@@ -2999,19 +3158,19 @@ function _renderArchiveCard(archive, isLatest) {
 
             ${hasMetrics ? `
                 <div class="grid grid-cols-4 gap-3 mb-3">
-                    <div class="bg-[#0a0e1a] rounded-lg p-2.5 text-center">
+                    <div class="bg-[#0B100E] rounded-lg p-2.5 text-center">
                         <div class="text-lg font-bold text-white">${fmt(r.total_assets)}</div>
                         <div class="text-[10px] text-slate-500 uppercase tracking-wider">Assets</div>
                     </div>
-                    <div class="bg-[#0a0e1a] rounded-lg p-2.5 text-center">
+                    <div class="bg-[#0B100E] rounded-lg p-2.5 text-center">
                         <div class="text-lg font-bold text-white">${fmt(r.web_assets || 0)}</div>
                         <div class="text-[10px] text-slate-500 uppercase tracking-wider">Web</div>
                     </div>
-                    <div class="bg-[#0a0e1a] rounded-lg p-2.5 text-center">
+                    <div class="bg-[#0B100E] rounded-lg p-2.5 text-center">
                         <div class="text-lg font-bold ${totalFindings > 0 ? 'text-orange-400' : 'text-white'}">${fmt(totalFindings)}</div>
                         <div class="text-[10px] text-slate-500 uppercase tracking-wider">Findings</div>
                     </div>
-                    <div class="bg-[#0a0e1a] rounded-lg p-2.5 text-center">
+                    <div class="bg-[#0B100E] rounded-lg p-2.5 text-center">
                         <div class="text-lg font-bold ${(r.shadow_it || 0) > 0 ? 'text-red-400' : 'text-white'}">${fmt(r.shadow_it || 0)}</div>
                         <div class="text-[10px] text-slate-500 uppercase tracking-wider">Shadow IT</div>
                     </div>
@@ -3179,8 +3338,24 @@ window.deleteArchive = async function(scanId) {
     }
 };
 
-window.exportScan = function(scanId) {
-    window.location.href = `/api/scans/${scanId}/export`;
+window.exportScan = async function(scanId) {
+    // Fetch (not a plain navigation) so the request carries the auth header.
+    try {
+        const res = await fetch(`/api/scans/${scanId}/export`);
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({ detail: res.statusText }));
+            throw new Error(err.detail || `Export failed (${res.status})`);
+        }
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `assets_${scanId}.parquet`;
+        a.click();
+        URL.revokeObjectURL(url);
+    } catch (e) {
+        alert('Error: ' + e.message);
+    }
 };
 
 window.importScan = async function() {
@@ -3255,7 +3430,7 @@ const BOUNTY_TIER_COLORS = {
     A: { bg: 'rgba(249,115,22,0.15)', border: '#f97316', text: '#fdba74', label: 'High Priority' },
     B: { bg: 'rgba(234,179,8,0.15)', border: '#eab308', text: '#fde047', label: 'Medium Priority' },
     C: { bg: 'rgba(59,130,246,0.15)', border: '#3b82f6', text: '#93c5fd', label: 'Low Priority' },
-    D: { bg: 'rgba(100,116,139,0.12)', border: '#475569', text: '#94a3b8', label: 'Background' },
+    D: { bg: 'rgba(100,116,139,0.12)', border: '#54655E', text: '#93A69E', label: 'Background' },
 };
 
 // ---------------------------------------------------------------------------
@@ -3269,7 +3444,7 @@ const AI_PROTOCOL_LABELS = {
 };
 
 const AI_PROTOCOL_COLORS = {
-    mcp: '#8b5cf6', ollama: '#06b6d4', openai_compat: '#10b981',
+    mcp: '#8b5cf6', ollama: '#2FD9B0', openai_compat: '#10b981',
     langserve: '#f59e0b', gradio: '#ec4899', streamlit: '#ef4444',
     comfyui: '#3b82f6', textgen_webui: '#6366f1',
     open_webui: '#14b8a6', openclaw: '#f97316',
@@ -3433,8 +3608,8 @@ async function pageAimap(el) {
                 indexAxis: 'y',
                 plugins: { ...CHART_DEFAULTS.plugins, legend: { display: false } },
                 scales: {
-                    x: { grid: { color: '#1e293b' }, ticks: { color: '#64748b' } },
-                    y: { grid: { display: false }, ticks: { color: '#94a3b8', font: { weight: '600' } } },
+                    x: { grid: { color: '#1F2B26' }, ticks: { color: '#6E827A' } },
+                    y: { grid: { display: false }, ticks: { color: '#93A69E', font: { weight: '600' } } },
                 },
             },
         });
@@ -3459,7 +3634,7 @@ async function pageAimap(el) {
                     ...CHART_DEFAULTS.plugins,
                     legend: {
                         position: 'right',
-                        labels: { color: '#94a3b8', padding: 16, usePointStyle: true, pointStyleWidth: 8 },
+                        labels: { color: '#93A69E', padding: 16, usePointStyle: true, pointStyleWidth: 8 },
                     },
                 },
             },
@@ -3477,7 +3652,7 @@ const PROVIDER_COLORS = {
 };
 
 function providerBadge(provider) {
-    const s = PROVIDER_COLORS[provider] || { text: '#94a3b8', bg: '#94a3b815', border: '#94a3b830', label: provider };
+    const s = PROVIDER_COLORS[provider] || { text: '#93A69E', bg: '#93A69E15', border: '#93A69E30', label: provider };
     return `<span class="text-[10px] px-2 py-0.5 rounded font-medium" style="color:${s.text};background:${s.bg};border:1px solid ${s.border}">${esc(s.label)}</span>`;
 }
 
@@ -3646,7 +3821,7 @@ async function pageCloud(el) {
     if (providers.length) {
         const provPalette = providers.map(p => {
             const c = PROVIDER_COLORS[p.provider];
-            return c ? c.text : '#94a3b8';
+            return c ? c.text : '#93A69E';
         });
         createChart('chart-cloud-providers', {
             type: 'doughnut',
@@ -3687,8 +3862,8 @@ async function pageCloud(el) {
                 ...CHART_DEFAULTS,
                 plugins: { ...CHART_DEFAULTS.plugins, legend: { display: false } },
                 scales: {
-                    x: { grid: { display: false }, ticks: { color: '#94a3b8', font: { size: 11 } } },
-                    y: { grid: { color: '#1e293b' }, ticks: { color: '#64748b', font: { size: 10 } } },
+                    x: { grid: { display: false }, ticks: { color: '#93A69E', font: { size: 11 } } },
+                    y: { grid: { color: '#1F2B26' }, ticks: { color: '#6E827A', font: { size: 10 } } },
                 },
             },
         });
@@ -3806,7 +3981,7 @@ async function pageBounty(el) {
                 <h3 class="text-sm font-semibold text-slate-300">Ranked Targets</h3>
                 <input id="bounty-search" type="text" placeholder="Filter targets…"
                        oninput="filterBountyTable(this.value)"
-                       class="text-xs bg-[#0a0e1a] border border-slate-700 rounded px-2 py-1 text-slate-300 placeholder-slate-600 focus:outline-none focus:border-accent w-52" />
+                       class="text-xs bg-[#0B100E] border border-slate-700 rounded px-2 py-1 text-slate-300 placeholder-slate-600 focus:outline-none focus:border-accent w-52" />
             </div>
             <div class="overflow-x-auto">
                 <table class="w-full text-xs">
@@ -3884,7 +4059,7 @@ window._expandBountyRow = function(tr, idx) {
     const techs = item.technologies || [];
 
     detail.innerHTML = `
-        <td colspan="8" class="px-6 py-4 bg-[#0a0e1a] border-b border-surface-border">
+        <td colspan="8" class="px-6 py-4 bg-[#0B100E] border-b border-surface-border">
             <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
                 <div>
                     <div class="text-[10px] text-slate-500 uppercase tracking-wider mb-2">Score Breakdown</div>
@@ -4102,8 +4277,8 @@ function initArchiveOverviewCharts(data) {
     if (tech.length) {
         createChart('arc-chart-tech', {
             type: 'bar',
-            data: { labels: tech.map(t => t.name), datasets: [{ data: tech.map(t => t.count), backgroundColor: 'rgba(6,182,212,0.6)', borderColor: '#06b6d4', borderWidth: 1, borderRadius: 4, barThickness: 18 }] },
-            options: { ...CHART_DEFAULTS, indexAxis: 'y', plugins: { ...CHART_DEFAULTS.plugins, legend: { display: false } }, scales: { x: { grid: { color: '#1e293b' }, ticks: { color: '#64748b', font: { size: 10 } } }, y: { grid: { display: false }, ticks: { color: '#94a3b8', font: { family: 'Inter', size: 11 } } } } },
+            data: { labels: tech.map(t => t.name), datasets: [{ data: tech.map(t => t.count), backgroundColor: 'rgba(47,217,176,0.6)', borderColor: '#2FD9B0', borderWidth: 1, borderRadius: 4, barThickness: 18 }] },
+            options: { ...CHART_DEFAULTS, indexAxis: 'y', plugins: { ...CHART_DEFAULTS.plugins, legend: { display: false } }, scales: { x: { grid: { color: '#1F2B26' }, ticks: { color: '#6E827A', font: { size: 10 } } }, y: { grid: { display: false }, ticks: { color: '#93A69E', font: { family: 'IBM Plex Mono', size: 11 } } } } },
         });
     }
     const ports = data.port_distribution || [];
@@ -4111,7 +4286,7 @@ function initArchiveOverviewCharts(data) {
         createChart('arc-chart-ports', {
             type: 'bar',
             data: { labels: ports.map(p => ':' + p.port), datasets: [{ data: ports.map(p => p.count), backgroundColor: 'rgba(59,130,246,0.6)', borderColor: '#3b82f6', borderWidth: 1, borderRadius: 4 }] },
-            options: { ...CHART_DEFAULTS, plugins: { ...CHART_DEFAULTS.plugins, legend: { display: false } }, scales: { x: { grid: { display: false }, ticks: { color: '#94a3b8', font: { family: 'JetBrains Mono', size: 10 } } }, y: { grid: { color: '#1e293b' }, ticks: { color: '#64748b', font: { size: 10 } } } } },
+            options: { ...CHART_DEFAULTS, plugins: { ...CHART_DEFAULTS.plugins, legend: { display: false } }, scales: { x: { grid: { display: false }, ticks: { color: '#93A69E', font: { family: 'IBM Plex Mono', size: 10 } } }, y: { grid: { color: '#1F2B26' }, ticks: { color: '#6E827A', font: { size: 10 } } } } },
         });
     }
 }
@@ -4312,7 +4487,7 @@ async function pageCompare(el, scanA, scanB) {
         <!-- Scan pair header -->
         <div class="card p-5 mb-5">
             <div class="grid grid-cols-5 gap-4 items-center">
-                <div class="col-span-2 text-center p-3 rounded-xl bg-[#0a0e1a]">
+                <div class="col-span-2 text-center p-3 rounded-xl bg-[#0B100E]">
                     <div class="text-[10px] text-slate-500 uppercase tracking-widest mb-1">Baseline (A)</div>
                     <div class="font-mono text-sm font-semibold text-slate-200">${esc(scanA === 'current' ? 'Current Active' : scanA)}</div>
                     <div class="text-xs text-slate-500 mt-1">${fmt(data.scan_a.total_assets)} assets</div>
@@ -4325,7 +4500,7 @@ async function pageCompare(el, scanA, scanB) {
                     </button>
                     <a href="#/compare/${esc(scanA)}" class="btn-secondary text-xs py-1 px-2 block mx-auto">Change B</a>
                 </div>
-                <div class="col-span-2 text-center p-3 rounded-xl bg-[#0a0e1a]">
+                <div class="col-span-2 text-center p-3 rounded-xl bg-[#0B100E]">
                     <div class="text-[10px] text-slate-500 uppercase tracking-widest mb-1">Current (B)</div>
                     <div class="font-mono text-sm font-semibold text-accent">${esc(scanB === 'current' ? 'Current Active' : scanB)}</div>
                     <div class="text-xs text-slate-500 mt-1">${fmt(data.scan_b.total_assets)} assets</div>
@@ -4658,7 +4833,7 @@ const SCOPE_ACTION_STYLES = {
     review_remove:       { bg: 'rgba(249,115,22,0.12)', border: '#f97316', text: '#fdba74', label: 'Review → Remove' },
     exclude_cdn:         { bg: 'rgba(139,92,246,0.12)', border: '#8b5cf6', text: '#c4b5fd', label: 'CDN Exclude' },
     review_cname_bloat:  { bg: 'rgba(234,179,8,0.12)',  border: '#eab308', text: '#fde047', label: 'CNAME Bloat' },
-    monitor:             { bg: 'rgba(100,116,139,0.12)',border: '#64748b', text: '#94a3b8', label: 'Monitor' },
+    monitor:             { bg: 'rgba(100,116,139,0.12)',border: '#6E827A', text: '#93A69E', label: 'Monitor' },
 };
 
 function scopeActionBadge(action) {
@@ -5032,4 +5207,7 @@ function capitalize(s) {
 // ---------------------------------------------------------------------------
 // Initialize
 // ---------------------------------------------------------------------------
-document.addEventListener('DOMContentLoaded', initRouter);
+document.addEventListener('DOMContentLoaded', async () => {
+    await ensureAuth();
+    initRouter();
+});

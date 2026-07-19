@@ -578,10 +578,36 @@ The FastAPI dashboard provides real-time visualization **and** in-browser scan o
 docker compose up -d --build
 open http://127.0.0.1:9990
 
-# Native — served on port 8443
-python3 -m uvicorn dashboard.app:app --host 0.0.0.0 --port 8443
+# Native — bind to loopback (see security note below)
+python3 -m uvicorn dashboard.app:app --host 127.0.0.1 --port 8443
 open http://127.0.0.1:8443
 ```
+
+> **Security — the dashboard exposes destructive endpoints** (launching scans
+> against arbitrary targets, deleting archived scans, importing database files),
+> so protect the port. Two layers, use at least one:
+>
+> 1. **Bind to loopback** — the default `docker compose` mapping is `127.0.0.1`
+>    only, and the native default is `--host 127.0.0.1`. Keep it there unless you
+>    need remote access.
+> 2. **Shared-secret token** — set `DASHBOARD_TOKEN` and every `/api/` request
+>    must send it in the `X-EASM-Token` header. The UI prompts for the token on
+>    load and keeps it in `sessionStorage`. When `DASHBOARD_TOKEN` is unset, auth
+>    is off (fine behind a loopback bind).
+>
+> ```bash
+> # Docker: export the token, then bring the stack up
+> export DASHBOARD_TOKEN="$(openssl rand -hex 32)"
+> docker compose up -d --build
+>
+> # Native
+> DASHBOARD_TOKEN="$(openssl rand -hex 32)" \
+>   python3 -m uvicorn dashboard.app:app --host 127.0.0.1 --port 8443
+> ```
+>
+> If you expose the port beyond loopback (e.g. bind `0.0.0.0` or change the
+> compose mapping), **always** set `DASHBOARD_TOKEN`, and ideally also front it
+> with a TLS-terminating reverse proxy.
 
 ### Dashboard Tabs
 

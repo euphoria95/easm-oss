@@ -30,6 +30,8 @@ Thumbs.db
 # Tooling / agent metadata
 .serena/
 aimap/
+.claude/
+.tokensave/
 
 # Scratch / scan logs
 tmp/

@@ -3,33 +3,61 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>EASM Dashboard</title>
+    <title>EASM · Deep Field</title>
 
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
+        // "Deep Field" instrument console palette — graphite-green base,
+        // phosphor mint-teal signal. slate/accent/cyan scales are remapped so the
+        // rest of the app inherits the identity through existing utility classes.
         tailwind.config = {
             darkMode: 'class',
             theme: {
                 extend: {
                     fontFamily: {
-                        sans: ['Inter', 'system-ui', 'sans-serif'],
-                        mono: ['JetBrains Mono', 'monospace'],
+                        sans: ['Space Grotesk', 'system-ui', 'sans-serif'],
+                        display: ['Space Grotesk', 'system-ui', 'sans-serif'],
+                        mono: ['IBM Plex Mono', 'ui-monospace', 'monospace'],
                     },
                     colors: {
-                        surface: {
-                            DEFAULT: '#111827',
-                            light: '#1e293b',
-                            hover: '#1f2937',
-                            border: '#2d3a4f',
+                        // Graphite-green field
+                        field: {
+                            DEFAULT: '#0A0E0C',
+                            raised:  '#101613',
+                            sunken:  '#070A09',
                         },
+                        surface: {
+                            DEFAULT: '#101613',
+                            light:   '#18211D',
+                            hover:   '#141C18',
+                            border:  '#1F2B26',
+                        },
+                        // Phosphor mint-teal signal (was stock cyan #06b6d4)
                         accent: {
-                            DEFAULT: '#06b6d4',
-                            light: '#22d3ee',
-                            dim: '#0e7490',
+                            DEFAULT: '#2FD9B0',
+                            light:   '#5FE8C6',
+                            dim:     '#1C8C72',
+                        },
+                        cyan: {
+                            300: '#7DEFD3',
+                            400: '#5FE8C6',
+                            500: '#2FD9B0',
+                            600: '#1C8C72',
+                        },
+                        // Neutrals remapped onto the graphite-green ramp
+                        slate: {
+                            200: '#E4EDE9',
+                            300: '#C6D3CD',
+                            400: '#93A69E',
+                            500: '#6E827A',
+                            600: '#54655E',
+                            700: '#2A3A34',
+                            800: '#18231F',
+                            900: '#0E1512',
                         },
                         severity: {
                             critical: '#ef4444',
@@ -48,16 +76,16 @@
 
     <link rel="stylesheet" href="/static/styles.css">
 </head>
-<body class="bg-[#060a14] text-slate-200 font-sans antialiased min-h-screen">
+<body class="bg-field text-slate-300 font-sans antialiased min-h-screen">
     <div id="app" class="flex min-h-screen">
         <div class="flex items-center justify-center w-full h-screen">
             <div class="flex flex-col items-center gap-4">
-                <div class="w-10 h-10 border-2 border-accent/30 border-t-accent rounded-full animate-spin"></div>
-                <span class="text-slate-400 text-sm">Loading EASM Dashboard...</span>
+                <div class="boot-reticle"></div>
+                <span class="text-slate-500 text-xs font-mono tracking-[0.2em] uppercase">Acquiring field…</span>
             </div>
         </div>
     </div>
 
-    <script src="/static/app.js?v=8"></script>
+    <script src="/static/app.js?v=10"></script>
 </body>
 </html>

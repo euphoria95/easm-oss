@@ -28,6 +28,10 @@ services:
     environment:
       - EASM_DB_PATH=/easm/data/output/easm.duckdb
       - DASHBOARD_PORT=8443
+      # Optional shared-secret auth. Set DASHBOARD_TOKEN in your shell (or a
+      # .env file) and every /api/ request must send it as X-EASM-Token.
+      # Recommended if you change the port mapping below off 127.0.0.1.
+      - DASHBOARD_TOKEN=${DASHBOARD_TOKEN:-}
     ports:
       - "127.0.0.1:9990:8443"
     volumes:

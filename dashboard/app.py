@@ -6,10 +6,14 @@ Serves the EASM dashboard SPA and provides REST API endpoints
 for querying the DuckDB database.
 
 Usage:
-    uvicorn dashboard.app:app --host 0.0.0.0 --port 8443
-    python3 -m uvicorn dashboard.app:app --host 0.0.0.0 --port 8443
+    uvicorn dashboard.app:app --host 127.0.0.1 --port 8443
+    python3 -m uvicorn dashboard.app:app --host 127.0.0.1 --port 8443
+
+The dashboard is unauthenticated and exposes destructive endpoints. Bind to
+127.0.0.1 unless the port is otherwise protected (see README "Security" note).
 """
 
+import hmac
 import json
 import math
 import os
@@ -51,6 +55,12 @@ try:
 except ImportError:
     _duckdb_create_cloud_views = None
 
+# Optional shared-secret auth. When DASHBOARD_TOKEN is set, every /api/ request
+# must carry it in the X-EASM-Token header. When unset, auth is disabled and the
+# loopback bind is the only protection (see README "Security").
+DASHBOARD_TOKEN = os.environ.get("DASHBOARD_TOKEN", "").strip()
+AUTH_HEADER = "X-EASM-Token"
+
 DB_PATH = os.environ.get("EASM_DB_PATH", "data/output/easm.duckdb")
 STATIC_DIR = Path(__file__).parent / "static"
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -78,6 +88,20 @@ class ORJSONResponse(JSONResponse):
 
     def render(self, content) -> bytes:
         return orjson.dumps(content, option=orjson.OPT_NON_STR_KEYS)
+
+
+@app.middleware("http")
+async def require_token(request: Request, call_next):
+    """Gate /api/ routes behind the shared secret when DASHBOARD_TOKEN is set.
+
+    The SPA shell and /static assets stay reachable so the UI can load and
+    prompt for the token; only the API (data + destructive actions) is gated.
+    """
+    if DASHBOARD_TOKEN and request.url.path.startswith("/api/"):
+        provided = request.headers.get(AUTH_HEADER, "")
+        if not hmac.compare_digest(provided, DASHBOARD_TOKEN):
+            return ORJSONResponse({"detail": "Unauthorized"}, status_code=401)
+    return await call_next(request)
 
 
 def get_db():
@@ -1557,7 +1581,7 @@ async def create_scan(request: Request):
     notes = body.get("notes", "")
     stages = body.get("stages", "").strip()
     mode = body.get("mode", "recon").strip() or "recon"
-    if mode not in ("recon", "bounty"):
+    if mode not in ("recon", "bounty", "livecheck"):
         mode = "recon"
 
     if not subdomains_text:
@@ -1957,9 +1981,13 @@ def spa_fallback(path: str):
 if __name__ == "__main__":
     import uvicorn
 
+    # Default to loopback: the dashboard is unauthenticated and exposes
+    # destructive endpoints. Override with DASHBOARD_HOST=0.0.0.0 only when the
+    # port is protected (e.g. the docker-compose 127.0.0.1 port mapping, or a
+    # reverse proxy that adds auth).
     uvicorn.run(
         "dashboard.app:app",
-        host="0.0.0.0",
+        host=os.environ.get("DASHBOARD_HOST", "127.0.0.1"),
         port=int(os.environ.get("DASHBOARD_PORT", "8443")),
         reload=True,
     )
