@@ -3,8 +3,9 @@
 Integration test for the subdomain takeover fix + verify_takeovers pipeline.
 
 What this tests:
-  1. normalize.py filters out subzy records where vulnerable=false
-  2. load_duckdb.py's v_findings view excludes non-vulnerable subzy entries
+  1. normalize.py turns nuclei `takeovers/*` results into findings on the right assets
+     (and hosts without a takeover result get none)
+  2. load_duckdb.py's v_findings view exposes exactly those takeover findings
   3. verify_takeovers.py runs against the DuckDB and produces JSONL output
      (DNS/HTTP calls are made live; synthetic domains return 'likely_fp' because
       they have no real CNAME — that is the expected result)
@@ -53,7 +54,7 @@ def main() -> None:
         (tmp / "screenshots").mkdir()
 
         # ------------------------------------------------------------------ #
-        # Step 1 — Generate synthetic scan data (including subzy)
+        # Step 1 — Generate synthetic scan data (including nuclei takeover findings)
         # ------------------------------------------------------------------ #
         print("\n=== Step 1: Generate synthetic data ===")
         result = run([
@@ -87,7 +88,6 @@ def main() -> None:
             "--http",   str(out / "httpx.jsonl"),
             "--tls",    str(out / "tls.jsonl"),
             "--nuclei", str(out / "nuclei.jsonl"),
-            "--subzy",  str(out / "subzy.json"),
             "--zgrab",  str(out / "zgrab" / "zgrab_ssh.jsonl"),
             "--output", str(out / "assets.jsonl"),
             "--scan-id", "test_001",
@@ -99,38 +99,38 @@ def main() -> None:
         assets_path = out / "assets.jsonl"
         check("assets.jsonl created", assets_path.exists())
 
-        # Parse assets and check subzy findings
+        # Parse assets and check takeover findings
         assets: dict[str, dict] = {}
         for line in assets_path.read_bytes().splitlines():
             rec = json.loads(line)
             assets[rec["fqdn"]] = rec
 
-        # Vulnerable FQDNs must have a subzy finding
+        # Vulnerable FQDNs must have a nuclei takeover finding
         for fqdn in vulnerable_fqdns:
             if fqdn not in assets:
                 check(f"{fqdn} in assets", False, "asset missing")
                 continue
-            subzy_findings = [
+            takeover_findings = [
                 f for f in assets[fqdn].get("findings", [])
-                if f.get("source") == "subzy"
+                if f.get("source") == "nuclei" and "takeover" in (f.get("template_id") or "")
             ]
-            check(f"{fqdn}: has subzy finding", len(subzy_findings) == 1,
-                  f"found {len(subzy_findings)}")
-            if subzy_findings:
-                check(f"{fqdn}: finding.vulnerable=True",
-                      subzy_findings[0].get("vulnerable") is True)
+            check(f"{fqdn}: has takeover finding", len(takeover_findings) == 1,
+                  f"found {len(takeover_findings)}")
+            if takeover_findings:
+                check(f"{fqdn}: takeover severity is high",
+                      takeover_findings[0].get("severity") == "high")
 
-        # Non-vulnerable FQDNs must NOT have any subzy finding
+        # Clean FQDNs must NOT have any takeover finding
         for fqdn in non_vulnerable_fqdns:
             if fqdn not in assets:
                 continue  # domain may not have resolved in DNS — skip
-            subzy_findings = [
+            takeover_findings = [
                 f for f in assets[fqdn].get("findings", [])
-                if f.get("source") == "subzy"
+                if "takeover" in (f.get("template_id") or "")
             ]
-            check(f"{fqdn}: no subzy finding (vulnerable=False filtered)",
-                  len(subzy_findings) == 0,
-                  f"found {len(subzy_findings)} — FP leak!")
+            check(f"{fqdn}: no takeover finding",
+                  len(takeover_findings) == 0,
+                  f"found {len(takeover_findings)} — FP leak!")
 
         # ------------------------------------------------------------------ #
         # Step 3 — Load into DuckDB
@@ -153,16 +153,16 @@ def main() -> None:
 
         rows = con.execute("""
             SELECT fqdn, finding_source FROM v_findings
-            WHERE finding_source = 'subzy'
+            WHERE template_id LIKE '%takeover%'
         """).fetchall()
         found_fqdns = {r[0] for r in rows}
 
         for fqdn in vulnerable_fqdns:
-            check(f"v_findings: {fqdn} present (vulnerable=True)",
+            check(f"v_findings: {fqdn} present (takeover finding)",
                   fqdn in found_fqdns)
 
         for fqdn in non_vulnerable_fqdns:
-            check(f"v_findings: {fqdn} absent (vulnerable=False)",
+            check(f"v_findings: {fqdn} absent (no takeover finding)",
                   fqdn not in found_fqdns,
                   "FP leak into v_findings!")
 
@@ -185,7 +185,7 @@ def main() -> None:
 
         if verify_out.exists():
             results = [json.loads(l) for l in verify_out.read_bytes().splitlines()]
-            # Nuclei takeover/* findings also feed into verify — total >= vulnerable subzy count
+            # Every takeover finding feeds verify, so at least one record per vulnerable FQDN
             check(f"at least {len(vulnerable_fqdns)} verification records written",
                   len(results) >= len(vulnerable_fqdns),
                   f"expected >={len(vulnerable_fqdns)}, got {len(results)}")

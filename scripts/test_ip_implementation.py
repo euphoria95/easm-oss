@@ -12,6 +12,7 @@ Exit 0 = all tests passed, non-zero = failures.
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -659,7 +660,7 @@ def test_run_sh_stage_order():
     output = result.stdout + result.stderr
     stages_seen = [line.split(": ")[1].strip() for line in output.splitlines() if "Would run:" in line]
 
-    expected_order = ["dns", "asn", "rdns", "ports", "http", "tls", "fingerprint", "nuclei", "takeover", "normalize", "load", "verify"]
+    expected_order = ["ct", "dns", "asn", "rdns", "ports", "http", "tls", "fingerprint", "nuclei", "cloud_enum", "aimap", "normalize", "load", "verify"]
     assert_equal("stage order correct", stages_seen, expected_order)
     assert_true("passive not in stages", "passive" not in stages_seen)
 
@@ -714,14 +715,16 @@ def test_enrich_asn_cli_no_db():
 # ─────────────────────────────────────────────
 
 def test_pipeline_env():
-    section("11 · config/pipeline.env — ROOT_DOMAINS removed")
+    section("11 · config/pipeline.env — ROOT_DOMAINS not set globally")
 
     env_path = PROJECT_ROOT / "config" / "pipeline.env"
     content = env_path.read_text()
 
+    # ROOT_DOMAINS is per-scan (dashboard / env var); a commented example is fine,
+    # an active assignment would silently enable CT enrichment for every scan.
     assert_true("ROOT_DOMAINS not set in pipeline.env",
-                "ROOT_DOMAINS=" not in content or content.count("ROOT_DOMAINS=") == 0,
-                "ROOT_DOMAINS= still present in pipeline.env")
+                not re.search(r"^\s*(export\s+)?ROOT_DOMAINS=", content, re.M),
+                "active ROOT_DOMAINS= assignment present in pipeline.env")
     assert_true("ct_enrich.sh deleted",
                 not (PROJECT_ROOT / "scripts" / "ct_enrich.sh").exists())
 

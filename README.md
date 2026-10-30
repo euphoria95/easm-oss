@@ -98,8 +98,9 @@ vim data/input/subdomains.txt
 # Add your CMDB export (optional)
 vim data/input/cmdb_export.csv
 
-# Set root domains for CT enrichment
-# Edit ROOT_DOMAINS in config/pipeline.env
+# Optional: enrich targets from Certificate Transparency logs (crt.sh).
+# Set the root domains per scan in the dashboard ("Root domains"), or via env:
+#   ROOT_DOMAINS=example.com,example.org ./run.sh
 ```
 
 ### 3. Run with Docker (one-click)
@@ -191,10 +192,11 @@ python3 scripts/load_duckdb.py \
 
 ## Pipeline Stages
 
-Stage order: `dns,asn,rdns,ports,http,tls,fingerprint,nuclei,cloud_enum,aimap,normalize,load,verify`
+Stage order: `ct,dns,asn,rdns,ports,http,tls,fingerprint,nuclei,cloud_enum,aimap,normalize,load,verify`
 
 | Stage | Name | Tool | Purpose |
 |-------|------|------|---------|
+| 0 | `ct` | ct_enrich.py (crt.sh) | Passive Certificate Transparency lookup for the configured root domains; adds new in-scope hostnames to the targets. Opt-in — skipped unless `ROOT_DOMAINS` is set |
 | 1 | `dns` | dnsx | Resolve A/AAAA/CNAME/NS/MX/TXT, filter to live hosts |
 | 2 | `asn` | pyasn | Enrich IPs with ASN, prefix, organization (offline BGP RIB) |
 | 3 | `rdns` | getdns | Reverse DNS lookup on IP addresses → PTR records |
@@ -209,7 +211,23 @@ Stage order: `dns,asn,rdns,ports,http,tls,fingerprint,nuclei,cloud_enum,aimap,no
 | 12 | `load` | load_duckdb.py | Load into DuckDB with analytical views + Parquet archive |
 | 13 | `verify` | verify_takeovers.py | Live DNS + HTTP fingerprint verification of takeover candidates |
 
-`cloud_enum` and `aimap` are best-effort enrichment stages — they are skipped (non-fatal) if no inputs or the `aimap` tool is unavailable.
+`ct`, `cloud_enum` and `aimap` are best-effort enrichment stages — they are skipped (non-fatal) if no inputs or the `aimap` tool is unavailable.
+
+### CT-log enrichment (`ct` stage)
+
+Queries [crt.sh](https://crt.sh) for every certificate ever logged for your root domains and adds the hostnames found to the scan targets — typically surfacing subdomains missing from your input list. Hosts that came from CT are tagged with source `crt.sh` in the asset record, so you can measure how much CT added.
+
+```bash
+ROOT_DOMAINS=example.com,example.org ./run.sh        # CLI / env
+ROOT_DOMAINS=example.com ./run.sh --stage ct,dns     # just CT + DNS
+python3 scripts/ct_enrich.py --domains example.com --output /tmp/ct.txt   # standalone
+```
+
+- **Opt-in and scoped.** Nothing is queried unless `ROOT_DOMAINS` is set (or the dashboard's *Root domains* field is filled in), and only names equal to or under those domains are kept — third-party SANs on shared certificates are dropped.
+- **Passive.** The only network traffic is to crt.sh; nothing touches your targets until the later stages.
+- **Best-effort.** crt.sh is often slow or returns 502s, so requests are retried (`CT_RETRIES`, `CT_TIMEOUT` in `config/pipeline.env`); if it stays down the scan continues with your input list.
+- Not run in `livecheck` mode, which validates your registered CMDB names only.
+- Output: `data/output/ct_subdomains.txt` (everything CT returned, including names already in your input).
 
 ### Partial runs and resuming
 
@@ -397,6 +415,7 @@ easm-oss/
 │   ├── enrich_asn.py            # Offline ASN enrichment using pyasn
 │   ├── enrich_nuclei.py         # Nuclei finding aggregation and enrichment
 │   ├── cloud_enum.py            # Azure/AWS/GCP cloud endpoint enumeration
+│   ├── ct_enrich.py             # Certificate Transparency (crt.sh) subdomain enrichment
 │   ├── run_aimap.py             # Exposed AI-agent endpoint discovery stage
 │   ├── verify_takeovers.py      # Live verification of subdomain takeover candidates
 │   ├── score_bounty.py          # Bug-bounty priority scoring engine (S/A/B/C/D)
@@ -408,6 +427,7 @@ easm-oss/
 │   ├── query.py                 # Query runner with pre-built queries
 │   ├── test_pipeline.py         # Synthetic data generator
 │   ├── test_nerva_ingest.py     # Unit tests for Nerva ingestion
+│   ├── test_ct_enrich.py        # CT enrichment tests (offline, crt.sh mocked)
 │   ├── test_pipeline_nerva.sh   # Integration test: normalize + DuckDB with mock Nerva data
 │   ├── test_ip_implementation.py # IP scanning and enrichment tests
 │   ├── test_livecheck.py        # Livecheck unit tests
@@ -437,6 +457,7 @@ easm-oss/
 ## Request Budget
 
 Per live asset, the pipeline makes approximately:
+- CT: 1 crt.sh request per root domain (only when `ROOT_DOMAINS` is set)
 - DNS: 1–3 queries
 - ASN: 1 lookup (offline — BGP RIB database)
 - Reverse DNS: 1 lookup per IP (PTR query)
@@ -542,6 +563,11 @@ bash scripts/test_pipeline_nerva.sh
 
 # IP scanning and enrichment tests
 python3 scripts/test_ip_implementation.py
+
+# CT enrichment (offline), livecheck, takeover verification
+python3 scripts/test_ct_enrich.py
+python3 scripts/test_livecheck.py
+python3 scripts/test_verify_takeovers.py
 ```
 
 ## Takeover Verification

@@ -747,6 +747,11 @@ class AssetStore:
                     "severity": sf.get("severity", "info"),
                     "matched_at": f"{host}:{port}",
                     "evidence": sf.get("evidence", ""),
+                    # v_findings reads f.tags / f.description; without them a scan whose
+                    # only findings are nerva misconfigs gets a findings struct lacking
+                    # those keys and the DuckDB load fails.
+                    "tags": ["misconfiguration"],
+                    "description": sf.get("description", ""),
                     "timestamp": self.timestamp,
                 }
                 asset["findings"].append(finding)

@@ -2,7 +2,7 @@
 """
 Automated verification of subdomain takeover candidates.
 
-Reads takeover candidates from the DuckDB assets table (subzy/nuclei findings
+Reads takeover candidates from the DuckDB assets table (nuclei takeover findings
 that the scanning pipeline already confirmed as live), performs live DNS CNAME
 resolution and HTTP fingerprint checks, then:
   1. Writes detailed evidence to a takeover_verifications table + JSONL.
@@ -31,7 +31,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ---------------------------------------------------------------------------
 # Fingerprint database
-# Keyed by the service name subzy/nuclei report.  Each entry is a list of
+# Keyed by the service name nuclei reports.  Each entry is a list of
 # lowercase substrings that appear in the HTTP response body when the resource
 # is unclaimed.  Based on https://github.com/EdOverflow/can-i-take-over-xyz
 # ---------------------------------------------------------------------------
@@ -286,7 +286,7 @@ def load_candidates(con: duckdb.DuckDBPyConnection) -> list[tuple[str, str, str]
     Two sources are merged:
     1. Subzy/nuclei findings already confirmed in the pipeline.
     2. Assets whose DNS CNAME chain points to a known takeover-vulnerable
-       service — catches everything subzy missed due to HTTP errors.
+       service — catches everything nuclei missed due to HTTP errors.
     """
     # Source 1: pipeline findings
     # Note: findings struct contains: template_id, name, template, severity, ...
@@ -305,7 +305,7 @@ def load_candidates(con: duckdb.DuckDBPyConnection) -> list[tuple[str, str, str]
         WHERE f.template_id LIKE '%takeover%'
     """).fetchall()
 
-    # FQDNs already covered by subzy/nuclei — DNS source won't add duplicates for these
+    # FQDNs already covered by nuclei — DNS source won't add duplicates for these
     src1_fqdns: set[str] = {r[0] for r in src1}
 
     # Source 2: DNS CNAME chain pattern matching
