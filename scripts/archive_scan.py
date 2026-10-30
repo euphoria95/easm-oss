@@ -26,6 +26,7 @@ ARCHIVE_DIR_DEFAULT = "data/archives"
 
 INTERMEDIATE_FILES = [
     "targets.txt",
+    "ct_subdomains.txt",
     "dns.jsonl",
     "live_hosts.txt",
     "ports.jsonl",

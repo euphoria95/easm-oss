@@ -3,14 +3,14 @@
 # EASM Pipeline Orchestrator
 # =============================================================================
 # Funnel-based EASM discovery pipeline:
-#   DNS → ASN → Port Scan → HTTP Probe → TLS → nerva → Nuclei
+#   CT → DNS → ASN → Port Scan → HTTP Probe → TLS → nerva → Nuclei
 #   → Normalize → DuckDB
 #
 # Usage:
 #   ./run.sh                          # full pipeline
 #   ./run.sh --stage dns              # run single stage
 #   ./run.sh --stage dns,ports        # run multiple stages
-#   ./run.sh --skip-passive           # skip CT log enrichment
+#   ROOT_DOMAINS=example.com ./run.sh # also enrich targets from CT logs (crt.sh)
 #   ./run.sh --dry-run                # print what would run
 # =============================================================================
 
@@ -71,13 +71,14 @@ ASN_JSONL="${OUTPUT_DIR}/asn.jsonl"
 RDNS_JSONL="${OUTPUT_DIR}/rdns.jsonl"
 AIMAP_JSONL="${OUTPUT_DIR}/aimap.jsonl"
 CLOUD_ENUM_JSONL="${OUTPUT_DIR}/cloud_enum.jsonl"
+CT_SUBDOMAINS="${OUTPUT_DIR}/ct_subdomains.txt"
 
 SCAN_ID="$(date -u +%Y%m%d_%H%M%S)"
 SCAN_LOG="${LOG_DIR}/scan_${SCAN_ID}.log"
 SCAN_MARKER="${OUTPUT_DIR}/scan_id.txt"
 
 # CLI args
-STAGE_ORDER="dns,asn,rdns,ports,http,tls,fingerprint,nuclei,cloud_enum,aimap,normalize,load,verify"
+STAGE_ORDER="ct,dns,asn,rdns,ports,http,tls,fingerprint,nuclei,cloud_enum,aimap,normalize,load,verify"
 STAGE_FILTER=""
 FROM_STAGE=""
 DRY_RUN=false
@@ -310,7 +311,8 @@ if [[ -z "${STAGE_FILTER}" ]] && [[ -z "${FROM_STAGE}" ]]; then
                       "${ASN_JSONL}" "${RDNS_JSONL}" "${DNS_JSONL}" "${LIVE_HOSTS}" "${AIMAP_JSONL}" \
                       "${PORTS_JSONL}" "${WEB_TARGETS}" "${HTTPX_JSONL}" \
                       "${TLS_JSONL}" "${NERVA_JSONL}" "${SERVICE_DETECT_JSONL}" \
-                      "${NUCLEI_JSONL}" "${ASSETS_JSONL}" "${VERIFY_JSONL}" "${CLOUD_ENUM_JSONL}"
+                      "${NUCLEI_JSONL}" "${ASSETS_JSONL}" "${VERIFY_JSONL}" "${CLOUD_ENUM_JSONL}" \
+                      "${CT_SUBDOMAINS}"
                 mkdir -p "${ZGRAB_DIR}"
             fi
         fi
@@ -330,6 +332,45 @@ if [[ ! -f "${TARGETS_FILE}" ]]; then
         | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
         | grep -v '^$' \
         | sort -u > "${TARGETS_FILE}"
+fi
+
+# ===========================================================================
+# STAGE 0: Passive enrichment — Certificate Transparency logs (crt.sh)
+#   Opt-in: only queries the root domains listed in ROOT_DOMAINS, and only
+#   names under those domains are added. Skipped in livecheck mode (which
+#   validates the registered CMDB FQDNs, not newly discovered ones).
+# ===========================================================================
+if should_run "ct" && [[ "${PIPELINE_MODE}" != "livecheck" ]]; then
+    log_stage "CT LOG ENRICHMENT (crt.sh)"
+    stage_start=$(date +%s)
+    debug_stage_start "ct"
+
+    if [[ -z "${ROOT_DOMAINS// /}" ]]; then
+        log "ROOT_DOMAINS not set — skipping CT enrichment"
+        rm -f "${CT_SUBDOMAINS}"   # don't let a previous scan's CT list get tagged onto this one
+        debug_stage_end "ct" "$(elapsed ${stage_start})" "(skipped)"
+    else
+        rm -f "${CT_SUBDOMAINS}"
+        INPUT_COUNT=$(count_lines "${TARGETS_FILE}")
+        python3 "${SCRIPT_DIR}/scripts/ct_enrich.py" \
+            --domains "${ROOT_DOMAINS}" \
+            --existing "${TARGETS_FILE}" \
+            --output "${CT_SUBDOMAINS}" \
+            --timeout "${CT_TIMEOUT:-60}" \
+            --retries "${CT_RETRIES:-3}" \
+            --user-agent "${USER_AGENT:-EASM-Pipeline/0.1}" 2>>"${SCAN_LOG}" || \
+            log "WARN: CT enrichment failed — continuing with input targets only"
+
+        if [[ -s "${CT_SUBDOMAINS}" ]]; then
+            cat "${TARGETS_FILE}" "${CT_SUBDOMAINS}" | sort -u > "${TARGETS_FILE}.merged"
+            mv "${TARGETS_FILE}.merged" "${TARGETS_FILE}"
+        fi
+        TOTAL_COUNT=$(count_lines "${TARGETS_FILE}")
+        CT_ADDED=$(( TOTAL_COUNT - INPUT_COUNT ))
+        debug_substep "CT: input=${INPUT_COUNT} added=${CT_ADDED} total=${TOTAL_COUNT}"
+        debug_stage_end "ct" "$(elapsed ${stage_start})"
+        log "CT enrichment complete | input=${INPUT_COUNT} ct_added=${CT_ADDED} total=${TOTAL_COUNT} elapsed=$(elapsed ${stage_start})s"
+    fi
 fi
 
 # Partition targets into FQDNs and IPs (including CIDR ranges)
@@ -1031,6 +1072,7 @@ if should_run "normalize"; then
     [[ -f "${NUCLEI_JSONL}" ]] && NORMALIZE_ARGS+=(--nuclei "${NUCLEI_JSONL}")
     [[ -f "${AIMAP_JSONL}" ]] && NORMALIZE_ARGS+=(--aimap "${AIMAP_JSONL}")
     [[ -f "${CLOUD_ENUM_JSONL}" ]] && NORMALIZE_ARGS+=(--cloud-enum "${CLOUD_ENUM_JSONL}")
+    [[ -s "${CT_SUBDOMAINS}" ]] && NORMALIZE_ARGS+=(--ct "${CT_SUBDOMAINS}")
     [[ -f "${CMDB_EXPORT}" ]] && NORMALIZE_ARGS+=(--cmdb "${CMDB_EXPORT}")
     [[ -f "${ASN_JSONL}" ]]   && NORMALIZE_ARGS+=(--asn "${ASN_JSONL}")
     [[ -f "${RDNS_JSONL}" ]]  && NORMALIZE_ARGS+=(--rdns "${RDNS_JSONL}")

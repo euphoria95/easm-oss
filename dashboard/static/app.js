@@ -84,6 +84,7 @@ const SEVERITY_COLORS = {
 const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low', 'info'];
 
 const PIPELINE_STAGES = [
+    { id: 'ct',          name: 'CT Log Enrichment',      tool: 'crt.sh' },
     { id: 'dns',         name: 'DNS Resolution',        tool: 'dnsx' },
     { id: 'asn',         name: 'ASN Enrichment',         tool: 'pyasn' },
     { id: 'rdns',        name: 'Reverse DNS',            tool: 'dnsx' },
@@ -92,6 +93,7 @@ const PIPELINE_STAGES = [
     { id: 'tls',         name: 'TLS Analysis',           tool: 'tlsx' },
     { id: 'fingerprint', name: 'Fingerprinting',         tool: 'nerva' },
     { id: 'nuclei',      name: 'Vulnerability Scan',     tool: 'nuclei' },
+    { id: 'cloud_enum',  name: 'Cloud Enumeration',      tool: 'cloud_enum.py' },
     { id: 'aimap',       name: 'AI Agent Discovery',     tool: 'aimap' },
     { id: 'normalize',   name: 'Normalization',          tool: 'normalize.py', required: true },
     { id: 'load',        name: 'DuckDB Load',            tool: 'load_duckdb.py', required: true },
@@ -2861,6 +2863,10 @@ async function pageScans(el) {
                         placeholder="Enter subdomains, one per line&#10;&#10;example.com&#10;app.example.com&#10;api.example.com&#10;staging.example.org&#10;&#10;Lines starting with # are ignored"
                         ${active ? 'disabled' : ''}
                     ></textarea>
+                    <input id="scan-root-domains" type="text"
+                           placeholder="Root domains for CT enrichment — optional, comma-separated (e.g. example.com)"
+                           class="w-full text-xs bg-[#0B100E] border border-slate-700 rounded px-2 py-1.5 mb-3 text-slate-300 placeholder-slate-600 focus:outline-none focus:border-accent"
+                           ${active ? 'disabled' : ''} />
                     <div class="flex items-center gap-3 mb-3">
                         <span class="text-xs text-slate-400 whitespace-nowrap">Mode:</span>
                         <label class="flex items-center gap-1.5 cursor-pointer">
@@ -3245,9 +3251,12 @@ window.startScan = async function() {
     }
 
     const stages = _getSelectedStages();
+    const rootDomainsEl = document.getElementById('scan-root-domains');
+    const root_domains = rootDomainsEl ? rootDomainsEl.value.trim() : '';
     const modeEl = document.querySelector('input[name="scan-mode"]:checked');
     const mode = modeEl ? modeEl.value : 'recon';
-    const stageInfo = stages ? `\nStages: ${stages}` : '\nAll pipeline stages will run.';
+    const stageInfo = (stages ? `\nStages: ${stages}` : '\nAll pipeline stages will run.')
+        + (root_domains ? `\nCT enrichment for: ${root_domains}` : '');
     const modeInfo = mode === 'bounty' ? '\nMode: Bug Bounty Prepare (expanded scanning)'
         : mode === 'livecheck' ? '\nMode: CMDB Livecheck (DNS-only scope validation)' : '';
 
@@ -3262,7 +3271,7 @@ window.startScan = async function() {
         const result = await fetch('/api/scans/new', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ subdomains, stages, mode }),
+            body: JSON.stringify({ subdomains, stages, mode, root_domains }),
         });
         const data = await result.json();
 

@@ -1170,6 +1170,9 @@ def global_search(q: str = Query("", min_length=2), db=Depends(get_db)):
 # API — Scan Management
 # ---------------------------------------------------------------------------
 
+_DOMAIN_RE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+
 def _read_scan_state() -> dict:
     if SCAN_STATE_FILE.exists():
         try:
@@ -1206,7 +1209,8 @@ def _get_current_stage(scan_id: str | None) -> str | None:
     return None
 
 
-def _run_pipeline(scan_id: str, input_file: str, stages: str = "", mode: str = "recon"):
+def _run_pipeline(scan_id: str, input_file: str, stages: str = "", mode: str = "recon",
+                  root_domains: str = ""):
     """Run the pipeline in a background thread."""
     try:
         _write_scan_state({
@@ -1216,11 +1220,14 @@ def _run_pipeline(scan_id: str, input_file: str, stages: str = "", mode: str = "
             "input_file": input_file,
             "stages": stages or "full",
             "mode": mode or "recon",
+            "root_domains": root_domains,
         })
 
         run_sh = PROJECT_ROOT / "run.sh"
         env = os.environ.copy()
         env["INPUT_SUBDOMAINS_OVERRIDE"] = str(Path(input_file).relative_to(PROJECT_ROOT))
+        if root_domains:
+            env["ROOT_DOMAINS_OVERRIDE"] = root_domains
 
         cmd = ["bash", str(run_sh)]
         if stages:
@@ -1584,6 +1591,16 @@ async def create_scan(request: Request):
     if mode not in ("recon", "bounty", "livecheck"):
         mode = "recon"
 
+    # Root domains for CT-log enrichment (opt-in; empty = ct stage skipped)
+    root_domains = [
+        d.strip().lower().lstrip("*.").rstrip(".")
+        for d in re.split(r"[,\s]+", str(body.get("root_domains", "")))
+        if d.strip()
+    ]
+    bad = [d for d in root_domains if not _DOMAIN_RE.match(d)]
+    if bad:
+        raise HTTPException(status_code=400, detail=f"Invalid root domain: {bad[0]}")
+
     if not subdomains_text:
         raise HTTPException(status_code=400, detail="No subdomains provided")
 
@@ -1609,7 +1626,7 @@ async def create_scan(request: Request):
 
     thread = threading.Thread(
         target=_run_pipeline,
-        args=(scan_id, str(input_file), stages, mode),
+        args=(scan_id, str(input_file), stages, mode, ",".join(dict.fromkeys(root_domains))),
         daemon=True,
     )
     thread.start()

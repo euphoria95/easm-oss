@@ -839,6 +839,21 @@ class AssetStore:
 
             asset["findings"].append(finding)
 
+    # --- Certificate Transparency ---
+    def tag_ct_discovered(self, fqdns):
+        """Mark assets that appeared in CT logs (crt.sh) with source 'crt.sh'.
+
+        Tag-only: CT names that never resolved or answered have no other data
+        and are intentionally not turned into empty assets.
+        """
+        tagged = 0
+        for fqdn in fqdns:
+            asset = self.assets.get(fqdn.lower().strip())
+            if asset:
+                self._add_source(asset, "crt.sh")
+                tagged += 1
+        return tagged
+
     # --- Cloud Enumeration ---
     def ingest_cloud_enum(self, records):
         """Ingest cloud endpoint enumeration results from cloud_enum.py."""
@@ -1207,6 +1222,7 @@ def main():
     parser.add_argument("--nuclei", help="nuclei JSONL output")
     parser.add_argument("--aimap", help="AIMAP AI agent discovery JSONL output")
     parser.add_argument("--cloud-enum", help="Cloud endpoint enumeration JSONL output")
+    parser.add_argument("--ct", help="CT-log hostnames (one per line) from ct_enrich.py; tags matching assets with source 'crt.sh'")
     parser.add_argument("--cmdb", help="CMDB CSV export")
     parser.add_argument("--output", required=True, help="Output JSONL path")
     parser.add_argument("--scan-id", default=now_iso(), help="Scan identifier")
@@ -1265,6 +1281,10 @@ def main():
     if cloud_enum_arg:
         print(f"Ingesting cloud enum: {cloud_enum_arg}", file=sys.stderr)
         store.ingest_cloud_enum(iter_jsonl(cloud_enum_arg))
+
+    if args.ct and Path(args.ct).is_file():
+        ct_names = [l.strip() for l in Path(args.ct).read_text().splitlines() if l.strip()]
+        print(f"Tagging CT-discovered hosts: {args.ct} ({store.tag_ct_discovered(ct_names)}/{len(ct_names)} matched assets)", file=sys.stderr)
 
     # CDN enrichment (multi-signal, runs after all data sources ingested)
     try:
