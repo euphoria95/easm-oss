@@ -6,7 +6,6 @@ severity:
 
 tags:
   - technologies
-  - takeovers
   - exposures
   - misconfiguration
   - default-logins
@@ -27,6 +26,7 @@ tags:
 exclude-tags:
   - dos
   - fuzz
+  - takeover
 
 rate-limit: 75
 bulk-size: 25

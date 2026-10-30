@@ -4,8 +4,7 @@ Tests for Tenable VM / WAS scope routing (tenable_scope.py, cmdb_scope_export.py
 routing mode, load_duckdb.py v_tenable_* views, run.sh `scope` stage).
 
 Unit tests walk every row of the routing matrix in TENABLE_SCOPE_PIPELINE.MD;
-integration tests run normalize → DuckDB load → simulated takeover verify →
-scope export → views. No network access.
+integration tests run normalize → DuckDB load → scope export → views. No network access.
 
 Run: python3 scripts/test_tenable_scope.py
 Exit 0 = all tests passed.
@@ -54,9 +53,8 @@ def asset(fqdn, ips=(IP,), ports=(443,), webs=None, in_cmdb=False, **network):
         "cloud": {"endpoints": [{"provider": "x", "service": s} for s in network.pop("cloud", [])]},
         "cmdb": {"in_cmdb": in_cmdb},
     }
-    for key in ("takeover_status", "ai_protocols"):
-        if key in network:
-            rec[key] = network.pop(key)
+    if "ai_protocols" in network:
+        rec["ai_protocols"] = network.pop("ai_protocols")
     rec["network"].update(network)
     return rec
 
@@ -210,38 +208,18 @@ class RoutingMatrix(unittest.TestCase):
         r = a["srv.example.com"]
         self.assertEqual((r["vm_action"], r["was_reasons"]), ("include", ["default_page"]))
 
-    def test_9_confirmed_takeover_poisons_ip(self):
-        a, ips = route(asset("dangling.example.com", takeover_status="confirmed"), asset("ok.example.com"))
-        self.assertEqual(a["dangling.example.com"]["category"], "takeover")
-        self.assertEqual(a["dangling.example.com"]["was_reasons"], ["takeover"])
-        self.assertEqual(ips[IP]["action"], "exclude")
-        self.assertEqual(a["ok.example.com"]["vm_action"], "exclude")
-        self.assertIn("takeover", a["ok.example.com"]["categories"])
-
-    def test_9_unverified_finding_is_candidate_likely_fp_clears(self):
-        finding = [{"source": "nuclei", "template_id": "azure-takeover-detection", "tags": ["takeover"]}]
-        a, _ = route(asset("t1.example.com", findings=finding))
-        self.assertEqual(a["t1.example.com"]["takeover_status"], "candidate")
-        self.assertEqual(a["t1.example.com"]["was_action"], "exclude")
-        a, _ = route(asset("t2.example.com", findings=finding, takeover_status="likely_fp"))
-        self.assertEqual(a["t2.example.com"]["was_action"], "include")
-
-    def test_9_unverified_cname_candidate_alone_does_not_exclude(self):
-        a, _ = route(asset("c.example.com", takeover_status="unverified"))
-        self.assertEqual(a["c.example.com"]["vm_action"], "include")
-
-    def test_10_json_api_routed_to_api_profile(self):
+    def test_9_json_api_routed_to_api_profile(self):
         a, _ = route(asset("api.example.com", webs=[web("https://api.example.com", ct="application/json; charset=utf-8")]))
         self.assertEqual((a["api.example.com"]["category"], a["api.example.com"]["was_profile"]), ("api", "api"))
         self.assertEqual(a["api.example.com"]["vm_action"], "include")
 
-    def test_10_ai_endpoint_and_api_gateway(self):
+    def test_9_ai_endpoint_and_api_gateway(self):
         a, _ = route(asset("llm.example.com", findings=[{"source": "aimap", "tags": ["ollama"]}]),
                      asset("gw.example.com", ips=("93.184.216.20",), cloud=["api_gateway"]))
         self.assertEqual(a["llm.example.com"]["was_profile"], "api")
         self.assertEqual(a["gw.example.com"]["was_profile"], "api")
 
-    def test_10_mixed_html_and_json_is_standard(self):
+    def test_9_mixed_html_and_json_is_standard(self):
         a, _ = route(asset("m.example.com", ports=(443, 8443),
                            webs=[web("https://m.example.com"), web("https://m.example.com:8443", ct="application/json")]))
         self.assertEqual(a["m.example.com"]["was_profile"], "standard")
@@ -348,7 +326,7 @@ class _PipelineDb(unittest.TestCase):
             {"host": "api.example.com", "a": ["93.184.216.10"]},
             {"host": "cf.example.com", "a": ["104.16.1.1"]},
             {"host": "ssh.example.com", "a": ["93.184.216.30"]},
-            {"host": "old.example.com", "a": ["93.184.216.40"], "cname": ["dangling.azurewebsites.net"]},
+            {"host": "old.example.com", "a": ["93.184.216.40"], "cname": ["old.azurewebsites.net"]},
         ])
         w("ports.jsonl", [{"host": h, "port": p} for h, p in [
             ("app.example.com", 443), ("api.example.com", 443), ("cf.example.com", 443),
@@ -377,13 +355,6 @@ class _PipelineDb(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _verify(self, fqdn, status):
-        import duckdb
-        con = duckdb.connect(str(self.db))
-        con.execute("ALTER TABLE assets ADD COLUMN takeover_status VARCHAR")
-        con.execute("UPDATE assets SET takeover_status = ? WHERE fqdn = ?", [status, fqdn])
-        con.close()
-
     def _query(self, sql):
         import duckdb
         con = duckdb.connect(str(self.db), read_only=True)
@@ -395,30 +366,29 @@ class _PipelineDb(unittest.TestCase):
 
 
 class EndToEnd(_PipelineDb):
-    """normalize.py → load_duckdb.py → (verify) → cmdb_scope_export.py --db."""
+    """normalize.py → load_duckdb.py → cmdb_scope_export.py --db."""
 
     def test_db_mode_files_tables_and_views(self):
-        self._verify("old.example.com", "confirmed")
         r = _run(SCRIPTS_DIR / "cmdb_scope_export.py", "--db", self.db, "--output-dir", self.out)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("Tenable Scope Routing", r.stderr)
 
         read = lambda n: (self.out / n).read_text().split()
-        self.assertEqual(read("tenable_vm_include.txt"), ["93.184.216.10", "93.184.216.30"])
-        self.assertEqual(read("tenable_vm_exclude.txt"), ["93.184.216.40", "104.16.1.1"])  # numeric order
+        self.assertEqual(read("tenable_vm_include.txt"), ["93.184.216.10", "93.184.216.30", "93.184.216.40"])
+        self.assertEqual(read("tenable_vm_exclude.txt"), ["104.16.1.1"])
         self.assertEqual(read("tenable_vm_review.txt"), [])
         self.assertEqual(read("tenable_was_targets.txt"), ["https://app.example.com"])
         self.assertEqual(read("tenable_was_waf_targets.txt"), ["https://cf.example.com"])
         self.assertEqual(read("tenable_was_api_targets.txt"), ["https://api.example.com"])
 
         rows = {r["fqdn"]: r for r in _jsonl(self.out / "tenable_scope.jsonl")}
-        self.assertEqual(rows["old.example.com"]["category"], "takeover")
+        self.assertEqual(rows["old.example.com"]["category"], "direct")
         self.assertEqual(rows["ssh.example.com"]["category"], "non_http")
 
         self.assertEqual(self._query("SELECT target_ip, vm_category, fqdn_count FROM v_tenable_vm_scope"),
-                         [("93.184.216.10", "owned_shared", 2), ("93.184.216.30", "direct", 1)])
+                         [("93.184.216.10", "owned_shared", 2), ("93.184.216.30", "direct", 1),
+                          ("93.184.216.40", "direct", 1)])
         excl = dict(self._query("SELECT target_ip, reasons FROM v_tenable_vm_exclusions"))
-        self.assertEqual(excl["93.184.216.40"], ["takeover:confirmed"])
         self.assertTrue(any(x.startswith(("cdn:", "waf:")) for x in excl["104.16.1.1"]))
         self.assertEqual(self._query("SELECT target_url, waf_provider FROM v_tenable_was_scope_waf"),
                          [("https://cf.example.com", "cloudflare")])
@@ -446,12 +416,11 @@ class EndToEnd(_PipelineDb):
         self.assertEqual(self._query("SELECT COUNT(*) FROM v_tenable_vm_scope"), [(0,)])
         self.assertEqual((self.out / "tenable_was_targets.txt").read_text(), "")
 
-    def test_assets_mode_with_takeover_overlay(self):
-        (self.tmp / "tk.jsonl").write_bytes(orjson.dumps({"fqdn": "old.example.com", "status": "confirmed"}) + b"\n")
-        r = _run(SCRIPTS_DIR / "cmdb_scope_export.py", "--assets", self.assets, "--takeovers", self.tmp / "tk.jsonl",
-                 "--output-dir", self.out)
+    def test_assets_mode(self):
+        r = _run(SCRIPTS_DIR / "cmdb_scope_export.py", "--assets", self.assets, "--output-dir", self.out)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("93.184.216.40", (self.out / "tenable_vm_exclude.txt").read_text())
+        self.assertIn("93.184.216.40", (self.out / "tenable_vm_include.txt").read_text())
+        self.assertEqual((self.out / "tenable_vm_exclude.txt").read_text().split(), ["104.16.1.1"])
 
 
 class DashboardApi(_PipelineDb):
@@ -470,7 +439,6 @@ class DashboardApi(_PipelineDb):
 
     def setUp(self):
         super().setUp()
-        self._verify("old.example.com", "confirmed")
         r = _run(SCRIPTS_DIR / "cmdb_scope_export.py", "--db", self.db, "--output-dir", self.out,
                  "--owned-cidrs", "93.184.216.0/24")
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -491,19 +459,19 @@ class DashboardApi(_PipelineDb):
         meta = d["meta"]
         self.assertEqual((meta["require_owned"], meta["cmdb_only"]), (False, False))
         self.assertEqual(meta["owned_cidrs"], ["93.184.216.0/24"])
-        self.assertEqual((d["vm"]["include"]["ips"], d["vm"]["include"]["fqdns"]), (2, 3))
+        self.assertEqual((d["vm"]["include"]["ips"], d["vm"]["include"]["fqdns"]), (3, 4))
         self.assertEqual(d["was_urls"], {"standard": 1, "waf": 1, "api": 1})
         self.assertEqual(d["assets"]["total"], 5)
         kinds = {r["kind"] for r in d["vm_reasons"]}
-        self.assertIn("takeover", kinds)
+        self.assertIn("cdn", kinds)
         self.assertEqual(sum(c["assets"] for c in d["categories"]), 5)
 
     def test_lists_and_filters(self):
         vm = self._list("vm_include")
-        self.assertEqual([r["target_ip"] for r in vm["items"]], ["93.184.216.10", "93.184.216.30"])
+        self.assertEqual([r["target_ip"] for r in vm["items"]], ["93.184.216.10", "93.184.216.30", "93.184.216.40"])
         self.assertEqual(self._list("vm_include", q="ssh")["total"], 1)
         self.assertEqual([r["target_url"] for r in self._list("was_waf")["items"]], ["https://cf.example.com"])
-        self.assertEqual(self._list("assets", category="takeover")["items"][0]["fqdn"], "old.example.com")
+        self.assertEqual(self._list("assets", category="direct")["items"][0]["fqdn"], "old.example.com")
         self.assertEqual(self._list("assets", was="exclude")["total"], 2)
         self.assertEqual(self._list("assets", cmdb="1")["total"], 0)
         page = self._list("assets", per_page=2, page=3)
@@ -513,11 +481,11 @@ class DashboardApi(_PipelineDb):
 
     def test_exports(self):
         r = self.dash.tenable_scope_export(db=self.con, kind="vm_exclude")
-        self.assertEqual(r.body.decode().split(), ["93.184.216.40", "104.16.1.1"])
+        self.assertEqual(r.body.decode().split(), ["104.16.1.1"])
         self.assertIn('filename="tenable_vm_exclude.txt"', r.headers["content-disposition"])
         csv = self.dash.tenable_scope_export(db=self.con, kind="assets").body.decode()
         self.assertTrue(csv.startswith("scan_id,fqdn,"))
-        self.assertIn("takeover:confirmed", csv)
+        self.assertIn("cdn:cloudflare", csv)
 
     @unittest.skipUnless(_has_xlsxwriter(), "XlsxWriter not installed")
     def test_xlsx_export(self):
@@ -577,9 +545,9 @@ class RunShStage(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         return [l.split(": ")[1].strip() for l in (r.stdout + r.stderr).splitlines() if "Would run:" in l]
 
-    def test_scope_runs_after_verify(self):
+    def test_scope_runs_after_load(self):
         stages = self._stages()
-        self.assertEqual(stages[-2:], ["verify", "scope"])
+        self.assertEqual(stages[-2:], ["load", "scope"])
 
     def test_scope_resumable(self):
         self.assertEqual(self._stages("--from", "scope"), ["scope"])

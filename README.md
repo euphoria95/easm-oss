@@ -80,8 +80,7 @@ subdomains.txt / IPs / CIDRs ─────────────────
                                          │
                                          ▼
                             ┌────────────────────────────────────────┐
-                            │  verify_takeovers.py                    │  Live DNS + HTTP
-                            │  (mode: recon)                          │  takeover confirmation
+                            │  cmdb_scope_export.py (mode: recon)     │  Tenable VM/WAS routing
                             │  score_bounty.py    (mode: bounty)      │  S/A/B/C/D tiering
                             │  livecheck.py       (mode: livecheck)   │  Tenable scope export
                             └────────────────────────────────────────┘
@@ -215,7 +214,7 @@ python3 scripts/load_duckdb.py \
 
 ## Pipeline Stages
 
-Stage order: `subfinder,ct,dns,asn,rdns,cdn,ports,http,waf,tls,fingerprint,nuclei,cloud_enum,aimap,normalize,load,verify,scope`
+Stage order: `subfinder,ct,dns,asn,rdns,cdn,ports,http,waf,tls,fingerprint,nuclei,cloud_enum,aimap,normalize,load,scope`
 
 | Stage | Name | Tool | Purpose |
 |-------|------|------|---------|
@@ -230,13 +229,12 @@ Stage order: `subfinder,ct,dns,asn,rdns,cdn,ports,http,waf,tls,fingerprint,nucle
 | 8 | `waf` | waf-detect | Passive WAF/CDN fingerprinting of every HTTP origin (no attack payloads) |
 | 9 | `tls` | tlsx | Deep cert analysis: SANs, expiry, misconfig flags |
 | 10 | `fingerprint` | nerva | Auto-detect all protocols: SSH, FTP, DB, Redis, SMB — CPE/vendor/version/OS fingerprints. Alias: `zgrab` |
-| 11 | `nuclei` | nuclei | Low-noise scan: takeovers, exposed panels, misconfigs |
+| 11 | `nuclei` | nuclei | Low-noise scan: exposed panels, misconfigs, default logins |
 | 12 | `cloud_enum` | cloud_enum.py | Detect Azure/AWS/GCP cloud endpoints (storage, web apps, DBs, CDN) from DNS/HTTP/TLS data |
 | 13 | `aimap` | run_aimap.py | Discover exposed AI agent endpoints (MCP, Ollama, LangServe, Gradio, ComfyUI…). Requires vendored `aimap/` tool |
 | 14 | `normalize` | normalize.py | Merge all JSONL → unified asset record per FQDN + CDN/WAF verdicts |
 | 15 | `load` | load_duckdb.py | Load into DuckDB with analytical views + Parquet archive |
-| 16 | `verify` | verify_takeovers.py | Live DNS + HTTP fingerprint verification of takeover candidates |
-| 17 | `scope` | cmdb_scope_export.py | Route assets to Tenable VM (unique IPs) / Tenable WAS (URLs, standard / WAF / API profiles). `recon` mode only |
+| 16 | `scope` | cmdb_scope_export.py | Route assets to Tenable VM (unique IPs) / Tenable WAS (URLs, standard / WAF / API profiles). `recon` mode only |
 
 `subfinder`, `ct`, `cdn`, `waf`, `cloud_enum` and `aimap` are best-effort enrichment stages — they are skipped (non-fatal) if they have no inputs or the tool is unavailable.
 
@@ -313,7 +311,7 @@ Select with `--mode` (or `PIPELINE_MODE` in `config/pipeline.env`). Default is `
 
 | Mode | Flag | Behavior |
 |------|------|----------|
-| `recon` | _(default)_ | Full pipeline with conservative, low-noise settings. Ends with takeover verification and Tenable VM/WAS scope routing. |
+| `recon` | _(default)_ | Full pipeline with conservative, low-noise settings. Ends with Tenable VM/WAS scope routing. |
 | `bounty` | `--mode bounty` | Expanded attack-surface scan: top-1000 ports, no CDN exclusion, Nerva misconfigs + UDP, broader `nuclei-bounty.yaml` template set. Runs `score_bounty.py` to assign each asset an S/A/B/C/D priority tier. |
 | `livecheck` | `--mode livecheck` | Lightweight DNS-only CMDB scope governance (`dns,asn,rdns,normalize,load`). Validates registered FQDNs for liveness, CDN/WAF fronting, CNAME bloat, stale records, and 3rd-party nameservers, then exports Tenable include/exclude scope files. |
 
@@ -344,7 +342,7 @@ LIVECHECK_CNAME_DEPTH_THRESHOLD=3    # CNAME hops considered "bloated"
 
 ### Tenable VM / WAS Scope Routing (`scope` stage)
 
-Turns every discovered asset into scanner-ready scope, following the routing matrix in [`TENABLE_SCOPE_PIPELINE.MD`](TENABLE_SCOPE_PIPELINE.MD). Tenable VM scans infrastructure by IP; Tenable WAS runs DAST against web applications. Feeding both scanners the raw asset list wastes licences and scans infrastructure you don't own. The rules live in `scripts/tenable_scope.py`; `cmdb_scope_export.py --db` applies them after `verify`, so confirmed takeovers stay out of both scanners.
+Turns every discovered asset into scanner-ready scope, following the routing matrix in [`TENABLE_SCOPE_PIPELINE.MD`](TENABLE_SCOPE_PIPELINE.MD). Tenable VM scans infrastructure by IP; Tenable WAS runs DAST against web applications. Feeding both scanners the raw asset list wastes licences and scans infrastructure you don't own. The rules live in `scripts/tenable_scope.py`; `cmdb_scope_export.py --db` applies them after `load`.
 
 | Category | Tenable VM | Tenable WAS |
 |----------|-----------|-------------|
@@ -359,11 +357,10 @@ Turns every discovered asset into scanner-ready scope, following the routing mat
 | Non-HTTP only (SSH, VPN, DB, SMTP) | include | exclude |
 | Redirect-only / parked / dead | exclude | exclude |
 | Default server page (nginx/IIS/Apache welcome) | include | exclude |
-| Takeover (verified `confirmed`, or scanner finding not cleared as `likely_fp`) | exclude | exclude |
 | Pure API / AI endpoint (JSON responses, aimap hit, API gateway) | include if direct | `api` profile — attach an OpenAPI definition |
 | Non-routable IP in public DNS (RFC 1918, documentation ranges) | exclude | exclude when every IP is non-routable |
 
-**Exclusion wins per IP.** If any asset resolving to an IP marks it as CDN, WAF, third-party/PaaS or a takeover target, that IP stays out of VM for every asset that shares it. A WAS URL counts as live on `2xx` (not `204`), `401`, `403` or `500`. A redirect to another host counts as redirect-only; that host is routed as its own asset. When `https://host` answers, `http://host` is dropped as the same app.
+**Exclusion wins per IP.** If any asset resolving to an IP marks it as CDN, WAF or third-party/PaaS, that IP stays out of VM for every asset that shares it. A WAS URL counts as live on `2xx` (not `204`), `401`, `403` or `500`. A redirect to another host counts as redirect-only; that host is routed as its own asset. When `https://host` answers, `http://host` is dropped as the same app.
 
 Outputs (in `data/output/`, then archived with the scan):
 
@@ -396,7 +393,7 @@ Every data sheet is a filterable Excel table with a frozen header. Hover a heade
 # Tunables (config/pipeline.env)
 TENABLE_CDN_MIN_CONFIDENCE=0.35   # detect_cdn scores 0.35 per signal type → any CDN signal excludes from VM
 TENABLE_WAF_MIN_CONFIDENCE=0.5
-TENABLE_OWNED_CIDRS=""            # your ranges — override CDN / third-party / PaaS heuristics (never WAF/takeover)
+TENABLE_OWNED_CIDRS=""            # your ranges — override CDN / third-party / PaaS heuristics (never WAF)
 TENABLE_OWNED_ASNS=""
 TENABLE_VM_REQUIRE_OWNED=false    # true = IPs outside owned ranges go to review, not include
 TENABLE_SCOPE_CMDB_ONLY=false     # true = only CMDB-registered assets enter scan scope
@@ -417,13 +414,11 @@ python3 scripts/query.py --db data/output/easm.duckdb --query list
 
 # Run a query (keys: stats, gaps, shadow_it, tls_issues, tls_expiring,
 #   findings, findings_critical, tech, tech_summary, ports, port_heatmap,
-#   cdn_distribution, waf_distribution, asn_distribution, favicon_clusters, takeovers,
-#   verified_takeovers)
+#   cdn_distribution, waf_distribution, asn_distribution, favicon_clusters)
 python3 scripts/query.py --db data/output/easm.duckdb --query stats
 python3 scripts/query.py --db data/output/easm.duckdb --query shadow_it
 python3 scripts/query.py --db data/output/easm.duckdb --query tls_issues
 python3 scripts/query.py --db data/output/easm.duckdb --query findings_critical
-python3 scripts/query.py --db data/output/easm.duckdb --query verified_takeovers
 python3 scripts/query.py --db data/output/easm.duckdb --query port_heatmap
 
 # Custom SQL
@@ -550,7 +545,6 @@ easm-oss/
 │   ├── cloud_enum.py            # Azure/AWS/GCP cloud endpoint enumeration
 │   ├── ct_enrich.py             # Certificate Transparency (crt.sh) subdomain enrichment
 │   ├── run_aimap.py             # Exposed AI-agent endpoint discovery stage
-│   ├── verify_takeovers.py      # Live verification of subdomain takeover candidates
 │   ├── score_bounty.py          # Bug-bounty priority scoring engine (S/A/B/C/D)
 │   ├── livecheck.py             # CMDB DNS-liveness / scope governance analysis
 │   ├── cmdb_scope_export.py     # Tenable scope exporter (VM/WAS routing + livecheck include/exclude)
@@ -566,7 +560,6 @@ easm-oss/
 │   ├── test_pipeline_nerva.sh   # Integration test: normalize + DuckDB with mock Nerva data
 │   ├── test_ip_implementation.py # IP scanning and enrichment tests
 │   ├── test_livecheck.py        # Livecheck unit tests
-│   ├── test_verify_takeovers.py # Takeover verification unit tests
 │   ├── test_tenable_scope.py    # Tenable VM/WAS routing tests (matrix rows, DuckDB views, run.sh stage)
 │   ├── diff_scans.sh            # Scan-to-scan diff
 │   ├── cache.sh                 # Cache manager
@@ -576,7 +569,7 @@ easm-oss/
 │   └── static/
 │       ├── index.html           # Single-page UI shell
 │       ├── app.js               # Frontend: Overview, Assets, Services, Network,
-│       │                        #   Cloud, AIMAP, Takeovers, Bounty, Livecheck,
+│       │                        #   Cloud, AIMAP, Bounty, Livecheck, Tenable,
 │       │                        #   Scans (history/compare) tabs
 │       └── styles.css           # Styles
 ├── aimap/                       # Vendored AI-agent discovery tool (git-ignored, optional)
@@ -704,27 +697,9 @@ bash scripts/test_pipeline_nerva.sh
 # IP scanning and enrichment tests
 python3 scripts/test_ip_implementation.py
 
-# CT enrichment (offline), livecheck, takeover verification
+# CT enrichment (offline), livecheck
 python3 scripts/test_ct_enrich.py
 python3 scripts/test_livecheck.py
-python3 scripts/test_verify_takeovers.py
-```
-
-## Takeover Verification
-
-The `verify` stage (stage 13) reads takeover candidates from the DuckDB assets table (nuclei `takeovers`-tagged findings already confirmed live), then performs live DNS CNAME resolution and HTTP fingerprint checks to confirm whether the dangling resource is actually claimable. Confirmed candidates are written to `takeover_verifications.jsonl` and surfaced via the dashboard **Takeovers** tab and the `takeovers` / `verified_takeovers` queries.
-
-```bash
-# Run takeover verification (requires an existing DuckDB)
-./run.sh --stage verify
-
-# Or automatically at the end of a full recon run
-./run.sh
-
-# Standalone
-python3 scripts/verify_takeovers.py \
-    --db data/output/easm.duckdb \
-    --out data/output/takeover_verifications.jsonl
 ```
 
 ### Schema validation (standalone)
@@ -787,7 +762,6 @@ open http://127.0.0.1:8443
 - **AIMAP**: Exposed AI agent endpoints (MCP, Ollama, LangServe, Gradio, …)
 - **TLS**: Certificate expiry, self-signed certs, misconfiguration flags
 - **Findings**: Searchable vulnerability findings filtered by severity and source
-- **Takeovers**: Subdomain takeover candidates and live-verification results
 - **Bounty**: S/A/B/C/D-tiered bug-bounty target scores (bounty mode)
 - **Livecheck**: CMDB scope governance results (livecheck mode)
 - **Tenable Scope**: VM/WAS routing for the current scan. Shows the routing settings used (ownership enforced or not, owned ranges, CMDB-only), the VM-by-IP and WAS-by-URL split, the routing matrix, why assets were excluded, filterable target lists, and downloads of the Tenable import files
@@ -808,7 +782,6 @@ Live scans stream stage progress and a debug log viewer in the browser.
 | `GET /api/cmdb` | Assets missing from CMDB with gap analysis |
 | `GET /api/cloud` | Detected cloud endpoints (Azure/AWS/GCP) |
 | `GET /api/aimap` | Exposed AI agent endpoints |
-| `GET /api/takeovers` | Takeover candidates and verification status |
 | `GET /api/bounty` / `GET /api/bounty/export` | Bounty scores and tiers / export |
 | `GET /api/livecheck` | CMDB livecheck / scope governance results |
 | `GET /api/tenable-scope` | Tenable routing overview: settings used, VM/WAS totals, category matrix, exclusion reasons |

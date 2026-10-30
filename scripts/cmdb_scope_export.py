@@ -7,7 +7,7 @@ Routing mode (recon pipeline, stage "scope"; --db or --assets)
   TENABLE_SCOPE_PIPELINE.MD (rules: tenable_scope.py) and writes:
     tenable_vm_include.txt       unique IPs for Tenable VM (network scan)
     tenable_vm_exclude.txt       IPs that must not be network-scanned
-                                 (CDN/WAF edge, 3rd-party, PaaS, takeover)
+                                 (CDN/WAF edge, 3rd-party, PaaS)
     tenable_vm_review.txt        IPs awaiting ownership confirmation (--require-owned)
     tenable_was_targets.txt      WAS standard-profile URLs
     tenable_was_waf_targets.txt  WAF-fronted URLs — allow-list scanner egress first
@@ -25,7 +25,7 @@ Livecheck mode (--report)
 
 Usage:
     python3 cmdb_scope_export.py --db data/output/easm.duckdb --output-dir data/output
-    python3 cmdb_scope_export.py --assets assets.jsonl --takeovers takeover_verifications.jsonl
+    python3 cmdb_scope_export.py --assets assets.jsonl --output-dir data/output
     python3 cmdb_scope_export.py --report livecheck_report.jsonl --output-dir data/output
 """
 
@@ -136,17 +136,15 @@ def export_scope(args):
 # Routing mode
 # ---------------------------------------------------------------------------
 
-# Asset columns the router reads; the last two only exist on some scans
-# (aimap hits / after the verify stage).
+# Asset columns the router reads; ai_protocols only exists on scans with aimap hits.
 ROUTING_COLUMNS = ["fqdn", "scan_id", "dns", "network", "web", "findings", "cloud",
-                   "cmdb", "ai_protocols", "takeover_status"]
+                   "cmdb", "ai_protocols"]
 
 SCOPE_TABLE_COLUMNS = {
     "scan_id": "VARCHAR", "fqdn": "VARCHAR", "in_cmdb": "BOOLEAN",
     "category": "VARCHAR", "categories": "VARCHAR[]",
     "ips": "VARCHAR[]", "ports": "INTEGER[]", "asn_org": "VARCHAR",
     "cdn_provider": "VARCHAR", "waf_provider": "VARCHAR", "platforms": "VARCHAR[]",
-    "takeover_status": "VARCHAR",
     "vm_action": "VARCHAR", "vm_ips": "VARCHAR[]", "vm_reasons": "VARCHAR[]",
     "was_action": "VARCHAR", "was_profile": "VARCHAR",
     "was_reasons": "VARCHAR[]", "was_urls": "VARCHAR[]",
@@ -166,16 +164,6 @@ def read_assets_db(con) -> list[dict]:
     cur = con.execute(f"SELECT {', '.join(cols)} FROM assets")
     names = [d[0] for d in cur.description]
     return [dict(zip(names, row)) for row in cur.fetchall()]
-
-
-def read_assets_jsonl(assets_path: str, takeovers_path: str | None) -> list[dict]:
-    assets = read_jsonl(assets_path)
-    if takeovers_path and Path(takeovers_path).exists():
-        status = {r.get("fqdn"): r.get("status") for r in read_jsonl(takeovers_path)}
-        for a in assets:
-            if a.get("fqdn") in status:
-                a["takeover_status"] = status[a["fqdn"]]
-    return assets
 
 
 def _write_lines(path: Path, lines) -> int:
@@ -287,7 +275,7 @@ def export_routing(args):
         con = duckdb.connect(args.db)
         assets = read_assets_db(con)
     else:
-        assets = read_assets_jsonl(args.assets, args.takeovers)
+        assets = read_jsonl(args.assets)
 
     try:
         asset_rows, ip_rows = route_assets(assets, cfg)
@@ -323,7 +311,6 @@ def main():
     src.add_argument("--report", help="livecheck_report.jsonl (livecheck mode)")
     src.add_argument("--db", help="DuckDB database to route assets from (writes tenable_* tables)")
     src.add_argument("--assets", help="Normalized assets.jsonl to route (offline; files only)")
-    parser.add_argument("--takeovers", help="With --assets: takeover_verifications.jsonl")
     parser.add_argument("--output-dir", default="data/output",
                         help="Output directory for scope files")
     parser.add_argument("--cdn-min-confidence", type=float, default=0.35,

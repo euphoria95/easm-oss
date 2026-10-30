@@ -11,9 +11,9 @@ asset is classified (direct, CDN, WAF, third-party, PaaS, ...) and routed to:
       api       pure API / AI endpoint; needs an OpenAPI / Postman definition
 
 Exclusion always wins for VM: an IP stays out if any asset resolving to it
-marks it as CDN edge, WAF, third-party / managed-platform infrastructure or a
-takeover target. Infrastructure reasons (CDN, third-party, PaaS) are lifted for
-IPs inside the operator-declared owned CIDRs / ASNs; WAF and takeover are not.
+marks it as CDN edge, WAF or third-party / managed-platform infrastructure.
+Infrastructure reasons (CDN, third-party, PaaS) are lifted for IPs inside the
+operator-declared owned CIDRs / ASNs; WAF is not.
 
 Pure functions over asset dicts (assets.jsonl records, or rows read back from
 DuckDB) — no I/O. cmdb_scope_export.py does the reading and writing.
@@ -30,14 +30,13 @@ import orjson
 # Matrix categories in reporting precedence: an asset's primary category is the
 # first one it matches. Numbers are the rows of the routing matrix.
 CATEGORIES = (
-    "takeover",        # 9  dangling DNS / takeover candidate
     "cloud_paas",      # 6  cloud PaaS / serverless / storage / managed platform
     "cdn",             # 2  behind a CDN (or on a CDN-edge ASN)
     "waf",             # 3  behind a WAF
     "third_party",     # 4  third-party SaaS or shared hosting
     "static_or_dead",  # 8  redirect-only, parked, dead
     "non_http",        # 7  non-HTTP services only
-    "api",             # 10 pure API / AI endpoint
+    "api",             # 9  pure API / AI endpoint
     "owned_shared",    # 5  owned IP serving several FQDNs (LB / ingress)
     "direct",          # 1  direct / dedicated IP
 )
@@ -149,12 +148,12 @@ PAAS_CLASSES = {"storage", "static", "paas_web", "paas_api", "managed"}
 THIRD_PARTY_HOSTING_SIGNALS = ("asn:", "header:")
 
 # VM exclusion reasons describing the IP's infrastructure that an owned
-# CIDR / ASN declaration overrides. waf / takeover / non_routable never are.
+# CIDR / ASN declaration overrides. waf / non_routable never are.
 OWNED_OVERRIDABLE = ("cdn:", "third_party:", "cloud_paas:")
 
 # VM reason prefix → matrix category
 REASON_CATEGORY = {
-    "takeover": "takeover", "cdn": "cdn", "waf": "waf", "third_party": "third_party",
+    "cdn": "cdn", "waf": "waf", "third_party": "third_party",
     "cloud_paas": "cloud_paas", "non_routable": "static_or_dead",
 }
 
@@ -278,25 +277,6 @@ def _platforms(asset: dict) -> list[tuple[str, str, str]]:
     return [(p, c, ev) for (p, c), ev in found.items()]
 
 
-def _takeover(asset: dict) -> str | None:
-    """'confirmed' / 'candidate' when the asset is a dangling-DNS target.
-
-    verify_takeovers.py 'unverified' only means its HTTP check could not
-    connect — common for healthy SaaS CNAMEs — so that alone does not count.
-    """
-    status = asset.get("takeover_status")
-    if status == "confirmed":
-        return "confirmed"
-    if status == "likely_fp":
-        return None
-    for f in _list(asset.get("findings")):
-        f = _dict(f)
-        tags = [str(t).strip().lower() for t in _list(f.get("tags"))]
-        if "takeover" in (f.get("template_id") or "").lower() or "takeover" in tags:
-            return "candidate"
-    return None
-
-
 def _is_ai_endpoint(asset: dict) -> bool:
     if _list(asset.get("ai_protocols")):
         return True
@@ -400,13 +380,6 @@ def classify_asset(asset: dict, cfg: ScopeConfig) -> dict:
         if name not in categories:
             categories.append(name)
 
-    # Row 9 — takeover
-    takeover = _takeover(asset)
-    if takeover:
-        cat("takeover")
-        ip_reasons.append(f"takeover:{takeover}")
-        was_block.append("takeover")
-
     # Row 6 / 4 / 2 — managed platforms (cloud_enum, hostname suffix, ASN org)
     platforms = _platforms(asset)
     for platform, cls, _ in platforms:
@@ -451,7 +424,7 @@ def classify_asset(asset: dict, cfg: ScopeConfig) -> dict:
             cat("third_party")
             ip_reasons.append(f"third_party:{str(sig).split(':', 1)[1]}")
 
-    # Web analysis — rows 7, 8, 10
+    # Web analysis — rows 7, 8, 9
     web = analyze_web(fqdn, _list(asset.get("web")))
     non_web_ports = [p for p in ports if p not in web["web_ports"]]
     has_web = bool(_list(asset.get("web")))
@@ -498,7 +471,6 @@ def classify_asset(asset: dict, cfg: ScopeConfig) -> dict:
         "cdn_provider": cdn_provider,
         "waf_provider": waf_provider,
         "platforms": sorted({f"{p}:{c}" for p, c, _ in platforms}),
-        "takeover_status": asset.get("takeover_status") or (takeover and "candidate") or None,
         "categories": categories,
         "ip_reasons": list(dict.fromkeys(ip_reasons)),
         "vm_block": vm_block,
@@ -615,7 +587,6 @@ def route_assets(assets, cfg: ScopeConfig | None = None) -> tuple[list[dict], li
             "cdn_provider": r["cdn_provider"],
             "waf_provider": r["waf_provider"],
             "platforms": r["platforms"],
-            "takeover_status": r["takeover_status"],
             "vm_action": vm_action,
             "vm_ips": included,
             "vm_reasons": vm_reasons,

@@ -36,9 +36,8 @@ This matrix defines how each discovered asset category in the EASM-OSS pipeline 
 | **5. Owned Shared IP (K8s Ingress / Reverse Proxy / Load Balancer)** | **INCLUDE** (1x per unique IP) | **INCLUDE** (All unique FQDNs) | If 100 FQDNs point to 1 company-owned Nginx/ALB IP: scan the **IP once** in Tenable VM (infrastructure check), and scan **each unique FQDN** in Tenable WAS (virtual host routing). |
 | **6. Cloud PaaS / Serverless (`cloud_enum` == AppService, CloudRun, S3, etc.)** | **EXCLUDE** | **INCLUDE** (If Web App) / **EXCLUDE** (If Storage) | Underlying OS/Network is managed by AWS/GCP/Azure (Shared Responsibility Model). Keep out of VM. Scan web apps in WAS; handle storage buckets via `nuclei`/`cloud_enum`. |
 | **7. Non-HTTP Services Only (`nerva` == SSH, VPN, DB, SMTP; `httpx` == null)** | **INCLUDE** | **EXCLUDE** | WAS cannot evaluate non-HTTP protocols. Route directly to Tenable VM to audit TLS (`tlsx`), SSH configurations, VPN concentrators, and exposed databases. |
-| **8. Static Sites, Redirects (301/302), Parked Domains, Dead Hosts** | **EXCLUDE** | **EXCLUDE** | Zero infrastructure control and zero dynamic application attack surface. Keep strictly in EASM (`nuclei` / `livecheck`) to monitor for drift or subdomain takeovers. |
-| **9. Dangling DNS / Takeover Candidates (`verify_takeovers.py` == true)** | **EXCLUDE** | **EXCLUDE** | Pointing to unclaimed third-party resources. Scanning causes legal/ToS issues. Trigger immediate remediation alert from EASM instead. |
-| **10. Pure APIs / AI Endpoints (`aimap` / `httpx` content-type: JSON)** | **INCLUDE** (If Direct IP) | **CONDITIONAL** (API Profile) | Standard WAS DOM-crawlers fail on pure APIs. Tag for specialized WAS API scanning (requires Swagger/OpenAPI spec) or keep in `nuclei` + `aimap`. |
+| **8. Static Sites, Redirects (301/302), Parked Domains, Dead Hosts** | **EXCLUDE** | **EXCLUDE** | Zero infrastructure control and zero dynamic application attack surface. Keep strictly in EASM (`nuclei` / `livecheck`) to monitor for drift. |
+| **9. Pure APIs / AI Endpoints (`aimap` / `httpx` content-type: JSON)** | **INCLUDE** (If Direct IP) | **CONDITIONAL** (API Profile) | Standard WAS DOM-crawlers fail on pure APIs. Tag for specialized WAS API scanning (requires Swagger/OpenAPI spec) or keep in `nuclei` + `aimap`. |
 
 ---
 
@@ -127,12 +126,7 @@ WHERE
     w.status_code IN (200, 401, 403, 500)
     -- 2. Exclude WAF-protected targets from standard aggressive DAST
     AND COALESCE(a.network.waf.detected, false) = false
-    -- 3. Exclude confirmed subdomain takeover candidates
-    AND NOT EXISTS (
-        SELECT 1 FROM UNNEST(a.findings) AS f 
-        WHERE 'takeover' IN f.tags
-    )
-    -- 4. Exclude static storage buckets
+    -- 3. Exclude static storage buckets
     AND NOT EXISTS (
         SELECT 1 FROM UNNEST(a.findings) AS f 
         WHERE f.source = 'cloud_enum' AND f.type = 'storage'

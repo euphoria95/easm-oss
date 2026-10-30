@@ -64,7 +64,6 @@ DUCKDB_PATH="${SCRIPT_DIR}/${DUCKDB_PATH_VALUE}"
 ZGRAB_DIR="${OUTPUT_DIR}/zgrab"
 NERVA_JSONL="${OUTPUT_DIR}/nerva.jsonl"
 SERVICE_DETECT_JSONL="${OUTPUT_DIR}/service_detection.jsonl"
-VERIFY_JSONL="${OUTPUT_DIR}/takeover_verifications.jsonl"
 IP_TARGETS="${OUTPUT_DIR}/ip_targets.txt"
 FQDN_TARGETS="${OUTPUT_DIR}/fqdn_targets.txt"
 ASN_JSONL="${OUTPUT_DIR}/asn.jsonl"
@@ -83,7 +82,7 @@ SCAN_LOG="${LOG_DIR}/scan_${SCAN_ID}.log"
 SCAN_MARKER="${OUTPUT_DIR}/scan_id.txt"
 
 # CLI args
-STAGE_ORDER="subfinder,ct,dns,asn,rdns,cdn,ports,http,waf,tls,fingerprint,nuclei,cloud_enum,aimap,normalize,load,verify,scope"
+STAGE_ORDER="subfinder,ct,dns,asn,rdns,cdn,ports,http,waf,tls,fingerprint,nuclei,cloud_enum,aimap,normalize,load,scope"
 STAGE_FILTER=""
 FROM_STAGE=""
 DRY_RUN=false
@@ -316,7 +315,7 @@ if [[ -z "${STAGE_FILTER}" ]] && [[ -z "${FROM_STAGE}" ]]; then
                       "${ASN_JSONL}" "${RDNS_JSONL}" "${DNS_JSONL}" "${LIVE_HOSTS}" "${AIMAP_JSONL}" \
                       "${PORTS_JSONL}" "${WEB_TARGETS}" "${HTTPX_JSONL}" \
                       "${TLS_JSONL}" "${NERVA_JSONL}" "${SERVICE_DETECT_JSONL}" \
-                      "${NUCLEI_JSONL}" "${ASSETS_JSONL}" "${VERIFY_JSONL}" "${CLOUD_ENUM_JSONL}" \
+                      "${NUCLEI_JSONL}" "${ASSETS_JSONL}" "${CLOUD_ENUM_JSONL}" \
                       "${CT_SUBDOMAINS}" "${SUBFINDER_JSONL}" "${SUBFINDER_SUBDOMAINS}" \
                       "${CDNCHECK_JSONL}" "${WAF_JSONL}"
                 mkdir -p "${ZGRAB_DIR}"
@@ -1300,33 +1299,9 @@ except: pass
 fi
 
 # ===========================================================================
-# STAGE 10: Verify takeover candidates (live DNS + HTTP fingerprint)
-# ===========================================================================
-if should_run "verify"; then
-    log_stage "TAKEOVER VERIFICATION"
-    stage_start=$(date +%s)
-    debug_stage_start "verify"
-
-    if [[ ! -f "${DUCKDB_PATH}" ]]; then
-        log "WARN: DuckDB not found — skipping takeover verification"
-        debug_stage_end "verify" "$(elapsed ${stage_start})" "(skipped)"
-    else
-        python3 "${SCRIPT_DIR}/scripts/verify_takeovers.py" \
-            --db  "${DUCKDB_PATH}" \
-            --out "${VERIFY_JSONL}" 2>>"${SCAN_LOG}" || \
-            log "WARN: takeover verification completed with warnings"
-
-        debug_substep "Candidates verified: $(count_lines "${VERIFY_JSONL}")"
-        debug_stage_end "verify" "$(elapsed ${stage_start})"
-        log "Takeover verification complete | elapsed=$(elapsed ${stage_start})s"
-    fi
-fi
-
-# ===========================================================================
-# STAGE 10.5: Tenable scan-scope routing (recon mode only)
+# STAGE 10: Tenable scan-scope routing (recon mode only)
 #   Routes every asset to Tenable VM (unique IPs) and/or Tenable WAS (URLs,
-#   standard / waf / api profiles) per TENABLE_SCOPE_PIPELINE.MD. Runs after
-#   verify so confirmed takeovers are kept out of both scanners.
+#   standard / waf / api profiles) per TENABLE_SCOPE_PIPELINE.MD.
 # ===========================================================================
 if should_run "scope" && [[ "${PIPELINE_MODE}" == "recon" ]]; then
     log_stage "TENABLE SCOPE ROUTING"
@@ -1456,7 +1431,6 @@ log "  WAF detect:   $(count_lines "${WAF_JSONL}" 2>/dev/null || echo 0) origins
 log "  TLS certs:    $(count_lines "${TLS_JSONL}" 2>/dev/null || echo 0)"
 log "  Nuclei finds: $(count_lines "${NUCLEI_JSONL}" 2>/dev/null || echo 0)"
 log "  Assets:       $(count_lines "${ASSETS_JSONL}" 2>/dev/null || echo 0)"
-log "  Takeover chk: $(count_lines "${VERIFY_JSONL}" 2>/dev/null || echo 0) verified"
 log "  Tenable VM:   $(count_lines "${OUTPUT_DIR}/tenable_vm_include.txt" 2>/dev/null || echo 0) IPs  WAS: $(cat "${OUTPUT_DIR}"/tenable_was_*targets.txt 2>/dev/null | wc -l | tr -d ' ') URLs"
 log "  Livecheck:    $(count_lines "${LIVECHECK_JSONL}" 2>/dev/null || echo 0) checked"
 log "  Screenshots:  $(find "${SCREENSHOT_DIR}" -name '*.png' 2>/dev/null | wc -l | tr -d ' ')"

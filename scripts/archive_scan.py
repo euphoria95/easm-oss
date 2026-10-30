@@ -41,7 +41,6 @@ INTERMEDIATE_FILES = [
     "service_detection.jsonl",
     "nuclei.jsonl",
     "assets.jsonl",
-    "takeover_verifications.jsonl",
     "bounty_report.jsonl",
     "tenable_scope.jsonl",
     "tenable_vm_targets.jsonl",

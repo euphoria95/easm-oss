@@ -100,7 +100,6 @@ const PIPELINE_STAGES = [
     { id: 'aimap',       name: 'AI Agent Discovery',     tool: 'aimap' },
     { id: 'normalize',   name: 'Normalization',          tool: 'normalize.py', required: true },
     { id: 'load',        name: 'DuckDB Load',            tool: 'load_duckdb.py', required: true },
-    { id: 'verify',      name: 'Takeover Verification',  tool: 'verify.py' },
     { id: 'scope',       name: 'Tenable Scope Routing',  tool: 'cmdb_scope_export.py' },
 ];
 
@@ -240,7 +239,6 @@ const ICONS = {
     tls: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>',
     cmdb: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>',
     network: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>',
-    takeovers: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/><line x1="2" y1="2" x2="22" y2="22" stroke="#ef4444" stroke-width="2"/></svg>',
     newScan: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>',
     play: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="w-4 h-4"><polygon points="5 3 19 12 5 21 5 3"/></svg>',
     archive: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" class="w-4 h-4"><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/></svg>',
@@ -444,7 +442,6 @@ function renderSidebar() {
             { id: 'cmdb', label: 'CMDB Gaps', icon: ICONS.cmdb },
         ]},
         { label: 'Respond', links: [
-            { id: 'takeovers', label: 'Takeovers', icon: ICONS.takeovers },
             { id: 'bounty', label: 'Bug Bounty', icon: ICONS.bounty },
             { id: 'livecheck', label: 'Livecheck', icon: ICONS.livecheck },
             { id: 'tenable', label: 'Tenable Scope', icon: ICONS.tenable },
@@ -545,7 +542,6 @@ async function renderCurrentPage() {
             case 'tls': await pageTLS(content); break;
             case 'cmdb': await pageCMDB(content); break;
             case 'network': await pageNetwork(content); break;
-            case 'takeovers': await pageTakeovers(content); break;
             case 'services': await pageServices(content); break;
             case 'aimap': await pageAimap(content); break;
             case 'cloud': await pageCloud(content); break;
@@ -2522,200 +2518,6 @@ window.switchNetworkTab = function(tab) {
 };
 
 // ---------------------------------------------------------------------------
-// Page: Takeover Verifications
-// ---------------------------------------------------------------------------
-let takeoverFilter = '';
-
-async function pageTakeovers(el) {
-    const data = await api('/takeovers', { status: takeoverFilter });
-    const items = data.items || [];
-    const summary = data.summary || [];
-    const verifiedAt = data.verified_at;
-
-    const counts = { confirmed: 0, likely_fp: 0, unverified: 0 };
-    summary.forEach(r => { counts[r.status] = (counts[r.status] || 0) + r.count; });
-    const highConf = summary.filter(r => r.status === 'confirmed' && r.confidence === 'high').reduce((a, r) => a + r.count, 0);
-
-    el.innerHTML = `
-        <div class="flex items-center justify-between mb-6">
-            <div>
-                <h1 class="text-2xl font-bold text-white">Subdomain Takeover Verification</h1>
-                <p class="text-sm text-slate-500 mt-1">
-                    Live-verified DNS + HTTP fingerprint results
-                    ${verifiedAt ? `&middot; Last run: ${fmtDate(verifiedAt)}` : '&middot; <span class="text-yellow-500">Not yet verified — run <code class="font-mono">./run.sh --stage verify</code></span>'}
-                </p>
-            </div>
-            <div class="text-xs text-slate-500 font-mono bg-surface-light px-3 py-2 rounded-lg border border-surface-border">
-                ./run.sh --stage verify
-            </div>
-        </div>
-
-        ${!items.length && !verifiedAt ? `
-            <div class="card p-10 text-center">
-                <div class="text-5xl mb-4">🔗</div>
-                <p class="text-slate-300 font-medium mb-2">No verification data yet</p>
-                <p class="text-sm text-slate-500 mb-4">Run the verify stage to perform live DNS + HTTP fingerprint checks on takeover candidates.</p>
-                <code class="text-xs font-mono bg-[#0B100E] px-4 py-2 rounded border border-surface-border text-accent">./run.sh --stage verify</code>
-            </div>
-        ` : `
-
-        <!-- KPI Cards -->
-        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
-            <div class="card kpi-card p-4" data-color="red">
-                <div class="text-xs font-medium text-slate-500 uppercase tracking-wider mb-2">Confirmed</div>
-                <div class="text-2xl font-bold text-red-400" data-counter="${counts.confirmed}">0</div>
-                <div class="text-xs text-slate-500">${highConf} high confidence</div>
-            </div>
-            <div class="card kpi-card p-4" data-color="yellow">
-                <div class="text-xs font-medium text-slate-500 uppercase tracking-wider mb-2">Unverified</div>
-                <div class="text-2xl font-bold text-yellow-400" data-counter="${counts.unverified}">0</div>
-                <div class="text-xs text-slate-500">Could not reach host</div>
-            </div>
-            <div class="card kpi-card p-4" data-color="green">
-                <div class="text-xs font-medium text-slate-500 uppercase tracking-wider mb-2">Likely False Positive</div>
-                <div class="text-2xl font-bold text-green-400" data-counter="${counts.likely_fp}">0</div>
-                <div class="text-xs text-slate-500">No fingerprint match</div>
-            </div>
-            <div class="card kpi-card p-4" data-color="cyan">
-                <div class="text-xs font-medium text-slate-500 uppercase tracking-wider mb-2">Total Checked</div>
-                <div class="text-2xl font-bold text-white" data-counter="${items.length || (counts.confirmed + counts.likely_fp + counts.unverified)}">0</div>
-                <div class="text-xs text-slate-500">Candidates processed</div>
-            </div>
-        </div>
-
-        <!-- Chart + Legend -->
-        ${counts.confirmed || counts.likely_fp || counts.unverified ? `
-        <div class="card p-5 mb-4">
-            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 items-center">
-                <div>
-                    <h3 class="text-sm font-semibold text-slate-300 mb-4">Verification Status Breakdown</h3>
-                    <div class="chart-container" style="height: 200px;">
-                        <canvas id="chart-takeover-status"></canvas>
-                    </div>
-                </div>
-                <div class="space-y-3 text-sm">
-                    <div class="flex items-start gap-3">
-                        <span class="mt-0.5 w-2.5 h-2.5 rounded-full bg-red-500 shrink-0"></span>
-                        <div><span class="text-white font-medium">Confirmed</span> — CNAME target is NXDOMAIN and/or HTTP fingerprint matched an unclaimed-resource page.</div>
-                    </div>
-                    <div class="flex items-start gap-3">
-                        <span class="mt-0.5 w-2.5 h-2.5 rounded-full bg-yellow-400 shrink-0"></span>
-                        <div><span class="text-white font-medium">Unverified</span> — Host could not be reached (connection timeout or DNS failure). Re-check manually.</div>
-                    </div>
-                    <div class="flex items-start gap-3">
-                        <span class="mt-0.5 w-2.5 h-2.5 rounded-full bg-green-500 shrink-0"></span>
-                        <div><span class="text-white font-medium">Likely FP</span> — No CNAME found, active CDN/provider serving real content, or fingerprint did not match.</div>
-                    </div>
-                </div>
-            </div>
-        </div>
-        ` : ''}
-
-        <!-- Filter Tabs -->
-        <div class="tab-bar">
-            <button class="tab-btn ${!takeoverFilter ? 'active' : ''}" onclick="filterTakeovers('')">
-                All (${counts.confirmed + counts.likely_fp + counts.unverified})
-            </button>
-            <button class="tab-btn ${takeoverFilter === 'confirmed' ? 'active' : ''}" onclick="filterTakeovers('confirmed')">
-                Confirmed (${counts.confirmed})
-            </button>
-            <button class="tab-btn ${takeoverFilter === 'unverified' ? 'active' : ''}" onclick="filterTakeovers('unverified')">
-                Unverified (${counts.unverified})
-            </button>
-            <button class="tab-btn ${takeoverFilter === 'likely_fp' ? 'active' : ''}" onclick="filterTakeovers('likely_fp')">
-                Likely FP (${counts.likely_fp})
-            </button>
-        </div>
-
-        <!-- Table -->
-        <div class="card overflow-hidden">
-            <div class="overflow-x-auto" style="max-height: 620px; overflow-y: auto;">
-                <table class="data-table">
-                    <thead>
-                        <tr>
-                            <th>Status</th>
-                            <th>Confidence</th>
-                            <th>FQDN</th>
-                            <th>Service</th>
-                            <th>Live CNAME Chain</th>
-                            <th>HTTP</th>
-                            <th>Fingerprint</th>
-                            <th>Evidence</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        ${items.length ? items.map(r => `
-                            <tr class="clickable" onclick="navigateTo('detail', {id: '${esc(r.fqdn)}'})">
-                                <td>${takeoverStatusBadge(r.status)}</td>
-                                <td>${takeoverConfBadge(r.confidence)}</td>
-                                <td class="font-mono text-xs text-accent">${esc(r.fqdn)}</td>
-                                <td class="text-xs text-slate-400">${esc(r.service || '-')}</td>
-                                <td class="font-mono text-xs text-slate-400 max-w-[200px] truncate">${(r.live_cname_chain || []).join(' → ') || '<span class="text-slate-600">none</span>'}</td>
-                                <td class="font-mono text-xs ${r.http_status_code === -1 ? 'text-slate-600' : r.http_status_code >= 400 ? 'text-orange-400' : 'text-slate-300'}">${r.http_status_code === -1 ? 'N/A' : r.http_status_code}</td>
-                                <td>${r.http_fingerprint_matched ? `<span class="text-red-400 text-xs font-medium">✓ ${esc(r.http_matched_snippet)}</span>` : '<span class="text-slate-600 text-xs">—</span>'}</td>
-                                <td class="text-xs text-slate-500 max-w-[280px]">${(r.evidence || []).slice(0, 2).map(e => esc(e)).join('<br>')}</td>
-                            </tr>
-                        `).join('') : `<tr><td colspan="8">${renderEmptyState('No results', 'Try a different filter')}</td></tr>`}
-                    </tbody>
-                </table>
-            </div>
-        </div>
-        `}
-    `;
-
-    requestAnimationFrame(() => {
-        document.querySelectorAll('[data-counter]').forEach(el => {
-            const val = parseFloat(el.getAttribute('data-counter'));
-            if (!isNaN(val)) animateCounter(el, val);
-        });
-    });
-
-    if (counts.confirmed || counts.likely_fp || counts.unverified) {
-        createChart('chart-takeover-status', {
-            type: 'doughnut',
-            data: {
-                labels: ['Confirmed', 'Unverified', 'Likely FP'],
-                datasets: [{
-                    data: [counts.confirmed, counts.unverified, counts.likely_fp],
-                    backgroundColor: ['#ef4444', '#eab308', '#10b981'],
-                    borderWidth: 0,
-                    hoverOffset: 6,
-                }],
-            },
-            options: {
-                ...CHART_DEFAULTS,
-                cutout: '65%',
-                plugins: {
-                    ...CHART_DEFAULTS.plugins,
-                    legend: { ...CHART_DEFAULTS.plugins.legend, position: 'right' },
-                },
-            },
-        });
-    }
-}
-
-function takeoverStatusBadge(status) {
-    const map = {
-        confirmed:  'badge-critical',
-        unverified: 'badge-medium',
-        likely_fp:  'badge-info',
-    };
-    const labels = { confirmed: 'CONFIRMED', unverified: 'UNVERIFIED', likely_fp: 'LIKELY FP' };
-    return `<span class="badge ${map[status] || 'badge-info'}">${labels[status] || esc(status)}</span>`;
-}
-
-function takeoverConfBadge(conf) {
-    const map = { high: 'text-red-400', medium: 'text-yellow-400', low: 'text-slate-500' };
-    return `<span class="text-xs font-semibold ${map[conf] || 'text-slate-500'}">${esc(conf || '-')}</span>`;
-}
-
-window.filterTakeovers = function(status) {
-    takeoverFilter = status;
-    const el = document.getElementById('page-content');
-    if (el) pageTakeovers(el);
-};
-
-// ---------------------------------------------------------------------------
 // Page: Services / Fingerprints
 // ---------------------------------------------------------------------------
 let serviceState = { service: '', search: '', limit: 500 };
@@ -4336,7 +4138,7 @@ async function pageArchive(el, scanId) {
         </div>
 
         <div class="flex items-center gap-0 mb-5 border-b border-surface-border">
-            ${['overview', 'assets', 'findings', 'tls', 'takeovers'].map((tab, i) => `
+            ${['overview', 'assets', 'findings', 'tls'].map((tab, i) => `
                 <button class="archive-tab px-4 py-2.5 text-sm font-medium transition-colors border-b-2 -mb-px
                     ${i === 0 ? 'text-white border-accent' : 'text-slate-500 border-transparent hover:text-slate-300 hover:border-slate-600'}"
                     data-tab="${tab}"
@@ -4559,30 +4361,6 @@ window.setArchiveTab = async function(scanId, tab, page) {
                 });
             });
 
-        } else if (tab === 'takeovers') {
-            const data = await api(`/scans/${scanId}/takeovers`, { limit: 200 });
-            content.innerHTML = `
-                <div class="card overflow-hidden">
-                    <div class="overflow-x-auto">
-                        <table class="data-table">
-                            <thead><tr>
-                                <th>FQDN</th><th>Service</th><th>Status</th><th>Confidence</th><th>CNAME</th>
-                            </tr></thead>
-                            <tbody>
-                                ${data.items.length ? data.items.map(t => `
-                                    <tr>
-                                        <td class="font-mono text-xs text-accent">${esc(t.fqdn)}</td>
-                                        <td class="text-slate-400 text-xs">${esc(t.service || '-')}</td>
-                                        <td><span class="badge badge-${t.status === 'confirmed' ? 'critical' : t.status === 'unverified' ? 'medium' : 'low'}">${esc(t.status)}</span></td>
-                                        <td class="text-xs text-slate-400">${esc(t.confidence || '-')}</td>
-                                        <td class="font-mono text-xs text-slate-500 truncate max-w-[200px]">${esc(t.stored_cname || '-')}</td>
-                                    </tr>
-                                `).join('') : `<tr><td colspan="5">${renderEmptyState('No takeover candidates', '')}</td></tr>`}
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-            `;
         }
     } catch (e) {
         content.innerHTML = renderErrorState(e.message);
@@ -5349,12 +5127,11 @@ const TS_CATEGORIES = {
     third_party:    { label: '3rd-party / hosting', color: '#F472B6' },
     cloud_paas:     { label: 'Cloud PaaS',          color: '#FBBF24' },
     static_or_dead: { label: 'Static / dead',       color: '#667A72' },
-    takeover:       { label: 'Takeover',            color: '#ef4444' },
 };
 
 const TS_REASONS = {
     cdn: 'CDN edge', waf: 'WAF', third_party: '3rd-party', cloud_paas: 'Cloud PaaS',
-    takeover: 'Takeover', non_routable: 'Non-routable IP', ownership_unverified: 'Ownership unverified',
+    non_routable: 'Non-routable IP', ownership_unverified: 'Ownership unverified',
     dead: 'Dead', no_open_ports: 'No open ports', redirect_only: 'Redirect only', parked: 'Parked',
     not_in_cmdb: 'Not in CMDB', non_http_only: 'No HTTP service', default_page: 'Default server page',
     no_app_content: 'No app content', cloud_storage: 'Cloud storage', static_hosting: 'Static hosting',
@@ -5438,7 +5215,7 @@ function tsModeStrip(meta) {
             </div>
             ${enforced ? '' : `
                 <p class="text-xs text-slate-400 mt-2">
-                    IPs are routed on observed signals only (CDN, WAF, 3rd-party, PaaS, takeover). Confirm ownership of
+                    IPs are routed on observed signals only (CDN, WAF, 3rd-party, PaaS). Confirm ownership of
                     <span class="font-mono">VM targets</span> before importing them. Gate unknown IPs with
                     <span class="font-mono">TENABLE_OWNED_CIDRS</span> / <span class="font-mono">TENABLE_OWNED_ASNS</span>
                     and <span class="font-mono">TENABLE_VM_REQUIRE_OWNED=true</span>.

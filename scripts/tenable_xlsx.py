@@ -205,7 +205,6 @@ ALL_COLUMNS = [
     Column("WAF provider", "waf_provider", width=14, note="WAF detected above TENABLE_WAF_MIN_CONFIDENCE"),
     Column("Platforms", "platforms", "list", 22,
            note="Managed platforms as platform:class (cloud_enum, hostname suffix, ASN org)"),
-    Column("Takeover status", "takeover_status", width=12, note="confirmed / candidate subdomain takeover"),
     Column("VM decision", "vm_action", width=11, colors=VM_COLORS,
            note="include = network-scan its IPs; review = confirm ownership; exclude = keep out of VM"),
     Column("VM IPs", "vm_ips", "list", 22, "IPs of this asset in the VM include list"),

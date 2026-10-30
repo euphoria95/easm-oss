@@ -345,14 +345,6 @@ class BountyScorer:
             pts += 5
             highlights.append(f"Sensitive subdomain naming: {matched[0]}")
 
-        takeover = any(
-            isinstance(f, dict) and "takeover" in _safe_str(f.get("template_id") or "")
-            for f in findings
-        )
-        if takeover:
-            pts += 5
-            highlights.append("Subdomain takeover candidate detected")
-
         return min(pts, 25), highlights
 
     def _has_auth(self, asset: dict) -> bool:
@@ -417,9 +409,6 @@ class BountyScorer:
                     f"Check {fp['product']} {fp['version']} against known CVEs — verify patch status"
                 )
                 break
-
-        if any("takeover" in h.lower() for h in highlights):
-            recs.append("Claim the dangling resource to confirm subdomain takeover")
 
         tls_entries = _safe_list(asset.get("tls"))
         tls_issues = [t for t in tls_entries if isinstance(t, dict)

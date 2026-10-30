@@ -925,84 +925,6 @@ def software_inventory(db=Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
-# API — Takeover Verifications
-# ---------------------------------------------------------------------------
-
-def _get_takeovers(con, status: str, limit: int) -> dict:
-    has_table = safe_query(
-        con,
-        "SELECT 1 FROM information_schema.tables WHERE table_name = 'takeover_verifications'",
-    )
-    if not has_table:
-        return {"items": [], "summary": {}, "verified_at": None}
-
-    where = []
-    params: list = []
-    if status:
-        where.append("status = ?")
-        params.append(status)
-
-    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
-    items = safe_query(
-        con,
-        f"""
-        SELECT
-            fqdn,
-            service,
-            stored_cname,
-            live_cname_chain,
-            cname_target_nxdomain,
-            http_fingerprint_matched,
-            http_matched_snippet,
-            http_status_code,
-            status,
-            confidence,
-            evidence
-        FROM takeover_verifications
-        {where_sql}
-        ORDER BY
-            CASE status WHEN 'confirmed' THEN 1 WHEN 'unverified' THEN 2 ELSE 3 END,
-            CASE confidence WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
-            fqdn
-        LIMIT ?
-        """,
-        params + [limit],
-    )
-
-    summary = safe_query(
-        con,
-        """
-        SELECT status, confidence, COUNT(*) AS count
-        FROM takeover_verifications
-        GROUP BY status, confidence
-        ORDER BY status, confidence
-        """,
-    )
-
-    verified_at = safe_query(
-        con,
-        """
-        SELECT takeover_verified_at
-        FROM assets
-        WHERE takeover_verified_at IS NOT NULL
-        LIMIT 1
-        """,
-    )
-    last_run = verified_at[0]["takeover_verified_at"] if verified_at else None
-
-    return {"items": items, "summary": summary, "verified_at": last_run}
-
-
-@app.get("/api/takeovers", response_class=ORJSONResponse)
-def list_takeovers(
-    db=Depends(get_db),
-    status: str = Query(""),
-    limit: int = Query(500, ge=1, le=2000),
-):
-    return _get_takeovers(db, status, limit)
-
-
-# ---------------------------------------------------------------------------
 # API — Bug Bounty
 # ---------------------------------------------------------------------------
 
@@ -2126,15 +2048,6 @@ def archive_tls(scan_id: str, limit: int = Query(200, ge=1, le=1000)):
 @app.get("/api/scans/{scan_id}/network/ports", response_class=ORJSONResponse)
 def archive_network_ports(scan_id: str, port: int = Query(None)):
     return _get_network_ports(_open_archive_db(scan_id), port)
-
-
-@app.get("/api/scans/{scan_id}/takeovers", response_class=ORJSONResponse)
-def archive_takeovers(
-    scan_id: str,
-    status: str = Query(""),
-    limit: int = Query(500, ge=1, le=2000),
-):
-    return _get_takeovers(_open_archive_db(scan_id), status, limit)
 
 
 # ---------------------------------------------------------------------------

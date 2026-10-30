@@ -260,42 +260,6 @@ def generate_nuclei(httpx_records, output_path):
     return records
 
 
-TAKEOVER_SERVICES = ["github", "heroku", "netlify", "s3", "azure", "shopify", "fastly"]
-
-
-def generate_takeover_findings(domains, nuclei_path):
-    """
-    Append nuclei-style subdomain-takeover findings (template-id 'takeovers/*') for a
-    few hosts, and pick a few decoy hosts that get none.
-
-    Takeover candidates reach the pipeline as nuclei findings, so these are what
-    verify_takeovers.py picks up. Returns (vulnerable_fqdns, clean_fqdns) so a test
-    can assert the first set shows up as findings and the second set never does.
-    """
-    candidates = random.sample(domains, min(7, len(domains)))
-    vulnerable = candidates[:4]
-    clean = candidates[4:]
-
-    with open(nuclei_path, "a") as f:
-        for i, fqdn in enumerate(vulnerable):
-            service = TAKEOVER_SERVICES[i % len(TAKEOVER_SERVICES)]
-            f.write(json.dumps({
-                "template-id": f"takeovers/{service}-takeover",
-                "template": f"{service}-takeover",
-                "info": {
-                    "name": f"{service.title()} Subdomain Takeover",
-                    "severity": "high",
-                    "tags": ["takeover", service],
-                    "description": f"{fqdn} points at an unclaimed {service} resource",
-                },
-                "host": fqdn,
-                "matched-at": f"https://{fqdn}",
-                "timestamp": random_date_recent(),
-            }) + "\n")
-
-    return vulnerable, clean
-
-
 def generate_zgrab_ssh(port_records, output_dir):
     records = []
     for prec in port_records:
@@ -365,16 +329,10 @@ def main():
     nuclei_recs = generate_nuclei(httpx_recs, output_dir / "nuclei.jsonl")
     print(f"  Nuclei: {len(nuclei_recs)} records", file=sys.stderr)
 
-    vulnerable_fqdns, clean_fqdns = generate_takeover_findings(
-        [r["host"] for r in dns_recs], output_dir / "nuclei.jsonl"
-    )
-    print(f"  Takeover findings: {len(vulnerable_fqdns)} (appended to nuclei.jsonl)", file=sys.stderr)
-
     zgrab_recs = generate_zgrab_ssh(port_recs, zgrab_dir)
     print(f"  zgrab2 SSH: {len(zgrab_recs)} records", file=sys.stderr)
 
     print(f"\nSynthetic data written to {output_dir}/", file=sys.stderr)
-    print(f"Vulnerable FQDNs (expected in findings): {vulnerable_fqdns}", file=sys.stderr)
     print("Run the normalizer:", file=sys.stderr)
     print(f"  python3 scripts/normalize.py \\", file=sys.stderr)
     print(f"    --dns {output_dir}/dns.jsonl \\", file=sys.stderr)
@@ -385,15 +343,6 @@ def main():
     print(f"    --nuclei {output_dir}/nuclei.jsonl \\", file=sys.stderr)
     print(f"    --cmdb data/input/cmdb_export.csv \\", file=sys.stderr)
     print(f"    --output {output_dir}/assets.jsonl", file=sys.stderr)
-
-    # Write manifest for test assertions
-    manifest = {
-        "vulnerable_fqdns": vulnerable_fqdns,
-        "non_vulnerable_fqdns": clean_fqdns,
-    }
-    with open(output_dir / "test_manifest.json", "w") as f:
-        json.dump(manifest, f, indent=2)
-    print(f"  Manifest: {output_dir}/test_manifest.json", file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -169,46 +169,6 @@ QUERIES = {
             ORDER BY host_count DESC
         """,
     },
-    "takeovers": {
-        "desc": "Subdomain takeover candidates (subzy vulnerable=true + nuclei takeover templates)",
-        "sql": """
-            WITH expanded AS (
-                SELECT fqdn, UNNEST(findings) AS f FROM assets WHERE len(findings) > 0
-            )
-            SELECT
-                fqdn,
-                f.name,
-                f.severity,
-                f.matched_at,
-                f.service,
-                f.cname
-            FROM expanded
-            WHERE (f.source = 'nuclei' AND f.template_id LIKE '%takeover%')
-               OR (f.source = 'subzy'  AND f.vulnerable = true)
-            ORDER BY fqdn
-        """,
-    },
-    "verified_takeovers": {
-        "desc": "Confirmed takeovers after live DNS + HTTP fingerprint verification",
-        "sql": """
-            SELECT
-                fqdn,
-                service,
-                stored_cname,
-                live_cname_chain,
-                cname_target_nxdomain,
-                http_fingerprint_matched,
-                http_matched_snippet,
-                http_status_code,
-                status,
-                confidence,
-                evidence
-            FROM v_confirmed_takeovers
-            ORDER BY
-                CASE confidence WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
-                fqdn
-        """,
-    },
 }
 
 
