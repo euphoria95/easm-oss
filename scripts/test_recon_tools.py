@@ -203,13 +203,25 @@ done
 """
 
 
+# naabu omits "host" when the input is a bare IP — only "ip" is set
+FAKE_NAABU = r"""#!/usr/bin/env bash
+while [[ $# -gt 0 ]]; do [[ "$1" == "-o" ]] && out="$2"; shift; done
+cat > "$out" <<'JSON'
+{"host":"www.example.com","ip":"203.0.113.9","port":443,"protocol":"tcp","tls":false}
+{"ip":"198.51.100.7","port":80,"protocol":"tcp","tls":false}
+{"ip":"198.51.100.7","port":22,"protocol":"tcp","tls":false}
+JSON
+"""
+
+
 class RunShStages(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmp.name)
         bindir = self.tmp / "bin"
         bindir.mkdir()
-        for name, body in (("subfinder", FAKE_SUBFINDER), ("cdncheck", FAKE_CDNCHECK), ("waf-detect", FAKE_WAF)):
+        for name, body in (("subfinder", FAKE_SUBFINDER), ("cdncheck", FAKE_CDNCHECK), ("waf-detect", FAKE_WAF),
+                           ("naabu", FAKE_NAABU)):
             f = bindir / name
             f.write_text(body)
             f.chmod(f.stat().st_mode | stat.S_IEXEC)
@@ -293,6 +305,13 @@ class RunShStages(unittest.TestCase):
         for line in (self.tmp / "waf.args").read_text().splitlines():
             self.assertEqual(line.strip(), "scan --stdin --ndjson")
         self.assertFalse((self.out / "_waf_shards").exists())
+
+    def test_ports_web_targets_fall_back_to_ip(self):
+        (self.out / "live_hosts.txt").write_text("www.example.com\n198.51.100.7\n")
+        out = self._run("--stage", "ports")
+        self.assertEqual((self.out / "web_targets.txt").read_text().split(),
+                         ["198.51.100.7:80", "www.example.com:443"])
+        self.assertIn("web_targets=2", out)
 
     def test_waf_skipped_without_http_data(self):
         out = self._run("--stage", "waf")

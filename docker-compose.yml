@@ -93,7 +93,7 @@ services:
       - "--port"
       - "7171"
     ports:
-      - "7171:7171"
+      - "127.0.0.1:7171:7171"
     volumes:
       - ./data:/easm/data
     networks:

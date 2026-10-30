@@ -64,6 +64,11 @@ def _uniq(values) -> list:
     return list(dict.fromkeys(v for v in values if v not in (None, "")))
 
 
+def _tech_names(w: dict) -> list:
+    """normalize.py stores tech as {name, version, categories}; accept bare strings too."""
+    return _uniq(t.get("name") if isinstance(t, dict) else t for t in _list(w.get("tech")))
+
+
 # ---------------------------------------------------------------------------
 # Asset enrichment
 # ---------------------------------------------------------------------------
@@ -74,7 +79,7 @@ def _web_summary(web: list) -> dict:
         "http_status": _uniq(_int(w.get("status_code")) for w in entries),
         "title": next((w["title"] for w in entries if w.get("title")), None),
         "server": _uniq(w.get("server") for w in entries),
-        "tech": _uniq(t for w in entries for t in _list(w.get("tech"))),
+        "tech": _uniq(t for w in entries for t in _tech_names(w)),
         "content_type": _uniq((w.get("content_type") or "").split(";")[0].strip() for w in entries),
     }
 
@@ -168,7 +173,7 @@ def tenable_workbook_data(con) -> dict:
                 "url_status": _int(w.get("status_code")),
                 "url_title": w.get("title"),
                 "url_server": w.get("server"),
-                "url_tech": _list(w.get("tech")),
+                "url_tech": _tech_names(w),
                 "url_content_type": (w.get("content_type") or "").split(";")[0].strip() or None,
             })
     was.sort(key=lambda r: ({"standard": 0, "waf": 1, "api": 2}.get(r.get("was_profile"), 9),

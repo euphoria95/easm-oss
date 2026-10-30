@@ -88,6 +88,8 @@ subdomains.txt / IPs / CIDRs ─────────────────
 
 ## Quick Start
 
+> Launching on a remote server? Follow [Deploying on a Server](#deploying-on-a-server).
+
 ### 1. Prerequisites
 
 - Docker & Docker Compose
@@ -98,9 +100,8 @@ subdomains.txt / IPs / CIDRs ─────────────────
 ```bash
 git clone <repo-url> && cd easm-oss
 
-# Edit your configuration
-cp config/pipeline.env config/pipeline.env.local
-vim config/pipeline.env.local
+# Edit your configuration (run.sh sources config/pipeline.env)
+vim config/pipeline.env
 
 # Add your subdomains
 vim data/input/subdomains.txt
@@ -211,6 +212,93 @@ python3 scripts/load_duckdb.py \
     --db data/output/easm.duckdb \
     --scan-id test_run
 ```
+
+## Deploying on a Server
+
+Step-by-step launch on a fresh Ubuntu server. On Debian, replace `ubuntu` with
+`debian` in both Docker URLs.
+
+**Requirements:** ~4 GB RAM and ~15 GB free disk for the image build; outbound
+internet for the build (Docker Hub, GitHub, Go proxy, crates.io, Debian mirrors)
+and to the targets you scan. Inbound, only **SSH (22)** needs to be open — the
+dashboard listens on the server's loopback and is reached through an SSH tunnel.
+
+### 1. Install Docker
+
+```bash
+sudo apt-get update && sudo apt-get install -y ca-certificates curl git openssl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+  | sudo tee /etc/apt/sources.list.d/docker.list
+sudo apt-get update && sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo usermod -aG docker $USER && newgrp docker
+docker run --rm hello-world && docker compose version
+```
+
+### 2. Clone and configure
+
+```bash
+git clone https://github.com/euphoria95/easm-oss.git && cd easm-oss
+vim config/pipeline.env          # USER_AGENT, rate limits, TENABLE_OWNED_CIDRS/ASNS, ...
+
+# Dashboard token — docker compose reads .env automatically
+echo "DASHBOARD_TOKEN=$(openssl rand -hex 32)" > .env && chmod 600 .env
+cat .env                         # keep this token; the UI asks for it
+
+# Optional: subfinder API keys
+cp config/subfinder-provider-config.example.yaml config/subfinder-provider-config.yaml
+```
+
+### 3. Build and start
+
+The first build compiles the Go and Rust tools and takes ~10–20 minutes.
+
+```bash
+docker compose up -d --build
+docker compose ps
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9990/   # expect 200
+```
+
+### 4. (Optional) Run the test suite on the server
+
+```bash
+for t in nerva_ingest ip_implementation ct_enrich livecheck dashboard_scan_input recon_tools tenable_scope xlsx_workbook; do
+  docker run --rm -v "$PWD":/easm -w /easm --entrypoint python3 easm-pipeline:local scripts/test_$t.py >/dev/null 2>&1 \
+    && echo "OK   $t" || echo "FAIL $t"
+done
+```
+
+### 5. Open the dashboard via SSH tunnel
+
+From your workstation:
+
+```bash
+ssh -N -L 9990:127.0.0.1:9990 user@server
+# then open http://localhost:9990 and paste the DASHBOARD_TOKEN
+```
+
+Optional screenshot gallery — start it on the server and add a second forward:
+
+```bash
+docker compose --profile gallery up -d gowitness             # on the server
+ssh -N -L 9990:127.0.0.1:9990 -L 7171:127.0.0.1:7171 user@server
+# http://localhost:7171
+```
+
+| Port (server loopback) | Service | Needed |
+|---|---|---|
+| `9990` | Dashboard | yes |
+| `7171` | gowitness gallery (`--profile gallery`) | optional |
+
+### Day-to-day
+
+- **Update:** `git pull && docker compose up -d --build`. `config/`, `scripts/`,
+  `dashboard/` and `run.sh` are bind-mounted, so config edits apply on the next
+  scan without a rebuild.
+- **Logs:** `docker compose logs -f dashboard`; per-scan logs land in `logs/`.
+- **Stop:** `docker compose down` (data in `data/` is kept).
+- `data/` and `logs/` are created by the container as root — use `sudo` to delete them.
 
 ## Pipeline Stages
 

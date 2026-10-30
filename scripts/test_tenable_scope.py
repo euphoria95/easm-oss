@@ -333,7 +333,7 @@ class _PipelineDb(unittest.TestCase):
             ("ssh.example.com", 22), ("old.example.com", 443)]])
         w("httpx.jsonl", [
             {"input": "app.example.com", "url": "https://app.example.com", "port": 443, "status_code": 200,
-             "content_type": "text/html", "title": "App"},
+             "content_type": "text/html", "title": "App", "tech": ["Nginx:1.27.5", "React"]},
             {"input": "api.example.com", "url": "https://api.example.com", "port": 443, "status_code": 200,
              "content_type": "application/json"},
             {"input": "cf.example.com", "url": "https://cf.example.com", "port": 443, "status_code": 200,
@@ -508,6 +508,9 @@ class DashboardApi(_PipelineDb):
         self.assertEqual((shared["vm_category"], shared["owned"]), ("owned_shared", True))
         app = next(a for a in data["assets"] if a["fqdn"] == "app.example.com")
         self.assertEqual((app["http_status"], app["title"]), ([200], "App"))
+        self.assertEqual(app["tech"], ["Nginx:1.27.5", "React"])
+        std = next(r for r in data["was"] if r["was_profile"] == "standard")
+        self.assertEqual(std["url_tech"], ["Nginx:1.27.5", "React"])
 
     def _query(self, sql):
         return self.con.execute(sql).fetchall()

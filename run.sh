@@ -651,7 +651,7 @@ if should_run "ports"; then
         # Build web target list
         WEB_PORTS_PATTERN=$(echo "${WEB_PORTS}" | sed 's/,/|/g')
         jq -r --arg ports "${WEB_PORTS_PATTERN}" \
-            'select(.port | tostring | test("^(" + $ports + ")$")) | "\(.host):\(.port)"' \
+            'select(.port | tostring | test("^(" + $ports + ")$")) | "\(.host // .ip):\(.port)"' \
             "${PORTS_JSONL}" | sort -u > "${WEB_TARGETS}"
 
         OPEN_PORTS=$(count_lines "${PORTS_JSONL}")
@@ -844,7 +844,7 @@ if should_run "tls"; then
         TLS_PORTS_PATTERN=$(echo "${TLS_PORTS}" | sed 's/,/|/g')
         TLS_TARGETS_FILE="${OUTPUT_DIR}/_tls_targets.txt"
         jq -r --arg ports "${TLS_PORTS_PATTERN}" \
-            'select(.port | tostring | test("^(" + $ports + ")$")) | "\(.host):\(.port)"' \
+            'select(.port | tostring | test("^(" + $ports + ")$")) | "\(.host // .ip):\(.port)"' \
             "${PORTS_JSONL}" | sort -u > "${TLS_TARGETS_FILE}"
 
         if [[ ! -s "${TLS_TARGETS_FILE}" ]]; then
@@ -983,7 +983,7 @@ with open(sys.argv[2], 'rb') as f, open(sys.argv[3], 'w') as out:
             ZGRAB_TOTAL=0
             for module in "${!ZGRAB_MODULES[@]}"; do
                 port="${ZGRAB_MODULES[$module]}"
-                HOSTS=$(jq -r "select(.port==${port}) | .host // empty" "${PORTS_JSONL}" 2>/dev/null | sort -u)
+                HOSTS=$(jq -r "select(.port==${port}) | .host // .ip // empty" "${PORTS_JSONL}" 2>/dev/null | sort -u)
                 if [[ -z "${HOSTS}" ]]; then continue; fi
 
                 OUTPUT_FILE="${ZGRAB_DIR}/zgrab_${module}.jsonl"
