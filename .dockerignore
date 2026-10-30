@@ -14,6 +14,11 @@ __pycache__/
 data/
 logs/
 
+# Upstream tool sources (compiled from remote repos in the Dockerfile)
+subfinder/
+cdncheck/
+waf-detector/
+
 # OS artifacts
 .DS_Store
 

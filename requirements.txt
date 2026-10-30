@@ -11,3 +11,4 @@ python-multipart>=0.0.12
 uvicorn[standard]>=0.32.0
 dnspython>=2.6.0
 requests>=2.32.0
+XlsxWriter>=3.2.0

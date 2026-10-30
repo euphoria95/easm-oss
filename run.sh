@@ -3,14 +3,14 @@
 # EASM Pipeline Orchestrator
 # =============================================================================
 # Funnel-based EASM discovery pipeline:
-#   CT → DNS → ASN → Port Scan → HTTP Probe → TLS → nerva → Nuclei
-#   → Normalize → DuckDB
+#   subfinder → CT → DNS → ASN → cdncheck → Port Scan → HTTP Probe
+#   → waf-detect → TLS → nerva → Nuclei → Normalize → DuckDB
 #
 # Usage:
 #   ./run.sh                          # full pipeline
 #   ./run.sh --stage dns              # run single stage
 #   ./run.sh --stage dns,ports        # run multiple stages
-#   ROOT_DOMAINS=example.com ./run.sh # also enrich targets from CT logs (crt.sh)
+#   ROOT_DOMAINS=example.com ./run.sh # also enrich targets via subfinder + CT logs (crt.sh)
 #   ./run.sh --dry-run                # print what would run
 # =============================================================================
 
@@ -72,13 +72,18 @@ RDNS_JSONL="${OUTPUT_DIR}/rdns.jsonl"
 AIMAP_JSONL="${OUTPUT_DIR}/aimap.jsonl"
 CLOUD_ENUM_JSONL="${OUTPUT_DIR}/cloud_enum.jsonl"
 CT_SUBDOMAINS="${OUTPUT_DIR}/ct_subdomains.txt"
+SUBFINDER_JSONL="${OUTPUT_DIR}/subfinder.jsonl"
+SUBFINDER_SUBDOMAINS="${OUTPUT_DIR}/subfinder_subdomains.txt"
+CDNCHECK_JSONL="${OUTPUT_DIR}/cdncheck.jsonl"
+WAF_JSONL="${OUTPUT_DIR}/waf.jsonl"
+SUBFINDER_PROVIDER_CONFIG="${CONFIG_DIR}/subfinder-provider-config.yaml"
 
 SCAN_ID="$(date -u +%Y%m%d_%H%M%S)"
 SCAN_LOG="${LOG_DIR}/scan_${SCAN_ID}.log"
 SCAN_MARKER="${OUTPUT_DIR}/scan_id.txt"
 
 # CLI args
-STAGE_ORDER="ct,dns,asn,rdns,ports,http,tls,fingerprint,nuclei,cloud_enum,aimap,normalize,load,verify"
+STAGE_ORDER="subfinder,ct,dns,asn,rdns,cdn,ports,http,waf,tls,fingerprint,nuclei,cloud_enum,aimap,normalize,load,verify,scope"
 STAGE_FILTER=""
 FROM_STAGE=""
 DRY_RUN=false
@@ -267,7 +272,7 @@ if [[ "${PIPELINE_MODE}" == "livecheck" ]]; then
     log "LIVECHECK MODE — lightweight DNS-only CMDB scope validation"
     # If no explicit --stage filter, restrict to DNS + enrichment + livecheck stages
     if [[ -z "${STAGE_FILTER}" ]]; then
-        STAGE_FILTER="dns,asn,rdns,normalize,load"
+        STAGE_FILTER="dns,asn,rdns,cdn,normalize,load"
     fi
 fi
 
@@ -312,7 +317,8 @@ if [[ -z "${STAGE_FILTER}" ]] && [[ -z "${FROM_STAGE}" ]]; then
                       "${PORTS_JSONL}" "${WEB_TARGETS}" "${HTTPX_JSONL}" \
                       "${TLS_JSONL}" "${NERVA_JSONL}" "${SERVICE_DETECT_JSONL}" \
                       "${NUCLEI_JSONL}" "${ASSETS_JSONL}" "${VERIFY_JSONL}" "${CLOUD_ENUM_JSONL}" \
-                      "${CT_SUBDOMAINS}"
+                      "${CT_SUBDOMAINS}" "${SUBFINDER_JSONL}" "${SUBFINDER_SUBDOMAINS}" \
+                      "${CDNCHECK_JSONL}" "${WAF_JSONL}"
                 mkdir -p "${ZGRAB_DIR}"
             fi
         fi
@@ -335,7 +341,64 @@ if [[ ! -f "${TARGETS_FILE}" ]]; then
 fi
 
 # ===========================================================================
-# STAGE 0: Passive enrichment — Certificate Transparency logs (crt.sh)
+# STAGE 0: Passive enrichment — subfinder (passive sources)
+#   Same opt-in as CT: only runs when ROOT_DOMAINS is set, and only names
+#   under those domains are added. crt.sh is excluded here because the ct
+#   stage already owns it. Skipped in livecheck mode.
+# ===========================================================================
+if should_run "subfinder" && [[ "${PIPELINE_MODE}" != "livecheck" ]]; then
+    log_stage "PASSIVE SUBDOMAIN ENUMERATION (subfinder)"
+    stage_start=$(date +%s)
+    debug_stage_start "subfinder"
+
+    rm -f "${SUBFINDER_JSONL}" "${SUBFINDER_SUBDOMAINS}"
+    if [[ -z "${ROOT_DOMAINS// /}" ]]; then
+        log "ROOT_DOMAINS not set — skipping subfinder"
+        debug_stage_end "subfinder" "$(elapsed ${stage_start})" "(skipped)"
+    else
+        SUBFINDER_DOMAINS_FILE="${OUTPUT_DIR}/_subfinder_domains.txt"
+        echo "${ROOT_DOMAINS}" | tr ', ' '\n\n' | tr '[:upper:]' '[:lower:]' \
+            | sed 's/^\*\.//;s/\.$//' | grep -v '^$' | sort -u > "${SUBFINDER_DOMAINS_FILE}"
+
+        SUBFINDER_ARGS=(
+            -dL "${SUBFINDER_DOMAINS_FILE}"
+            -oJ -cs -silent -duc
+            -es crtsh
+            -timeout "${SUBFINDER_TIMEOUT:-30}"
+            -max-time "${SUBFINDER_MAX_TIME:-10}"
+            -t "${SUBFINDER_THREADS:-10}"
+        )
+        [[ "${SUBFINDER_ALL:-false}" == "true" ]] && SUBFINDER_ARGS+=(-all)
+        [[ -f "${SUBFINDER_PROVIDER_CONFIG}" ]] && SUBFINDER_ARGS+=(-pc "${SUBFINDER_PROVIDER_CONFIG}")
+
+        timeout "${SUBFINDER_TOTAL_TIMEOUT:-900}" subfinder "${SUBFINDER_ARGS[@]}" \
+            2>>"${SCAN_LOG}" > "${SUBFINDER_JSONL}" || \
+            log "WARN: subfinder exited non-zero — continuing with partial results"
+
+        # Scope filter: keep only the root domains themselves or names under them
+        jq -r --rawfile roots "${SUBFINDER_DOMAINS_FILE}" '
+            ($roots | split("\n") | map(select(length > 0))) as $r
+            | (.host // "" | ascii_downcase | rtrimstr(".")) as $h
+            | select($h != "" and any($r[]; . as $d | $h == $d or ($h | endswith("." + $d))))
+            | $h
+        ' "${SUBFINDER_JSONL}" 2>>"${SCAN_LOG}" | sort -u > "${SUBFINDER_SUBDOMAINS}" || true
+        rm -f "${SUBFINDER_DOMAINS_FILE}"
+
+        INPUT_COUNT=$(count_lines "${TARGETS_FILE}")
+        if [[ -s "${SUBFINDER_SUBDOMAINS}" ]]; then
+            cat "${TARGETS_FILE}" "${SUBFINDER_SUBDOMAINS}" | sort -u > "${TARGETS_FILE}.merged"
+            mv "${TARGETS_FILE}.merged" "${TARGETS_FILE}"
+        fi
+        TOTAL_COUNT=$(count_lines "${TARGETS_FILE}")
+        SUBFINDER_ADDED=$(( TOTAL_COUNT - INPUT_COUNT ))
+        debug_substep "subfinder: input=${INPUT_COUNT} found=$(count_lines "${SUBFINDER_SUBDOMAINS}") added=${SUBFINDER_ADDED}"
+        debug_stage_end "subfinder" "$(elapsed ${stage_start})"
+        log "subfinder complete | input=${INPUT_COUNT} found=$(count_lines "${SUBFINDER_SUBDOMAINS}") added=${SUBFINDER_ADDED} total=${TOTAL_COUNT} elapsed=$(elapsed ${stage_start})s"
+    fi
+fi
+
+# ===========================================================================
+# STAGE 0.5: Passive enrichment — Certificate Transparency logs (crt.sh)
 #   Opt-in: only queries the root domains listed in ROOT_DOMAINS, and only
 #   names under those domains are added. Skipped in livecheck mode (which
 #   validates the registered CMDB FQDNs, not newly discovered ones).
@@ -512,6 +575,44 @@ if should_run "rdns"; then
 fi
 
 # ===========================================================================
+# STAGE 1.9: CDN / Cloud / WAF classification (cdncheck)
+#   Matches live FQDNs and IPs against cdncheck's provider IP-range index.
+#   Output feeds the multi-signal CDN detector and WAF verdicts in normalize.
+# ===========================================================================
+if should_run "cdn"; then
+    log_stage "CDN/CLOUD/WAF CLASSIFICATION (cdncheck)"
+    stage_start=$(date +%s)
+    debug_stage_start "cdn"
+
+    rm -f "${CDNCHECK_JSONL}"
+    if [[ ! -f "${LIVE_HOSTS}" ]] || [[ $(count_lines "${LIVE_HOSTS}") -eq 0 ]]; then
+        log "WARN: No live hosts — skipping cdncheck"
+        debug_stage_end "cdn" "$(elapsed ${stage_start})" "(skipped)"
+    else
+        # cdncheck -r takes a comma-separated list, not a file path — a path is
+        # silently treated as one (unusable) resolver and every FQDN lookup fails.
+        CDNCHECK_RESOLVERS=$(grep -vE '^[[:space:]]*(#|$)' "${RESOLVERS}" | paste -sd, -)
+        CDNCHECK_ARGS=(
+            -i "${LIVE_HOSTS}"
+            -jsonl -resp -silent -duc -nc
+            -retry "${DNS_RETRIES:-2}"
+        )
+        [[ -n "${CDNCHECK_RESOLVERS}" ]] && CDNCHECK_ARGS+=(-r "${CDNCHECK_RESOLVERS}")
+        # -t (threads) exists on cdncheck main but not in release v1.3.3
+        if cdncheck -h 2>&1 | grep -qE '(^|[ ,])-t[ ,]'; then
+            CDNCHECK_ARGS+=(-t "${CDNCHECK_THREADS:-50}")
+        fi
+        cdncheck "${CDNCHECK_ARGS[@]}" 2>>"${SCAN_LOG}" > "${CDNCHECK_JSONL}" || \
+            log "WARN: cdncheck exited non-zero (partial results may be available)"
+
+        CDN_HITS=$(jq -c 'select(.cdn or .waf)' "${CDNCHECK_JSONL}" 2>/dev/null | wc -l | tr -d ' ')
+        debug_substep "cdncheck: input=$(count_lines "${LIVE_HOSTS}") classified=$(count_lines "${CDNCHECK_JSONL}") cdn_or_waf=${CDN_HITS}"
+        debug_stage_end "cdn" "$(elapsed ${stage_start})"
+        log "cdncheck complete | classified=$(count_lines "${CDNCHECK_JSONL}") cdn_or_waf=${CDN_HITS} elapsed=$(elapsed ${stage_start})s"
+    fi
+fi
+
+# ===========================================================================
 # STAGE 2: Port Scanning (naabu)
 # ===========================================================================
 if should_run "ports"; then
@@ -680,6 +781,53 @@ if should_run "http"; then
             fi
         fi
     fi
+fi
+
+# ===========================================================================
+# STAGE 3.5: WAF Detection (waf-detector)
+#   PASSIVE detection only (headers, body, DNS, TLS, timing on normal
+#   requests). Never add --payload-analysis, --smoke-test, --effectiveness,
+#   or the hardening/va subcommands here — those send attack payloads and are
+#   out of scope for EASM recon.
+# ===========================================================================
+if should_run "waf" && [[ "${PIPELINE_MODE}" != "livecheck" ]]; then
+    log_stage "WAF DETECTION (waf-detect)"
+    stage_start=$(date +%s)
+    debug_stage_start "waf"
+
+    rm -f "${WAF_JSONL}"
+    WAF_TARGETS_FILE="${OUTPUT_DIR}/_waf_targets.txt"
+    if [[ -f "${HTTPX_JSONL}" ]]; then
+        # One URL per scheme://host:port origin
+        jq -r 'select(.url != null) | .url | capture("^(?<o>[a-zA-Z]+://[^/?#]+)").o' \
+            "${HTTPX_JSONL}" 2>/dev/null | sort -u | head -n "${WAF_MAX_TARGETS:-2000}" > "${WAF_TARGETS_FILE}"
+    fi
+
+    if [[ ! -s "${WAF_TARGETS_FILE}" ]]; then
+        log "WARN: No HTTP origins — skipping WAF detection"
+        debug_stage_end "waf" "$(elapsed ${stage_start})" "(skipped)"
+    else
+        # waf-detect emits results only when a whole batch finishes and its
+        # internal concurrency is fixed at 3, so feed it small chunks in
+        # parallel with a per-chunk timeout — a hung chunk loses only itself.
+        WAF_SHARD_DIR="${OUTPUT_DIR}/_waf_shards"
+        rm -rf "${WAF_SHARD_DIR}" && mkdir -p "${WAF_SHARD_DIR}"
+        split -l "${WAF_BATCH_SIZE:-25}" "${WAF_TARGETS_FILE}" "${WAF_SHARD_DIR}/in_"
+        find "${WAF_SHARD_DIR}" -name 'in_*' ! -name '*.out' -print0 \
+            | xargs -0 -r -P "${WAF_WORKERS:-4}" -I{} \
+                sh -c 'timeout "$1" waf-detect scan --stdin --ndjson < "$2" > "$2.out"' \
+                _ "${WAF_BATCH_TIMEOUT:-300}" {} 2>>"${SCAN_LOG}" || \
+            log "WARN: some waf-detect batches failed or timed out (partial results kept)"
+        # Keep only JSON lines (tolerates any non-JSON chatter on stdout)
+        cat "${WAF_SHARD_DIR}"/in_*.out 2>/dev/null | grep '^{' > "${WAF_JSONL}" || true
+        rm -rf "${WAF_SHARD_DIR}"
+
+        WAF_HITS=$(jq -c 'select(.detected_waf != null)' "${WAF_JSONL}" 2>/dev/null | wc -l | tr -d ' ')
+        debug_substep "waf-detect: origins=$(count_lines "${WAF_TARGETS_FILE}") results=$(count_lines "${WAF_JSONL}") waf=${WAF_HITS}"
+        debug_stage_end "waf" "$(elapsed ${stage_start})"
+        log "WAF detection complete | origins=$(count_lines "${WAF_TARGETS_FILE}") results=$(count_lines "${WAF_JSONL}") waf_detected=${WAF_HITS} elapsed=$(elapsed ${stage_start})s"
+    fi
+    rm -f "${WAF_TARGETS_FILE}"
 fi
 
 # ===========================================================================
@@ -1073,6 +1221,9 @@ if should_run "normalize"; then
     [[ -f "${AIMAP_JSONL}" ]] && NORMALIZE_ARGS+=(--aimap "${AIMAP_JSONL}")
     [[ -f "${CLOUD_ENUM_JSONL}" ]] && NORMALIZE_ARGS+=(--cloud-enum "${CLOUD_ENUM_JSONL}")
     [[ -s "${CT_SUBDOMAINS}" ]] && NORMALIZE_ARGS+=(--ct "${CT_SUBDOMAINS}")
+    [[ -s "${SUBFINDER_SUBDOMAINS}" ]] && NORMALIZE_ARGS+=(--subfinder "${SUBFINDER_SUBDOMAINS}")
+    [[ -s "${CDNCHECK_JSONL}" ]] && NORMALIZE_ARGS+=(--cdncheck "${CDNCHECK_JSONL}")
+    [[ -s "${WAF_JSONL}" ]] && NORMALIZE_ARGS+=(--waf "${WAF_JSONL}")
     [[ -f "${CMDB_EXPORT}" ]] && NORMALIZE_ARGS+=(--cmdb "${CMDB_EXPORT}")
     [[ -f "${ASN_JSONL}" ]]   && NORMALIZE_ARGS+=(--asn "${ASN_JSONL}")
     [[ -f "${RDNS_JSONL}" ]]  && NORMALIZE_ARGS+=(--rdns "${RDNS_JSONL}")
@@ -1172,6 +1323,41 @@ if should_run "verify"; then
 fi
 
 # ===========================================================================
+# STAGE 10.5: Tenable scan-scope routing (recon mode only)
+#   Routes every asset to Tenable VM (unique IPs) and/or Tenable WAS (URLs,
+#   standard / waf / api profiles) per TENABLE_SCOPE_PIPELINE.MD. Runs after
+#   verify so confirmed takeovers are kept out of both scanners.
+# ===========================================================================
+if should_run "scope" && [[ "${PIPELINE_MODE}" == "recon" ]]; then
+    log_stage "TENABLE SCOPE ROUTING"
+    stage_start=$(date +%s)
+    debug_stage_start "scope"
+
+    if [[ ! -f "${DUCKDB_PATH}" ]]; then
+        log "WARN: DuckDB not found — skipping Tenable scope routing"
+        debug_stage_end "scope" "$(elapsed ${stage_start})" "(skipped)"
+    else
+        SCOPE_ARGS=(
+            --db "${DUCKDB_PATH}"
+            --output-dir "${OUTPUT_DIR}"
+            --cdn-min-confidence "${TENABLE_CDN_MIN_CONFIDENCE:-0.35}"
+            --waf-min-confidence "${TENABLE_WAF_MIN_CONFIDENCE:-0.5}"
+        )
+        [[ -n "${TENABLE_OWNED_CIDRS:-}" ]] && SCOPE_ARGS+=(--owned-cidrs "${TENABLE_OWNED_CIDRS}")
+        [[ -n "${TENABLE_OWNED_ASNS:-}" ]]  && SCOPE_ARGS+=(--owned-asns "${TENABLE_OWNED_ASNS}")
+        [[ "${TENABLE_SCOPE_CMDB_ONLY:-false}" == "true" ]]  && SCOPE_ARGS+=(--cmdb-only)
+        [[ "${TENABLE_VM_REQUIRE_OWNED:-false}" == "true" ]] && SCOPE_ARGS+=(--require-owned)
+        [[ "${TENABLE_WAS_INCLUDE_SAAS:-false}" == "true" ]] && SCOPE_ARGS+=(--was-include-saas)
+
+        python3 "${SCRIPT_DIR}/scripts/cmdb_scope_export.py" "${SCOPE_ARGS[@]}" 2>>"${SCAN_LOG}" || \
+            log "WARN: Tenable scope routing completed with warnings"
+
+        debug_stage_end "scope" "$(elapsed ${stage_start})"
+        log "Scope routing complete | vm_include=$(count_lines "${OUTPUT_DIR}/tenable_vm_include.txt") vm_exclude=$(count_lines "${OUTPUT_DIR}/tenable_vm_exclude.txt") was=$(count_lines "${OUTPUT_DIR}/tenable_was_targets.txt") was_waf=$(count_lines "${OUTPUT_DIR}/tenable_was_waf_targets.txt") was_api=$(count_lines "${OUTPUT_DIR}/tenable_was_api_targets.txt") xlsx=$([[ -f "${OUTPUT_DIR}/tenable_scope.xlsx" ]] && echo yes || echo no) elapsed=$(elapsed ${stage_start})s"
+    fi
+fi
+
+# ===========================================================================
 # STAGE 11: Bounty Scoring (bounty mode only)
 # ===========================================================================
 if [[ "${PIPELINE_MODE}" == "bounty" ]] && should_run "load"; then
@@ -1261,13 +1447,17 @@ log "  Scan ID:      ${SCAN_ID}"
 log "  Mode:         ${PIPELINE_MODE}"
 log "  Wall clock:   ${PIPELINE_ELAPSED}s"
 log "  Targets:      $(count_lines "${TARGETS_FILE}")"
+log "  Subfinder:    $(count_lines "${SUBFINDER_SUBDOMAINS}" 2>/dev/null || echo 0) in-scope names"
 log "  Live hosts:   $(count_lines "${LIVE_HOSTS}" 2>/dev/null || echo 0)"
+log "  CDN check:    $(count_lines "${CDNCHECK_JSONL}" 2>/dev/null || echo 0) classified"
 log "  Open ports:   $(count_lines "${PORTS_JSONL}" 2>/dev/null || echo 0)"
 log "  HTTP probed:  $(count_lines "${HTTPX_JSONL}" 2>/dev/null || echo 0)"
+log "  WAF detect:   $(count_lines "${WAF_JSONL}" 2>/dev/null || echo 0) origins"
 log "  TLS certs:    $(count_lines "${TLS_JSONL}" 2>/dev/null || echo 0)"
 log "  Nuclei finds: $(count_lines "${NUCLEI_JSONL}" 2>/dev/null || echo 0)"
 log "  Assets:       $(count_lines "${ASSETS_JSONL}" 2>/dev/null || echo 0)"
 log "  Takeover chk: $(count_lines "${VERIFY_JSONL}" 2>/dev/null || echo 0) verified"
+log "  Tenable VM:   $(count_lines "${OUTPUT_DIR}/tenable_vm_include.txt" 2>/dev/null || echo 0) IPs  WAS: $(cat "${OUTPUT_DIR}"/tenable_was_*targets.txt 2>/dev/null | wc -l | tr -d ' ') URLs"
 log "  Livecheck:    $(count_lines "${LIVECHECK_JSONL}" 2>/dev/null || echo 0) checked"
 log "  Screenshots:  $(find "${SCREENSHOT_DIR}" -name '*.png' 2>/dev/null | wc -l | tr -d ' ')"
 log "  DuckDB:       ${DUCKDB_PATH}"

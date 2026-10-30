@@ -1,0 +1,33 @@
+# =============================================================================
+# subfinder provider API keys
+# =============================================================================
+# Copy to config/subfinder-provider-config.yaml (gitignored) and fill in the
+# sources you have keys for. run.sh passes it to subfinder via -pc only when
+# that file exists; without it subfinder uses its keyless sources only.
+#
+# Each source takes a list of keys (rotated). Full list: `subfinder -ls`.
+# =============================================================================
+bevigil: []
+binaryedge: []
+bufferover: []
+c99: []
+censys: []          # format: API_ID:API_SECRET
+certspotter: []
+chaos: []
+chinaz: []
+dnsdb: []
+fofa: []            # format: EMAIL:KEY
+fullhunt: []
+github: []
+hunter: []
+intelx: []          # format: HOST:API_KEY
+leakix: []
+netlas: []
+passivetotal: []    # format: USERNAME:KEY
+quake: []
+securitytrails: []
+shodan: []
+threatbook: []
+virustotal: []
+whoisxmlapi: []
+zoomeyeapi: []

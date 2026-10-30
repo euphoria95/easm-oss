@@ -27,6 +27,11 @@ def load_assets(con: duckdb.DuckDBPyConnection, jsonl_path: str, scan_id: str):
         return
 
     con.execute("DROP TABLE IF EXISTS assets")
+    # Scope routing is derived from the previous scan's assets — the scope
+    # stage rebuilds it for this one.
+    con.execute("DROP TABLE IF EXISTS tenable_scope")
+    con.execute("DROP TABLE IF EXISTS tenable_vm_targets")
+    con.execute("DROP TABLE IF EXISTS tenable_scope_meta")
     con.execute(f"""
         CREATE TABLE assets AS
         SELECT * FROM read_ndjson_auto('{jsonl_path}',
@@ -53,6 +58,16 @@ def _has_column(con: duckdb.DuckDBPyConnection, table: str, column: str) -> bool
         return False
 
 
+def _has_expr(con: duckdb.DuckDBPyConnection, table: str, expr: str) -> bool:
+    """Check that a (struct) expression binds — fields that were null in every
+    record are inferred as JSON/NULL by read_ndjson_auto and have no sub-fields."""
+    try:
+        con.execute(f"SELECT {expr} FROM \"{table}\" LIMIT 0")
+        return True
+    except Exception:
+        return False
+
+
 def create_views(con: duckdb.DuckDBPyConnection):
     """Create analytical views (must be called after assets table exists).
 
@@ -73,6 +88,15 @@ def create_views(con: duckdb.DuckDBPyConnection):
         "            NULL AS cloud_providers,"
     )
 
+    has_waf = _has_expr(con, "assets", "network.waf.provider, network.waf.confidence")
+    waf_summary_cols = (
+        "network.waf.provider AS waf_provider,\n"
+        "            network.waf.confidence AS waf_confidence,"
+    ) if has_waf else (
+        "NULL::VARCHAR AS waf_provider,\n"
+        "            NULL::DOUBLE AS waf_confidence,"
+    )
+
     con.execute(f"""
         CREATE OR REPLACE VIEW v_asset_summary AS
         SELECT
@@ -87,6 +111,7 @@ def create_views(con: duckdb.DuckDBPyConnection):
             network.cdn AS cdn,
             network.cdn_detection.provider AS cdn_provider,
             network.cdn_detection.confidence AS cdn_confidence,
+            {waf_summary_cols}
             network.shared_hosting.detected AS shared_hosting_detected,
             network.shared_hosting.confidence AS shared_hosting_confidence,
             network.shared_hosting.cohosted_count AS cohosted_count,
@@ -310,6 +335,40 @@ def create_views(con: duckdb.DuckDBPyConnection):
     except Exception:
         pass
 
+    # WAF verdicts (cdncheck IP ranges + waf-detector fingerprinting)
+    if has_waf:
+        try:
+            has_cdncheck = _has_expr(con, "assets", "network.cdncheck.cloud")
+            cloud_col = "network.cdncheck.cloud" if has_cdncheck else "NULL::VARCHAR"
+            con.execute(f"""
+                CREATE OR REPLACE VIEW v_waf_analysis AS
+                SELECT
+                    fqdn,
+                    network.waf.provider AS waf_provider,
+                    network.waf.confidence AS waf_confidence,
+                    network.waf.sources AS waf_sources,
+                    network.waf.url AS waf_url,
+                    network.cdn AS cdn,
+                    {cloud_col} AS cloud_provider,
+                    network.asn.org AS asn_org,
+                    dns.a AS ips
+                FROM assets
+                WHERE network.waf IS NOT NULL
+                ORDER BY waf_provider, fqdn
+            """)
+        except Exception:
+            pass
+    else:
+        con.execute("""
+            CREATE OR REPLACE VIEW v_waf_analysis AS
+            SELECT NULL::VARCHAR AS fqdn, NULL::VARCHAR AS waf_provider,
+                   NULL::DOUBLE AS waf_confidence, NULL::VARCHAR[] AS waf_sources,
+                   NULL::VARCHAR AS waf_url, NULL::VARCHAR AS cdn,
+                   NULL::VARCHAR AS cloud_provider, NULL::VARCHAR AS asn_org,
+                   NULL::VARCHAR[] AS ips
+            WHERE false
+        """)
+
     try:
         con.execute("""
             CREATE OR REPLACE VIEW v_shared_hosting AS
@@ -364,6 +423,7 @@ def create_views(con: duckdb.DuckDBPyConnection):
         create_cloud_views(con)
     create_bounty_views(con)
     create_livecheck_views(con)
+    create_tenable_views(con)
 
 
 def create_cloud_views(con: duckdb.DuckDBPyConnection):
@@ -581,6 +641,91 @@ def create_livecheck_views(con: duckdb.DuckDBPyConnection):
 
     except Exception as e:
         print(f"WARN: Could not create livecheck views: {e}", file=sys.stderr)
+
+
+TENABLE_VIEWS = (
+    "v_tenable_vm_scope", "v_tenable_vm_exclusions", "v_tenable_vm_review",
+    "v_tenable_was_scope_standard", "v_tenable_was_scope_waf",
+    "v_tenable_was_scope_api", "v_tenable_scope_summary",
+)
+
+
+def create_tenable_views(con: duckdb.DuckDBPyConnection):
+    """Tenable VM / WAS routing views over the tables written by
+    cmdb_scope_export.py (scope stage). Without those tables (scope stage not
+    run since the last load) the views are dropped rather than left dangling."""
+    has_tables = con.execute("""
+        SELECT COUNT(*) FROM information_schema.tables
+        WHERE table_name IN ('tenable_scope', 'tenable_vm_targets')
+    """).fetchone()[0] == 2
+    if not has_tables:
+        for view in TENABLE_VIEWS:
+            con.execute(f"DROP VIEW IF EXISTS {view}")
+        return
+
+    try:
+        # VM: one row per unique IP (an owned LB serving 100 FQDNs is scanned once)
+        con.execute("""
+            CREATE OR REPLACE VIEW v_tenable_vm_scope AS
+            SELECT target_ip, primary_fqdn, vm_category, fqdn_count, fqdns,
+                   ports, asn_org, owned
+            FROM tenable_vm_targets
+            WHERE action = 'include'
+            ORDER BY target_ip
+        """)
+
+        con.execute("""
+            CREATE OR REPLACE VIEW v_tenable_vm_exclusions AS
+            SELECT target_ip, reasons, primary_fqdn, fqdn_count, fqdns, asn_org, owned
+            FROM tenable_vm_targets
+            WHERE action = 'exclude'
+            ORDER BY target_ip
+        """)
+
+        con.execute("""
+            CREATE OR REPLACE VIEW v_tenable_vm_review AS
+            SELECT target_ip, primary_fqdn, fqdn_count, fqdns, ports, asn_org
+            FROM tenable_vm_targets
+            WHERE action = 'review'
+            ORDER BY target_ip
+        """)
+
+        # WAS: one row per target URL, split by scan profile
+        for profile, view, extra in (
+            ("standard", "v_tenable_was_scope_standard", "cdn_provider"),
+            ("waf", "v_tenable_was_scope_waf", "waf_provider, cdn_provider"),
+            ("api", "v_tenable_was_scope_api", "platforms"),
+        ):
+            con.execute(f"""
+                CREATE OR REPLACE VIEW {view} AS
+                WITH expanded AS (
+                    SELECT *, UNNEST(was_urls) AS target_url
+                    FROM tenable_scope
+                    WHERE was_action = 'include' AND was_profile = '{profile}'
+                )
+                SELECT target_url, fqdn, category, {extra}, in_cmdb
+                FROM expanded
+                ORDER BY fqdn, target_url
+            """)
+
+        con.execute("""
+            CREATE OR REPLACE VIEW v_tenable_scope_summary AS
+            SELECT
+                category,
+                COUNT(*) AS assets,
+                COUNT(*) FILTER (WHERE vm_action = 'include') AS vm_include,
+                COUNT(*) FILTER (WHERE vm_action = 'exclude') AS vm_exclude,
+                COUNT(*) FILTER (WHERE vm_action = 'review') AS vm_review,
+                COUNT(*) FILTER (WHERE was_profile = 'standard') AS was_standard,
+                COUNT(*) FILTER (WHERE was_profile = 'waf') AS was_waf,
+                COUNT(*) FILTER (WHERE was_profile = 'api') AS was_api,
+                COUNT(*) FILTER (WHERE was_action = 'exclude') AS was_exclude
+            FROM tenable_scope
+            GROUP BY category
+            ORDER BY assets DESC
+        """)
+    except Exception as e:
+        print(f"WARN: Could not create Tenable scope views: {e}", file=sys.stderr)
 
 
 def create_bounty_views(con: duckdb.DuckDBPyConnection):

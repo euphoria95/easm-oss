@@ -102,6 +102,43 @@ QUERIES = {
             ORDER BY asset_count DESC
         """,
     },
+    "waf_distribution": {
+        "desc": "WAF provider distribution (cdncheck + waf-detector)",
+        "sql": """
+            SELECT
+                waf_provider,
+                COUNT(*) AS asset_count,
+                ROUND(AVG(waf_confidence), 2) AS avg_confidence,
+                COUNT(*) FILTER (WHERE list_contains(waf_sources, 'waf-detector')) AS fingerprinted
+            FROM v_waf_analysis
+            GROUP BY waf_provider
+            ORDER BY asset_count DESC
+        """,
+    },
+    "tenable_scope": {
+        "desc": "Tenable VM/WAS routing by asset category",
+        "sql": "SELECT * FROM v_tenable_scope_summary",
+    },
+    "tenable_vm": {
+        "desc": "Tenable VM scope — unique IPs to network-scan",
+        "sql": "SELECT * FROM v_tenable_vm_scope",
+    },
+    "tenable_vm_exclusions": {
+        "desc": "IPs kept out of Tenable VM, with reasons",
+        "sql": "SELECT * FROM v_tenable_vm_exclusions",
+    },
+    "tenable_was": {
+        "desc": "Tenable WAS targets by scan profile",
+        "sql": """
+            SELECT 'standard' AS profile, target_url, fqdn, category, NULL AS waf_provider
+            FROM v_tenable_was_scope_standard
+            UNION ALL
+            SELECT 'waf', target_url, fqdn, category, waf_provider FROM v_tenable_was_scope_waf
+            UNION ALL
+            SELECT 'api', target_url, fqdn, category, NULL FROM v_tenable_was_scope_api
+            ORDER BY profile, fqdn
+        """,
+    },
     "asn_distribution": {
         "desc": "ASN/hosting provider distribution",
         "sql": """

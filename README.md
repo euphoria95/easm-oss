@@ -5,6 +5,8 @@ Open-source EASM discovery and CMDB reconciliation pipeline built on the Project
 ## Architecture
 
 ```
+ROOT_DOMAINS (opt-in) ──→ subfinder + crt.sh ──┐  passive subdomain discovery
+                                               ▼
 subdomains.txt / IPs / CIDRs ────────────────────────→ targets.txt
                                                           │
                                                           ▼
@@ -24,6 +26,11 @@ subdomains.txt / IPs / CIDRs ─────────────────
                                                          │ rdns.jsonl
                                                          ▼
                                                     ┌──────────┐
+                                                    │ cdncheck  │  CDN / cloud / WAF
+                                                    └────┬─────┘  (provider IP ranges)
+                                                         │ cdncheck.jsonl
+                                                         ▼
+                                                    ┌──────────┐
                                                     │  naabu    │  Port Scanning
                                                     └────┬─────┘  (top ports, CDN-aware)
                                                          │ ports.jsonl
@@ -35,6 +42,10 @@ subdomains.txt / IPs / CIDRs ─────────────────
                                    │+CDN test │               │    fingerprints  │  CPE/vendor/version
                                    └────┬─────┘               │  + misconfigs    │  OS hints
                                         │                     └────┬─────────────┘
+                                   ┌────┴─────┐                    │
+                                   │waf-detect│                    │  Passive WAF/CDN
+                                   └────┬─────┘                    │  fingerprinting
+                                        │                          │
                                    ┌────┴─────┐                    │
                                    │  tlsx    │                    │
                                    └────┬─────┘                    │
@@ -57,7 +68,7 @@ subdomains.txt / IPs / CIDRs ─────────────────
                                         ▼                          ▼
                             ┌────────────────────────────────────────┐
                             │   normalize.py                         │  Merge all JSONL
-                            │   + CMDB reconciliation                │  + CDN detection
+                            │   + CMDB reconciliation                │  + CDN/WAF verdicts
                             │   1 record/FQDN                        │
                             └────────────┬─────────────────────────┘
                                          │ assets.jsonl
@@ -98,9 +109,13 @@ vim data/input/subdomains.txt
 # Add your CMDB export (optional)
 vim data/input/cmdb_export.csv
 
-# Optional: enrich targets from Certificate Transparency logs (crt.sh).
-# Set the root domains per scan in the dashboard ("Root domains"), or via env:
+# Optional: enrich targets via subfinder (passive sources) and Certificate
+# Transparency logs (crt.sh). Set the root domains per scan in the dashboard
+# ("Root domains"), or via env:
 #   ROOT_DOMAINS=example.com,example.org ./run.sh
+
+# Optional: subfinder API keys (more sources → more subdomains)
+cp config/subfinder-provider-config.example.yaml config/subfinder-provider-config.yaml
 ```
 
 ### 3. Run with Docker (one-click)
@@ -126,6 +141,9 @@ to run from the scan form (defaults to full pipeline).
 # Build with Ubuntu 24.04 runtime base (uses Google Chrome instead of Chromium)
 RUNTIME_BASE=ubuntu:24.04 docker compose build
 
+# Pin the tools compiled from their upstream repos (defaults: latest / pinned sha)
+SUBFINDER_VERSION=<tag> CDNCHECK_VERSION=<tag> WAF_DETECTOR_REF=<git-sha> docker compose build
+
 # Run pipeline from CLI (without the dashboard)
 docker compose --profile cli run --rm easm-pipeline
 docker compose --profile cli run --rm easm-pipeline --stage dns,ports,http
@@ -137,6 +155,7 @@ docker compose --profile cli run --rm easm-pipeline --dry-run
 
 Notes:
 - Default runtime base is `debian:bookworm-slim` (works on both x86_64 and arm64).
+- subfinder and cdncheck are compiled with `go install` and waf-detector with `cargo build` from their upstream repositories inside the image build — no local checkout is needed. Local clones in `subfinder/`, `cdncheck/` or `waf-detector/` are git- and docker-ignored.
 - `ubuntu:24.04` is supported via `RUNTIME_BASE=ubuntu:24.04`; the image installs Google Chrome instead of snap-based Chromium.
 
 ### 4. Run Natively
@@ -153,6 +172,10 @@ go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest
 go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 go install github.com/sensepost/gowitness/v3@latest
 go install github.com/praetorian-inc/nerva/cmd/nerva@latest
+go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+go install github.com/projectdiscovery/cdncheck/cmd/cdncheck@latest
+# waf-detector (Rust)
+cargo install --locked --git https://github.com/ammarion/waf-detector --bin waf-detect
 # optional: zgrab2 fallback (set FINGERPRINT_BACKEND=zgrab2 in pipeline.env to use)
 # go install github.com/zmap/zgrab2/cmd/zgrab2@latest
 # optional: aimap (exposed-AI-agent discovery stage) — vendored separately into aimap/
@@ -192,26 +215,30 @@ python3 scripts/load_duckdb.py \
 
 ## Pipeline Stages
 
-Stage order: `ct,dns,asn,rdns,ports,http,tls,fingerprint,nuclei,cloud_enum,aimap,normalize,load,verify`
+Stage order: `subfinder,ct,dns,asn,rdns,cdn,ports,http,waf,tls,fingerprint,nuclei,cloud_enum,aimap,normalize,load,verify,scope`
 
 | Stage | Name | Tool | Purpose |
 |-------|------|------|---------|
-| 0 | `ct` | ct_enrich.py (crt.sh) | Passive Certificate Transparency lookup for the configured root domains; adds new in-scope hostnames to the targets. Opt-in — skipped unless `ROOT_DOMAINS` is set |
-| 1 | `dns` | dnsx | Resolve A/AAAA/CNAME/NS/MX/TXT, filter to live hosts |
-| 2 | `asn` | pyasn | Enrich IPs with ASN, prefix, organization (offline BGP RIB) |
-| 3 | `rdns` | getdns | Reverse DNS lookup on IP addresses → PTR records |
-| 4 | `ports` | naabu | TCP SYN scan top-100 ports, CDN-aware |
-| 5 | `http` | httpx | Full-signal probe: status, title, tech, headers, JARM, screenshot |
-| 6 | `tls` | tlsx | Deep cert analysis: SANs, expiry, misconfig flags |
-| 7 | `fingerprint` | nerva | Auto-detect all protocols: SSH, FTP, DB, Redis, SMB — CPE/vendor/version/OS fingerprints. Alias: `zgrab` |
-| 8 | `nuclei` | nuclei | Low-noise scan: takeovers, exposed panels, misconfigs |
-| 9 | `cloud_enum` | cloud_enum.py | Detect Azure/AWS/GCP cloud endpoints (storage, web apps, DBs, CDN) from DNS/HTTP/TLS data |
-| 10 | `aimap` | run_aimap.py | Discover exposed AI agent endpoints (MCP, Ollama, LangServe, Gradio, ComfyUI…). Requires vendored `aimap/` tool |
-| 11 | `normalize` | normalize.py | Merge all JSONL → unified asset record per FQDN + CDN detection |
-| 12 | `load` | load_duckdb.py | Load into DuckDB with analytical views + Parquet archive |
-| 13 | `verify` | verify_takeovers.py | Live DNS + HTTP fingerprint verification of takeover candidates |
+| 0 | `subfinder` | subfinder | Passive subdomain enumeration across many sources for the configured root domains; adds in-scope hostnames to the targets. Opt-in — skipped unless `ROOT_DOMAINS` is set |
+| 1 | `ct` | ct_enrich.py (crt.sh) | Passive Certificate Transparency lookup for the configured root domains; adds new in-scope hostnames to the targets. Opt-in — skipped unless `ROOT_DOMAINS` is set |
+| 2 | `dns` | dnsx | Resolve A/AAAA/CNAME/NS/MX/TXT, filter to live hosts |
+| 3 | `asn` | pyasn | Enrich IPs with ASN, prefix, organization (offline BGP RIB) |
+| 4 | `rdns` | getdns | Reverse DNS lookup on IP addresses → PTR records |
+| 5 | `cdn` | cdncheck | Classify live hosts/IPs as CDN / cloud / WAF using provider IP ranges |
+| 6 | `ports` | naabu | TCP SYN scan top-100 ports, CDN-aware |
+| 7 | `http` | httpx | Full-signal probe: status, title, tech, headers, JARM, screenshot |
+| 8 | `waf` | waf-detect | Passive WAF/CDN fingerprinting of every HTTP origin (no attack payloads) |
+| 9 | `tls` | tlsx | Deep cert analysis: SANs, expiry, misconfig flags |
+| 10 | `fingerprint` | nerva | Auto-detect all protocols: SSH, FTP, DB, Redis, SMB — CPE/vendor/version/OS fingerprints. Alias: `zgrab` |
+| 11 | `nuclei` | nuclei | Low-noise scan: takeovers, exposed panels, misconfigs |
+| 12 | `cloud_enum` | cloud_enum.py | Detect Azure/AWS/GCP cloud endpoints (storage, web apps, DBs, CDN) from DNS/HTTP/TLS data |
+| 13 | `aimap` | run_aimap.py | Discover exposed AI agent endpoints (MCP, Ollama, LangServe, Gradio, ComfyUI…). Requires vendored `aimap/` tool |
+| 14 | `normalize` | normalize.py | Merge all JSONL → unified asset record per FQDN + CDN/WAF verdicts |
+| 15 | `load` | load_duckdb.py | Load into DuckDB with analytical views + Parquet archive |
+| 16 | `verify` | verify_takeovers.py | Live DNS + HTTP fingerprint verification of takeover candidates |
+| 17 | `scope` | cmdb_scope_export.py | Route assets to Tenable VM (unique IPs) / Tenable WAS (URLs, standard / WAF / API profiles). `recon` mode only |
 
-`ct`, `cloud_enum` and `aimap` are best-effort enrichment stages — they are skipped (non-fatal) if no inputs or the `aimap` tool is unavailable.
+`subfinder`, `ct`, `cdn`, `waf`, `cloud_enum` and `aimap` are best-effort enrichment stages — they are skipped (non-fatal) if they have no inputs or the tool is unavailable.
 
 ### CT-log enrichment (`ct` stage)
 
@@ -228,6 +255,34 @@ python3 scripts/ct_enrich.py --domains example.com --output /tmp/ct.txt   # stan
 - **Best-effort.** crt.sh is often slow or returns 502s, so requests are retried (`CT_RETRIES`, `CT_TIMEOUT` in `config/pipeline.env`); if it stays down the scan continues with your input list.
 - Not run in `livecheck` mode, which validates your registered CMDB names only.
 - Output: `data/output/ct_subdomains.txt` (everything CT returned, including names already in your input).
+
+### Passive subdomain enumeration (`subfinder` stage)
+
+Runs [subfinder](https://github.com/projectdiscovery/subfinder) against the same `ROOT_DOMAINS` as the `ct` stage and merges the in-scope results into the targets. Matching assets are tagged with source `subfinder`.
+
+- **Same scope rules as CT.** Opt-in via `ROOT_DOMAINS`; only names equal to or under a root domain are kept; not run in `livecheck` mode.
+- **No double crt.sh traffic.** subfinder's `crtsh` source is excluded — the `ct` stage owns it.
+- **API keys (optional).** Copy `config/subfinder-provider-config.example.yaml` to `config/subfinder-provider-config.yaml` (git-ignored); it is passed with `-pc` only when present.
+- Tunables: `SUBFINDER_THREADS`, `SUBFINDER_TIMEOUT`, `SUBFINDER_MAX_TIME`, `SUBFINDER_TOTAL_TIMEOUT`, `SUBFINDER_ALL`.
+- Output: `subfinder.jsonl` (raw, with sources) and `subfinder_subdomains.txt` (in-scope names).
+
+### CDN / cloud / WAF classification (`cdn` stage)
+
+Runs [cdncheck](https://github.com/projectdiscovery/cdncheck) over `live_hosts.txt` (resolved FQDNs + direct IPs). Each record is stored as `network.cdncheck { ip, cdn, cloud, waf }` and:
+
+- adds a `cdncheck:<provider>` signal to the multi-signal CDN detector (`detect_cdn.py`) — Cloudflare / Imperva are counted as CDN even though cdncheck files them under WAF;
+- seeds a `network.waf` verdict (confidence 0.6, source `cdncheck`) when a WAF IP range matches.
+
+Also runs in `livecheck` mode (cheap, improves CDN-fronting classification). Tunable: `CDNCHECK_THREADS`.
+
+### WAF detection (`waf` stage)
+
+Runs [waf-detector](https://github.com/ammarion/waf-detector) (`waf-detect scan --ndjson`) against one URL per HTTP origin found by httpx.
+
+- **Passive only.** The stage never enables payload analysis, smoke tests, effectiveness, hardening or adversary modes — those send attack payloads and are out of scope for recon.
+- **Verdicts.** The highest-confidence detection per host becomes `network.waf { detected, provider, confidence, sources[], url }`; agreement with cdncheck is recorded in `sources`. A waf-detector CDN verdict adds a `wafdetector:<provider>` signal to CDN detection.
+- **Throughput.** Origins are processed in chunks (`WAF_BATCH_SIZE`) by parallel workers (`WAF_WORKERS`), each with a timeout (`WAF_BATCH_TIMEOUT`); a hung chunk loses only its own results. Capped at `WAF_MAX_TARGETS` origins.
+- Not run in `livecheck` mode. Output: `waf.jsonl`. Query via `v_waf_analysis` or the dashboard's *Network → CDN Providers* tab.
 
 ### Partial runs and resuming
 
@@ -258,7 +313,7 @@ Select with `--mode` (or `PIPELINE_MODE` in `config/pipeline.env`). Default is `
 
 | Mode | Flag | Behavior |
 |------|------|----------|
-| `recon` | _(default)_ | Full pipeline with conservative, low-noise settings. Ends with takeover verification. |
+| `recon` | _(default)_ | Full pipeline with conservative, low-noise settings. Ends with takeover verification and Tenable VM/WAS scope routing. |
 | `bounty` | `--mode bounty` | Expanded attack-surface scan: top-1000 ports, no CDN exclusion, Nerva misconfigs + UDP, broader `nuclei-bounty.yaml` template set. Runs `score_bounty.py` to assign each asset an S/A/B/C/D priority tier. |
 | `livecheck` | `--mode livecheck` | Lightweight DNS-only CMDB scope governance (`dns,asn,rdns,normalize,load`). Validates registered FQDNs for liveness, CDN/WAF fronting, CNAME bloat, stale records, and 3rd-party nameservers, then exports Tenable include/exclude scope files. |
 
@@ -287,6 +342,73 @@ LIVECHECK_DEADLINE_DAYS=30           # grace period before stale records are fla
 LIVECHECK_CNAME_DEPTH_THRESHOLD=3    # CNAME hops considered "bloated"
 ```
 
+### Tenable VM / WAS Scope Routing (`scope` stage)
+
+Turns every discovered asset into scanner-ready scope, following the routing matrix in [`TENABLE_SCOPE_PIPELINE.MD`](TENABLE_SCOPE_PIPELINE.MD). Tenable VM scans infrastructure by IP; Tenable WAS runs DAST against web applications. Feeding both scanners the raw asset list wastes licences and scans infrastructure you don't own. The rules live in `scripts/tenable_scope.py`; `cmdb_scope_export.py --db` applies them after `verify`, so confirmed takeovers stay out of both scanners.
+
+| Category | Tenable VM | Tenable WAS |
+|----------|-----------|-------------|
+| Direct / dedicated IP | include (by IP) | include (live web apps) |
+| Owned shared IP (LB / ingress, ≥2 FQDNs) | include **once** per IP | include every FQDN |
+| Behind CDN (detector, CDN-edge ASN, CloudFront / Front Door) | exclude | include |
+| Behind WAF (`network.waf`) | exclude | `waf` profile — allow-list scanner egress first |
+| Shared hosting (hosting ASN / panel headers) | exclude | include |
+| Third-party SaaS (Shopify, Zendesk, HubSpot … by CNAME/ASN) | exclude | exclude (`TENABLE_WAS_INCLUDE_SAAS=true` to override) |
+| Cloud PaaS / serverless (App Service, Cloud Run, Lambda, Heroku, Vercel …) | exclude | include |
+| Cloud storage / static hosting / managed DBs (S3, Blob, GitHub Pages, RDS …) | exclude | exclude |
+| Non-HTTP only (SSH, VPN, DB, SMTP) | include | exclude |
+| Redirect-only / parked / dead | exclude | exclude |
+| Default server page (nginx/IIS/Apache welcome) | include | exclude |
+| Takeover (verified `confirmed`, or scanner finding not cleared as `likely_fp`) | exclude | exclude |
+| Pure API / AI endpoint (JSON responses, aimap hit, API gateway) | include if direct | `api` profile — attach an OpenAPI definition |
+| Non-routable IP in public DNS (RFC 1918, documentation ranges) | exclude | exclude when every IP is non-routable |
+
+**Exclusion wins per IP.** If any asset resolving to an IP marks it as CDN, WAF, third-party/PaaS or a takeover target, that IP stays out of VM for every asset that shares it. A WAS URL counts as live on `2xx` (not `204`), `401`, `403` or `500`. A redirect to another host counts as redirect-only; that host is routed as its own asset. When `https://host` answers, `http://host` is dropped as the same app.
+
+Outputs (in `data/output/`, then archived with the scan):
+
+| File | Contents |
+|------|----------|
+| `tenable_vm_include.txt` | Unique IPs to network-scan |
+| `tenable_vm_exclude.txt` | IPs that must not be network-scanned (import as a Tenable exclusion) |
+| `tenable_vm_review.txt` | VM candidates outside your declared ranges (only with `TENABLE_VM_REQUIRE_OWNED=true`) |
+| `tenable_was_targets.txt` | WAS URLs for the standard scan policy |
+| `tenable_was_waf_targets.txt` | WAF-fronted URLs. Scan only once the WAF allow-lists Tenable's egress IPs / header |
+| `tenable_was_api_targets.txt` | API / AI endpoints. Scan with an API policy and an OpenAPI/Postman definition |
+| `tenable_scope.jsonl` | Per-asset decision with category and reasons (audit trail) |
+| `tenable_vm_targets.jsonl` | Per-IP VM decision: primary FQDN, all FQDNs, ports, reasons |
+| `tenable_scope_meta.json` | Routing settings used for this run (also shown on the dashboard) |
+| `tenable_scope.xlsx` | Analyst workbook — see below |
+
+**XLSX workbook.** `tenable_scope.xlsx` (also downloadable from the dashboard's Tenable Scope page) holds:
+
+| Sheet | Contents |
+|-------|----------|
+| Summary | Routing settings (ownership, thresholds, CMDB-only), totals, category matrix, caveats to check before importing |
+| All | Every routed asset: categories, CMDB match, IPs/ports/ASN/CNAME, CDN/WAF/platforms, VM and WAS decision with reasons, HTTP status/title/tech, TLS expiry and issues, sources, first/last seen |
+| Tenable VM Candidates | One row per IP to scan (`include`) or confirm (`review`): category, ownership, primary and all FQDNs, ports, CMDB CIs |
+| Tenable WAS Candidates | One row per URL with its scan profile and the policy it needs (standard / WAF allow-list / API definition), HTTP and TLS details |
+| Columns | Data dictionary: every column, its type and meaning |
+
+Every data sheet is a filterable Excel table with a frozen header. Hover a header to see what the column means. Scanned text such as titles and banners is always stored as plain text, never as a formula. The workbook is built on `scripts/xlsx_workbook.py`, a small declarative writer (sheets of typed `Column` specs) that other exports can reuse. To regenerate it from any routed database, run `python3 scripts/tenable_xlsx.py --db data/output/easm.duckdb --output tenable_scope.xlsx`.
+
+```bash
+# Tunables (config/pipeline.env)
+TENABLE_CDN_MIN_CONFIDENCE=0.35   # detect_cdn scores 0.35 per signal type → any CDN signal excludes from VM
+TENABLE_WAF_MIN_CONFIDENCE=0.5
+TENABLE_OWNED_CIDRS=""            # your ranges — override CDN / third-party / PaaS heuristics (never WAF/takeover)
+TENABLE_OWNED_ASNS=""
+TENABLE_VM_REQUIRE_OWNED=false    # true = IPs outside owned ranges go to review, not include
+TENABLE_SCOPE_CMDB_ONLY=false     # true = only CMDB-registered assets enter scan scope
+TENABLE_WAS_INCLUDE_SAAS=false
+
+# Re-route the current database without re-scanning
+./run.sh --stage scope
+python3 scripts/query.py --db data/output/easm.duckdb --query tenable_scope
+```
+
+> **Authorization:** routing reduces the risk of scanning third-party infrastructure but cannot prove ownership. For production scan scopes, set `TENABLE_OWNED_CIDRS` / `TENABLE_OWNED_ASNS` and `TENABLE_VM_REQUIRE_OWNED=true` so that IPs outside your declared ranges go to review rather than straight into VM.
+
 ## Querying
 
 ```bash
@@ -295,7 +417,7 @@ python3 scripts/query.py --db data/output/easm.duckdb --query list
 
 # Run a query (keys: stats, gaps, shadow_it, tls_issues, tls_expiring,
 #   findings, findings_critical, tech, tech_summary, ports, port_heatmap,
-#   cdn_distribution, asn_distribution, favicon_clusters, takeovers,
+#   cdn_distribution, waf_distribution, asn_distribution, favicon_clusters, takeovers,
 #   verified_takeovers)
 python3 scripts/query.py --db data/output/easm.duckdb --query stats
 python3 scripts/query.py --db data/output/easm.duckdb --query shadow_it
@@ -341,7 +463,7 @@ bash scripts/diff_scans.sh data/output/assets_prev.jsonl data/output/assets.json
 
 | View | Description |
 |------|-------------|
-| `v_asset_summary` | One-row-per-asset overview with service_count, CDN status, ASN |
+| `v_asset_summary` | One-row-per-asset overview with service_count, CDN/WAF status, ASN |
 | `v_cmdb_gaps` | Assets missing from CMDB |
 | `v_tls_issues` | Expired, self-signed, expiring certs |
 | `v_findings` | All nuclei/nerva findings by severity |
@@ -353,6 +475,7 @@ bash scripts/diff_scans.sh data/output/assets_prev.jsonl data/output/assets.json
 | `v_reverse_dns` | Reverse DNS mappings for infrastructure analysis |
 | `v_cdn_analysis` | CDN detection results with confidence scoring |
 | `v_cdn_exclusions` | Assets behind CDN (candidate scan exclusions) |
+| `v_waf_analysis` | WAF verdicts per asset (provider, confidence, cdncheck/waf-detector sources) |
 | `v_cloud_endpoints` | Detected Azure/AWS/GCP cloud endpoints |
 | `v_cloud_providers` | Cloud provider distribution |
 | `v_cloud_risk` | Cloud endpoints ranked by exposure risk |
@@ -366,6 +489,13 @@ bash scripts/diff_scans.sh data/output/assets_prev.jsonl data/output/assets.json
 | `v_leaf_domains` | Leaf (non-delegated) domains |
 | `v_third_party_ns` | FQDNs served by 3rd-party nameservers |
 | `v_shared_hosting` | IPs hosting multiple distinct FQDNs |
+| `v_tenable_vm_scope` | Tenable VM targets — one row per unique IP with primary FQDN, all FQDNs, ports |
+| `v_tenable_vm_exclusions` | IPs kept out of Tenable VM, with reasons |
+| `v_tenable_vm_review` | VM candidates awaiting ownership confirmation |
+| `v_tenable_was_scope_standard` | Tenable WAS URLs for the standard DAST policy |
+| `v_tenable_was_scope_waf` | WAF-fronted WAS URLs with WAF/CDN provider (allow-list first) |
+| `v_tenable_was_scope_api` | API / AI endpoints for API-profile WAS scans |
+| `v_tenable_scope_summary` | Asset counts per routing category and VM/WAS action |
 
 ## Data Model
 
@@ -377,6 +507,8 @@ fqdn, scan_id, first_seen, last_seen, source[], tags[]
 ├── network: { 
 │   asn: { number, prefix, org },
 │   cdn: { provider, confidence, signals[] },
+│   cdncheck: { ip, cdn, cloud, waf },
+│   waf: { detected, provider, confidence, sources[], url },
 │   rdns: [{ ip, ptr }],
 │   open_ports[]
 │ }
@@ -401,7 +533,8 @@ easm-oss/
 ├── docker-compose.yml           # Docker Compose stack
 ├── requirements.txt             # Python dependencies
 ├── config/
-│   ├── pipeline.env             # Pipeline configuration (PIPELINE_MODE, NERVA_*, ASN_*, LIVECHECK_*)
+│   ├── pipeline.env             # Pipeline configuration (PIPELINE_MODE, NERVA_*, SUBFINDER_*, WAF_*, …)
+│   ├── subfinder-provider-config.example.yaml  # subfinder API keys template (real file git-ignored)
 │   ├── resolvers.txt            # DNS resolvers
 │   ├── nuclei-config.yaml       # Nuclei scanning profile (recon mode)
 │   ├── nuclei-bounty.yaml       # Expanded Nuclei profile (bounty mode)
@@ -411,7 +544,7 @@ easm-oss/
 │   ├── normalize.py             # JSONL merger & asset normalizer + CDN detection
 │   ├── load_duckdb.py           # DuckDB loader with views + archive
 │   ├── run_nerva.sh             # Nerva service fingerprinting wrapper
-│   ├── detect_cdn.py            # Multi-signal CDN detection (CNAME, IP, headers, ASN)
+│   ├── detect_cdn.py            # Multi-signal CDN detection (CNAME, IP, headers, ASN, cdncheck, waf-detector)
 │   ├── enrich_asn.py            # Offline ASN enrichment using pyasn
 │   ├── enrich_nuclei.py         # Nuclei finding aggregation and enrichment
 │   ├── cloud_enum.py            # Azure/AWS/GCP cloud endpoint enumeration
@@ -420,7 +553,8 @@ easm-oss/
 │   ├── verify_takeovers.py      # Live verification of subdomain takeover candidates
 │   ├── score_bounty.py          # Bug-bounty priority scoring engine (S/A/B/C/D)
 │   ├── livecheck.py             # CMDB DNS-liveness / scope governance analysis
-│   ├── cmdb_scope_export.py     # Tenable include/exclude scope file exporter
+│   ├── cmdb_scope_export.py     # Tenable scope exporter (VM/WAS routing + livecheck include/exclude)
+│   ├── tenable_scope.py         # Tenable VM/WAS routing rules (TENABLE_SCOPE_PIPELINE.MD matrix)
 │   ├── archive_scan.py          # Archive scan results to Parquet
 │   ├── validate_schema.py       # Schema validation and data integrity checks
 │   ├── cmdb_report.py           # CMDB gap analysis report
@@ -428,10 +562,12 @@ easm-oss/
 │   ├── test_pipeline.py         # Synthetic data generator
 │   ├── test_nerva_ingest.py     # Unit tests for Nerva ingestion
 │   ├── test_ct_enrich.py        # CT enrichment tests (offline, crt.sh mocked)
+│   ├── test_recon_tools.py      # subfinder / cdncheck / waf-detector stage + ingest tests (fake binaries)
 │   ├── test_pipeline_nerva.sh   # Integration test: normalize + DuckDB with mock Nerva data
 │   ├── test_ip_implementation.py # IP scanning and enrichment tests
 │   ├── test_livecheck.py        # Livecheck unit tests
 │   ├── test_verify_takeovers.py # Takeover verification unit tests
+│   ├── test_tenable_scope.py    # Tenable VM/WAS routing tests (matrix rows, DuckDB views, run.sh stage)
 │   ├── diff_scans.sh            # Scan-to-scan diff
 │   ├── cache.sh                 # Cache manager
 │   └── export.sh                # Export to CSV/JSON/Parquet
@@ -444,6 +580,7 @@ easm-oss/
 │       │                        #   Scans (history/compare) tabs
 │       └── styles.css           # Styles
 ├── aimap/                       # Vendored AI-agent discovery tool (git-ignored, optional)
+├── subfinder/ cdncheck/ waf-detector/  # Optional local upstream clones (git- & docker-ignored; image builds from remote)
 ├── data/
 │   ├── input/
 │   │   ├── subdomains.txt       # Your subdomain list
@@ -457,12 +594,15 @@ easm-oss/
 ## Request Budget
 
 Per live asset, the pipeline makes approximately:
+- subfinder: queries to third-party passive sources per root domain (only when `ROOT_DOMAINS` is set; no traffic to targets)
 - CT: 1 crt.sh request per root domain (only when `ROOT_DOMAINS` is set)
+- cdncheck: mostly offline IP-range matching (+1 DNS lookup per FQDN)
 - DNS: 1–3 queries
 - ASN: 1 lookup (offline — BGP RIB database)
 - Reverse DNS: 1 lookup per IP (PTR query)
 - Port scan: top-100 SYN packets (2 if behind CDN)
 - HTTP: 2–3 requests (+ sub-resources for screenshot)
+- WAF detection: a few benign requests per HTTP origin (no attack payloads)
 - TLS: 1 connection per TLS port
 - Nerva: 1 TCP/UDP connection per open port (concurrent, auto-detects protocol)
 - Nuclei: 5–20 requests (rate-limited to 50 rps total)
@@ -473,10 +613,10 @@ Note: ASN enrichment and cloud enumeration are offline (no network requests). Re
 
 ## IP Address Scanning & Enrichment
 
-Stages 2–3 (ASN and RDNS) enrich discovered IP addresses with network intelligence:
-- **ASN Enrichment** (stage 2): Maps IPs to Autonomous System Numbers, prefixes, and organizations using offline BGP RIB data
-- **Reverse DNS** (stage 3): Performs PTR lookups on discovered IPs for hostname inference and infrastructure mapping
-- **CDN Detection**: Multi-signal detection during normalization (CNAME patterns, IP ranges, HTTP headers, ASN membership)
+Stages 3–4 (ASN and RDNS) enrich discovered IP addresses with network intelligence:
+- **ASN Enrichment** (stage 3): Maps IPs to Autonomous System Numbers, prefixes, and organizations using offline BGP RIB data
+- **Reverse DNS** (stage 4): Performs PTR lookups on discovered IPs for hostname inference and infrastructure mapping
+- **CDN Detection**: Multi-signal detection during normalization (CNAME patterns, IP ranges, HTTP headers, ASN membership, cdncheck and waf-detector verdicts)
 
 ### Configuration (`config/pipeline.env`)
 
@@ -599,6 +739,8 @@ python3 scripts/validate_schema.py --input data/output/assets.jsonl
 
 The FastAPI dashboard provides real-time visualization **and** in-browser scan orchestration — you configure stages, enter targets, pick a mode, and start a scan without touching the CLI.
 
+**Scan input.** Paste targets or upload a `targets.txt` / `.csv` with the button or by drag-and-drop. This works for every mode (Recon, Bug Bounty, CMDB Livecheck). Hostnames, IPs, CIDRs and URLs are accepted. URLs are reduced to their host, `#` starts a comment, and anything else is skipped and reported. You can optionally attach a CMDB export CSV with an `fqdn`, `hostname` or `name` column. It drives CMDB matching, CMDB Livecheck and the CMDB-only Tenable scope for that scan. Without one, the scan falls back to `data/input/cmdb_export.csv`. Uploaded inputs are stored as `data/input/scan_<id>.txt` and `cmdb_<id>.csv`.
+
 ```bash
 # Docker (recommended) — exposed on host port 9990
 docker compose up -d --build
@@ -648,6 +790,7 @@ open http://127.0.0.1:8443
 - **Takeovers**: Subdomain takeover candidates and live-verification results
 - **Bounty**: S/A/B/C/D-tiered bug-bounty target scores (bounty mode)
 - **Livecheck**: CMDB scope governance results (livecheck mode)
+- **Tenable Scope**: VM/WAS routing for the current scan. Shows the routing settings used (ownership enforced or not, owned ranges, CMDB-only), the VM-by-IP and WAS-by-URL split, the routing matrix, why assets were excluded, filterable target lists, and downloads of the Tenable import files
 - **CMDB Gaps**: Assets missing from your configuration database
 - **Scans**: Scan history, restore/import/export archived scans, and diff two scans (Compare)
 
@@ -668,9 +811,12 @@ Live scans stream stage progress and a debug log viewer in the browser.
 | `GET /api/takeovers` | Takeover candidates and verification status |
 | `GET /api/bounty` / `GET /api/bounty/export` | Bounty scores and tiers / export |
 | `GET /api/livecheck` | CMDB livecheck / scope governance results |
+| `GET /api/tenable-scope` | Tenable routing overview: settings used, VM/WAS totals, category matrix, exclusion reasons |
+| `GET /api/tenable-scope/list` | Paginated targets: `kind=vm_include\|vm_exclude\|vm_review\|was_standard\|was_waf\|was_api\|assets`, filters `q`, `category`, `vm`, `was`, `cmdb` |
+| `GET /api/tenable-scope/export` | Import file download (`kind` as above → `.txt`), audit CSV (`kind=assets\|vm_targets`) or XLSX workbook (`kind=xlsx`) |
 | `GET /api/network/ports\|tech\|cdn\|asn\|rdns` | Network intelligence breakdowns |
 | `GET /api/search` | Cross-asset search |
-| `POST /api/scans/new` | Launch a new scan (targets, stages, mode) |
+| `POST /api/scans/new` | Launch a new scan. JSON body: `subdomains` (targets text, ≤ 20 MB), `stages`, `mode`, `root_domains`, optional `cmdb_csv` (CMDB export text). The response reports any skipped entries (`rejected_count`, `rejected_sample`) and `cmdb_rows` |
 | `GET /api/scans` / `GET /api/scans/active` / `GET /api/scans/logs` | Scan history / running scan / live logs |
 | `GET\|POST\|DELETE /api/scans/{scan_id}...` | Inspect, restore, delete archived scans |
 | `POST /api/scans/import` / `GET /api/scans/{scan_id}/export` | Import / export scan archives |

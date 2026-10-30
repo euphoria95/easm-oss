@@ -555,6 +555,29 @@ select.search-input { padding-left: 0.75rem; }
 }
 .scan-textarea:focus { border-color: var(--signal-dim); box-shadow: 0 0 0 3px var(--signal-glow); }
 .scan-textarea::placeholder { color: var(--ink-ghost); }
+.scan-textarea.scan-dropzone-active {
+    border-color: var(--signal);
+    border-style: dashed;
+    box-shadow: 0 0 0 3px var(--signal-glow);
+}
+.scan-cmdb-row {
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius);
+    padding: 0.6rem 0.75rem;
+    background: var(--field-sunken);
+}
+.scan-file-chip {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.68rem;
+    color: var(--ink-faint);
+    border: 1px solid var(--hairline);
+    border-radius: 999px;
+    padding: 0.05rem 0.5rem;
+    max-width: 14rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
 
 /* =========================================================
    Buttons
@@ -595,6 +618,7 @@ select.search-input { padding-left: 0.75rem; }
     transition: all 0.15s;
 }
 .btn-secondary:hover:not(:disabled) { background: var(--field-raised); color: var(--ink); border-color: var(--hairline-strong); }
+.btn-secondary:disabled { opacity: 0.4; cursor: not-allowed; }
 
 .btn-danger {
     display: inline-flex;
@@ -833,6 +857,65 @@ select.search-input { padding-left: 0.75rem; }
 }
 .lc-tab:hover { color: var(--ink-mute); }
 .lc-tab.active { color: var(--signal-bright); border-bottom-color: var(--signal); }
+
+/* =========================================================
+   Tenable scope routing
+   ========================================================= */
+.ts-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.1rem 0.5rem;
+    border-radius: 4px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.68rem;
+    white-space: nowrap;
+    color: var(--ink-soft);
+    background: color-mix(in srgb, var(--chip) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--chip) 35%, transparent);
+}
+.ts-dot { width: 6px; height: 6px; border-radius: 2px; background: var(--chip); flex-shrink: 0; }
+.ts-reason {
+    display: inline-block;
+    padding: 0.05rem 0.4rem;
+    margin: 0.1rem 0;
+    border-radius: 3px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.65rem;
+    color: var(--ink-mute);
+    background: var(--field-sunken);
+    border: 1px solid var(--hairline);
+    white-space: nowrap;
+}
+.ts-mode {
+    padding: 0.75rem 1rem;
+    border-radius: var(--radius);
+    background: var(--field-panel);
+    border: 1px solid var(--hairline);
+    border-left: 2px solid var(--signal-dim);
+}
+.ts-mode-warn { border-left-color: var(--sev-medium); }
+.ts-mode-key {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.6rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+}
+.ts-mode-val { font-family: 'IBM Plex Mono', monospace; font-size: 0.75rem; color: var(--ink-soft); }
+.ts-bar-row {
+    display: grid;
+    grid-template-columns: 9rem 1fr 2.5rem;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.2rem 0;
+    cursor: default;
+}
+.ts-bar-label { font-size: 0.75rem; color: var(--ink-mute); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ts-bar-track { height: 6px; border-radius: 3px; background: var(--field-sunken); border: 1px solid var(--hairline); overflow: hidden; }
+.ts-bar-track > span { display: block; height: 100%; background: var(--ink-faint); }
+.ts-bar-row:hover .ts-bar-track > span { background: var(--signal-dim); }
+.ts-bar-val { font-family: 'IBM Plex Mono', monospace; font-size: 0.72rem; color: var(--ink); text-align: right; }
 
 /* =========================================================
    Focus visibility (accessibility floor)

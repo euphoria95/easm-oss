@@ -1,12 +1,17 @@
 # =============================================================================
 # EASM Pipeline - Multi-stage Docker Build
-# Installs: dnsx, naabu, httpx, tlsx, nuclei, nerva, zgrab2, gowitness
+# Installs: subfinder, dnsx, cdncheck, naabu, httpx, tlsx, nuclei, nerva,
+#           zgrab2, gowitness, waf-detect (waf-detector, Rust)
 #           + Python venv (duckdb stack), jq, Chromium/Chrome
 # nerva is the primary fingerprinting engine; zgrab2 is kept for fallback.
 #
 # Runtime base can be switched at build-time:
 #   docker build --build-arg RUNTIME_BASE=ubuntu:24.04 -t easm-pipeline .
 #   docker build --build-arg RUNTIME_BASE=debian:bookworm-slim -t easm-pipeline .
+#
+# Tool versions can be pinned at build-time:
+#   --build-arg SUBFINDER_VERSION=v2.x.y --build-arg CDNCHECK_VERSION=v1.x.y
+#   --build-arg WAF_DETECTOR_REF=<git sha|tag>
 # =============================================================================
 
 ARG RUNTIME_BASE=debian:bookworm-slim
@@ -24,6 +29,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 ENV GOBIN=/go/bin
+# Let `go install` fetch a newer toolchain when a module requires it (the base
+# image defaults to GOTOOLCHAIN=local, which hard-fails e.g. tlsx needing go 1.27).
+ENV GOTOOLCHAIN=auto
 
 # Build tools separately for easier debugging
 RUN go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest
@@ -34,6 +42,32 @@ RUN go install -v github.com/projectdiscovery/pdtm/cmd/pdtm@latest
 RUN go install -v github.com/sensepost/gowitness@latest
 RUN go install -v github.com/zmap/zgrab2/cmd/zgrab2@latest
 RUN go install -v github.com/praetorian-inc/nerva/cmd/nerva@latest
+
+ARG SUBFINDER_VERSION=latest
+ARG CDNCHECK_VERSION=latest
+RUN go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@${SUBFINDER_VERSION}
+RUN go install -v github.com/projectdiscovery/cdncheck/cmd/cdncheck@${CDNCHECK_VERSION}
+
+# Stage 1b: Build waf-detector (Rust) from the upstream repo.
+# Pinned to a commit by default — single-maintainer project, so bump deliberately.
+# bookworm base keeps the binary's glibc compatible with the default runtime.
+FROM rust:1-slim-bookworm AS rust-builder
+
+ARG WAF_DETECTOR_REPO=https://github.com/ammarion/waf-detector.git
+ARG WAF_DETECTOR_REF=07ffed91
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone "${WAF_DETECTOR_REPO}" /src \
+    && cd /src \
+    && git checkout "${WAF_DETECTOR_REF}" \
+    && cargo build --release --locked --bin waf-detect \
+    && strip target/release/waf-detect
 
 # Stage 2: Runtime image
 FROM ${RUNTIME_BASE} AS runtime
@@ -69,6 +103,11 @@ RUN set -eux; \
         python3-dev \
         sudo \
         tini; \
+    if [[ "${ID}" == "ubuntu" ]]; then \
+        apt-get install -y --no-install-recommends libssl3t64; \
+    else \
+        apt-get install -y --no-install-recommends libssl3; \
+    fi; \
     if [[ "${ID}" == "ubuntu" ]]; then \
         apt-get install -y --no-install-recommends \
             fonts-liberation \
@@ -115,6 +154,11 @@ COPY --from=go-builder /go/bin/pdtm      /usr/local/bin/
 COPY --from=go-builder /go/bin/gowitness /usr/local/bin/
 COPY --from=go-builder /go/bin/zgrab2       /usr/local/bin/
 COPY --from=go-builder /go/bin/nerva         /usr/local/bin/
+COPY --from=go-builder /go/bin/subfinder /usr/local/bin/
+COPY --from=go-builder /go/bin/cdncheck  /usr/local/bin/
+
+# Copy waf-detector built from source
+COPY --from=rust-builder /src/target/release/waf-detect /usr/local/bin/waf-detect
 
 # Copy nuclei from official prebuilt image
 COPY --from=nuclei-bin /usr/local/bin/nuclei /usr/local/bin/nuclei

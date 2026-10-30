@@ -186,10 +186,10 @@ class RunShWiring(unittest.TestCase):
         return subprocess.run(["bash", str(REPO / "run.sh"), *args],
                               capture_output=True, text=True, cwd=REPO, env=e)
 
-    def test_ct_is_first_stage(self):
+    def test_ct_runs_before_dns(self):
         r = self._run("--dry-run")
         stages = [l.split(": ")[1].strip() for l in (r.stdout + r.stderr).splitlines() if "Would run:" in l]
-        self.assertEqual(stages[:2], ["ct", "dns"])
+        self.assertEqual(stages[:3], ["subfinder", "ct", "dns"])
 
     def test_ct_stage_skipped_without_root_domains_and_in_livecheck(self):
         with tempfile.TemporaryDirectory() as tmp:

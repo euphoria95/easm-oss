@@ -660,7 +660,7 @@ def test_run_sh_stage_order():
     output = result.stdout + result.stderr
     stages_seen = [line.split(": ")[1].strip() for line in output.splitlines() if "Would run:" in line]
 
-    expected_order = ["ct", "dns", "asn", "rdns", "ports", "http", "tls", "fingerprint", "nuclei", "cloud_enum", "aimap", "normalize", "load", "verify"]
+    expected_order = ["subfinder", "ct", "dns", "asn", "rdns", "cdn", "ports", "http", "waf", "tls", "fingerprint", "nuclei", "cloud_enum", "aimap", "normalize", "load", "verify", "scope"]
     assert_equal("stage order correct", stages_seen, expected_order)
     assert_true("passive not in stages", "passive" not in stages_seen)
 

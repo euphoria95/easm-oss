@@ -2,7 +2,8 @@
 """
 Multi-signal CDN detection for EASM assets.
 
-Combines CNAME patterns, IP ranges, HTTP headers, and ASN data to identify
+Combines CNAME patterns, IP ranges, HTTP headers, ASN data, and (when the
+cdn / waf stages ran) cdncheck and waf-detector verdicts to identify
 CDN-proxied assets with confidence scoring.
 """
 import ipaddress
@@ -115,6 +116,28 @@ CDN_CIDRS: list[tuple[str, str]] = [
 ]
 
 
+# Provider names used by cdncheck / waf-detector → this module's vocabulary.
+# Names not listed pass through lowercased with spaces → underscores.
+PROVIDER_NAME_MAP: dict[str, str] = {
+    "amazon": "cloudfront",
+    "aws": "cloudfront",
+    "azure": "azure_cdn",
+    "google": "google_cdn",
+    "incapsula": "imperva",
+}
+
+# cdncheck classifies these as "waf", but they also front traffic as a CDN.
+CDNCHECK_WAF_AS_CDN: set[str] = {"cloudflare", "imperva", "arvancloud"}
+
+
+def normalize_provider(name: str | None) -> str | None:
+    """Map an external tool's provider name onto CNAME_PATTERNS/CDN_ASNS names."""
+    if not name:
+        return None
+    key = str(name).strip().lower().replace(" ", "_")
+    return PROVIDER_NAME_MAP.get(key, key) or None
+
+
 class CDNDetector:
     def __init__(self):
         self._cidr_nets = [
@@ -161,6 +184,24 @@ class CDNDetector:
         asn_num = asset.get("network", {}).get("asn", {}).get("number")
         if asn_num and asn_num in CDN_ASNS:
             votes.setdefault(CDN_ASNS[asn_num], []).append(f"asn:{asn_num}")
+
+        network = asset.get("network", {})
+
+        # Signal 5: cdncheck provider IP-range index
+        cdncheck = network.get("cdncheck") or {}
+        cdncheck_provider = normalize_provider(cdncheck.get("cdn"))
+        if not cdncheck_provider:
+            waf = normalize_provider(cdncheck.get("waf"))
+            if waf in CDNCHECK_WAF_AS_CDN:
+                cdncheck_provider = waf
+        if cdncheck_provider:
+            votes.setdefault(cdncheck_provider, []).append(f"cdncheck:{cdncheck_provider}")
+
+        # Signal 6: waf-detector CDN verdict (headers/body/TLS fingerprint)
+        wd_cdn = network.get("waf_detector_cdn") or {}
+        wd_provider = normalize_provider(wd_cdn.get("provider"))
+        if wd_provider:
+            votes.setdefault(wd_provider, []).append(f"wafdetector:{wd_provider}")
 
         if not votes:
             return None

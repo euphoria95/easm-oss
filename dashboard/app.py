@@ -13,7 +13,10 @@ The dashboard is unauthenticated and exposes destructive endpoints. Bind to
 127.0.0.1 unless the port is otherwise protected (see README "Security" note).
 """
 
+import csv
 import hmac
+import io
+import ipaddress
 import json
 import math
 import os
@@ -81,6 +84,7 @@ _archive_cache: "OrderedDict[str, duckdb.DuckDBPyConnection]" = OrderedDict()
 _archive_cache_lock = threading.Lock()
 
 _MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # 200 MB
+_MAX_INPUT_BYTES = 20 * 1024 * 1024    # targets list / CMDB CSV sent with a new scan
 
 
 class ORJSONResponse(JSONResponse):
@@ -806,7 +810,20 @@ def _get_network_cdn(con) -> dict:
         """,
     )
     details = safe_query(con, "SELECT * FROM v_cdn_analysis LIMIT 500")
-    return {"summary": summary, "details": details}
+    waf = safe_query(
+        con,
+        """
+        SELECT
+            waf_provider,
+            COUNT(*) AS count,
+            ROUND(AVG(waf_confidence), 2) AS avg_confidence,
+            COUNT(*) FILTER (WHERE list_contains(waf_sources, 'waf-detector')) AS fingerprinted
+        FROM v_waf_analysis
+        GROUP BY waf_provider
+        ORDER BY count DESC
+        """,
+    )
+    return {"summary": summary, "details": details, "waf": waf}
 
 
 @app.get("/api/network/cdn", response_class=ORJSONResponse)
@@ -1126,6 +1143,219 @@ def livecheck_report(db=Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
+# API — Tenable scope routing (VM / WAS)
+# ---------------------------------------------------------------------------
+
+# kind → (export filename, WAS profile or VM action)
+_TENABLE_TARGET_LISTS = {
+    "vm_include":   ("tenable_vm_include.txt", "include"),
+    "vm_exclude":   ("tenable_vm_exclude.txt", "exclude"),
+    "vm_review":    ("tenable_vm_review.txt", "review"),
+    "was_standard": ("tenable_was_targets.txt", "standard"),
+    "was_waf":      ("tenable_was_waf_targets.txt", "waf"),
+    "was_api":      ("tenable_was_api_targets.txt", "api"),
+}
+
+
+_XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def _require_tenable_scope(con):
+    rows = safe_query(con, """
+        SELECT COUNT(*) AS n FROM information_schema.tables
+        WHERE table_name IN ('tenable_scope', 'tenable_vm_targets')
+    """)
+    if not rows or rows[0]["n"] != 2:
+        raise HTTPException(status_code=404, detail="No Tenable scope routing data — run the scope stage")
+
+
+def _ip_key(ip: str):
+    try:
+        addr = ipaddress.ip_address(ip)
+        return (addr.version, int(addr))
+    except ValueError:
+        return (9, 0)
+
+
+def _reason_counts(con, table: str, column: str, where: str) -> list[dict]:
+    """Reason histogram: kind ('cdn') and full reason ('cdn:cloudflare')."""
+    return query_rows(con, f"""
+        WITH r AS (SELECT UNNEST({column}) AS reason FROM {table} WHERE {where})
+        SELECT split_part(reason, ':', 1) AS kind, reason, COUNT(*) AS count
+        FROM r GROUP BY ALL ORDER BY count DESC, reason
+    """)
+
+
+def _get_tenable_scope(con) -> dict:
+    _require_tenable_scope(con)
+    meta = safe_query(con, "SELECT * FROM tenable_scope_meta LIMIT 1")
+
+    vm = {r["action"]: r for r in query_rows(con, """
+        SELECT action, COUNT(*) AS ips, COALESCE(SUM(fqdn_count), 0) AS fqdns,
+               COUNT(*) FILTER (WHERE vm_category = 'owned_shared') AS shared_ips,
+               COUNT(*) FILTER (WHERE owned) AS owned_ips
+        FROM tenable_vm_targets GROUP BY action
+    """)}
+    was_urls = {r["profile"]: r["urls"] for r in query_rows(con, """
+        WITH u AS (
+            SELECT was_profile AS profile, UNNEST(was_urls) AS url
+            FROM tenable_scope WHERE was_action = 'include'
+        )
+        SELECT profile, COUNT(DISTINCT url) AS urls FROM u GROUP BY profile
+    """)}
+    assets = query_one(con, """
+        SELECT COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE in_cmdb) AS in_cmdb,
+               COUNT(*) FILTER (WHERE was_action = 'include') AS was_included,
+               COUNT(*) FILTER (WHERE was_action = 'exclude') AS was_excluded,
+               COUNT(*) FILTER (WHERE vm_action = 'include') AS vm_covered
+        FROM tenable_scope
+    """) or {}
+
+    return {
+        "meta": meta[0] if meta else None,
+        "assets": assets,
+        "vm": vm,
+        "was_urls": was_urls,
+        "categories": safe_query(con, "SELECT * FROM v_tenable_scope_summary"),
+        "vm_reasons": _reason_counts(con, "tenable_vm_targets", "reasons", "action <> 'include'"),
+        "was_reasons": _reason_counts(con, "tenable_scope", "was_reasons", "was_action = 'exclude'"),
+    }
+
+
+@app.get("/api/tenable-scope", response_class=ORJSONResponse)
+def tenable_scope(db=Depends(get_db)):
+    return _get_tenable_scope(db)
+
+
+@app.get("/api/tenable-scope/list", response_class=ORJSONResponse)
+def tenable_scope_list(
+    db=Depends(get_db),
+    kind: str = Query("vm_include"),
+    q: str = Query(""),
+    category: str = Query(""),
+    vm: str = Query(""),
+    was: str = Query(""),
+    cmdb: str = Query(""),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(50, ge=1, le=500),
+):
+    _require_tenable_scope(db)
+    like = f"%{q.strip()}%"
+    where, params = [], []
+
+    if kind.startswith("vm_") and kind in _TENABLE_TARGET_LISTS:
+        base = "SELECT * FROM tenable_vm_targets"
+        where.append("action = ?")
+        params.append(_TENABLE_TARGET_LISTS[kind][1])
+        if q.strip():
+            where.append("(target_ip ILIKE ? OR array_to_string(fqdns, ' ') ILIKE ? OR asn_org ILIKE ?)")
+            params += [like, like, like]
+        order = "fqdn_count DESC, target_ip"
+    elif kind.startswith("was_") and kind in _TENABLE_TARGET_LISTS:
+        base = """
+            WITH expanded AS (
+                SELECT *, UNNEST(was_urls) AS target_url
+                FROM tenable_scope WHERE was_action = 'include'
+            )
+            SELECT target_url, fqdn, category, categories, waf_provider, cdn_provider,
+                   platforms, in_cmdb, was_profile
+            FROM expanded
+        """
+        where.append("was_profile = ?")
+        params.append(_TENABLE_TARGET_LISTS[kind][1])
+        if q.strip():
+            where.append("(target_url ILIKE ? OR fqdn ILIKE ?)")
+            params += [like, like]
+        order = "fqdn, target_url"
+    elif kind == "assets":
+        base = "SELECT * FROM tenable_scope"
+        if q.strip():
+            where.append("(fqdn ILIKE ? OR array_to_string(ips, ' ') ILIKE ?)")
+            params += [like, like]
+        if vm:
+            where.append("vm_action = ?")
+            params.append(vm)
+        if was == "exclude":
+            where.append("was_action = 'exclude'")
+        elif was:
+            where.append("was_profile = ?")
+            params.append(was)
+        if cmdb in ("1", "0"):
+            where.append("in_cmdb" if cmdb == "1" else "NOT in_cmdb")
+        order = "fqdn"
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown list kind: {kind}")
+
+    if category and not kind.startswith("vm_"):
+        where.append("category = ?")
+        params.append(category)
+
+    sql = f"SELECT * FROM ({base}) AS t" + (f" WHERE {' AND '.join(where)}" if where else "")
+    total = query_one(db, f"SELECT COUNT(*) AS n FROM ({sql}) AS c", params)["n"]
+    items = query_rows(db, f"{sql} ORDER BY {order} LIMIT ? OFFSET ?",
+                       params + [per_page, (page - 1) * per_page])
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "pages": max(1, math.ceil(total / per_page)),
+    }
+
+
+@app.get("/api/tenable-scope/export")
+def tenable_scope_export(db=Depends(get_db), kind: str = Query(...)):
+    """Tenable import files (same content as the scope stage's .txt outputs,
+    which are archived with the scan), CSV audit views and the XLSX workbook."""
+    _require_tenable_scope(db)
+    if kind == "xlsx":
+        from tenable_xlsx import tenable_workbook_data, write_tenable_xlsx, xlsx_filename
+        data = tenable_workbook_data(db)
+        buf = io.BytesIO()
+        write_tenable_xlsx(db, buf, data)
+        return Response(
+            buf.getvalue(), media_type=_XLSX_MEDIA_TYPE,
+            headers={"Content-Disposition": f'attachment; filename="{xlsx_filename(data)}"'},
+        )
+
+    if kind in _TENABLE_TARGET_LISTS:
+        filename, key = _TENABLE_TARGET_LISTS[kind]
+        if kind.startswith("vm_"):
+            rows = query_rows(db, "SELECT target_ip FROM tenable_vm_targets WHERE action = ?", [key])
+            lines = sorted((r["target_ip"] for r in rows), key=_ip_key)
+        else:
+            rows = query_rows(db, """
+                WITH u AS (SELECT UNNEST(was_urls) AS url FROM tenable_scope
+                           WHERE was_action = 'include' AND was_profile = ?)
+                SELECT DISTINCT url FROM u
+            """, [key])
+            lines = sorted(r["url"] for r in rows)
+        return Response(
+            "".join(f"{line}\n" for line in lines), media_type="text/plain",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    if kind == "assets":
+        table, filename = "tenable_scope", "tenable_scope_routing.csv"
+    elif kind == "vm_targets":
+        table, filename = "tenable_vm_targets", "tenable_vm_targets.csv"
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown export kind: {kind}")
+
+    rows = query_rows(db, f"SELECT * FROM {table}")
+    buf = io.StringIO()
+    if rows:
+        writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({k: ";".join(map(str, v)) if isinstance(v, list) else v for k, v in r.items()})
+    return Response(
+        buf.getvalue(), media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
 # API — Search
 # ---------------------------------------------------------------------------
 
@@ -1173,6 +1403,74 @@ def global_search(q: str = Query("", min_length=2), db=Depends(get_db)):
 _DOMAIN_RE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 
+_URL_SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.-]*://")
+# Scan targets also allow '_' labels (_dmarc, _sip._tls, ...), unlike root domains
+_TARGET_HOST_RE = re.compile(r"^(?:[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+# Header names normalize.read_cmdb_csv accepts for the hostname column
+_CMDB_HOST_COLUMNS = ("fqdn", "hostname", "name")
+
+
+def _normalize_target(token: str) -> str | None:
+    """Hostname, IP or CIDR from one list token; URLs reduce to their host,
+    '*.example.com' to example.com. None when it is none of those."""
+    tok = token.strip().strip("\"'").lower()
+    if "/" in tok and "://" not in tok:
+        try:
+            return str(ipaddress.ip_network(tok, strict=False))
+        except ValueError:
+            pass
+    host = _URL_SCHEME_RE.sub("", tok).split("/", 1)[0].split("?", 1)[0]
+    if host.startswith("["):                     # [v6]:port
+        host = host[1:].split("]", 1)[0]
+    elif host.count(":") == 1:                   # host:port
+        host = host.split(":", 1)[0]
+    host = host.removeprefix("*.").rstrip(".")
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        return host if _TARGET_HOST_RE.match(host) else None
+
+
+def _parse_targets(text: str) -> tuple[list[str], list[str]]:
+    """Targets from a pasted or uploaded list: one per line, or comma /
+    whitespace separated (one-column CSV); '#' starts a comment.
+    Returns (targets deduplicated in order, rejected tokens)."""
+    targets: dict[str, None] = {}
+    rejected: list[str] = []
+    for line in text.splitlines():
+        for tok in re.split(r"[,;\s]+", line.split("#", 1)[0]):
+            if not tok.strip("\"'"):
+                continue
+            target = _normalize_target(tok)
+            if target:
+                targets[target] = None
+            else:
+                rejected.append(tok)
+    return list(targets), rejected
+
+
+def _normalize_cmdb_csv(text: str) -> tuple[str, int]:
+    """Validate a CMDB export and lower-case its header (normalize.read_cmdb_csv
+    matches column names exactly). Returns (csv text, data row count)."""
+    try:
+        rows = list(csv.reader(io.StringIO(text.lstrip("\ufeff"))))
+    except csv.Error as e:
+        raise HTTPException(status_code=400, detail=f"CMDB CSV could not be parsed: {e}")
+    header = [h.strip().lower() for h in rows[0]] if rows else []
+    if not any(h in header for h in _CMDB_HOST_COLUMNS):
+        raise HTTPException(
+            status_code=400,
+            detail=f"CMDB CSV needs a {' / '.join(_CMDB_HOST_COLUMNS)} column "
+                   f"(found: {', '.join(h for h in header if h) or 'no header'})",
+        )
+    data = [r for r in rows[1:] if any(c.strip() for c in r)]
+    if not data:
+        raise HTTPException(status_code=400, detail="CMDB CSV has no data rows")
+    out = io.StringIO()
+    csv.writer(out, lineterminator="\n").writerows([header, *data])
+    return out.getvalue(), len(data)
+
+
 def _read_scan_state() -> dict:
     if SCAN_STATE_FILE.exists():
         try:
@@ -1210,7 +1508,7 @@ def _get_current_stage(scan_id: str | None) -> str | None:
 
 
 def _run_pipeline(scan_id: str, input_file: str, stages: str = "", mode: str = "recon",
-                  root_domains: str = ""):
+                  root_domains: str = "", cmdb_file: str = "", cmdb_rows: int | None = None):
     """Run the pipeline in a background thread."""
     try:
         _write_scan_state({
@@ -1221,6 +1519,8 @@ def _run_pipeline(scan_id: str, input_file: str, stages: str = "", mode: str = "
             "stages": stages or "full",
             "mode": mode or "recon",
             "root_domains": root_domains,
+            "cmdb_file": cmdb_file or None,
+            "cmdb_rows": cmdb_rows,
         })
 
         run_sh = PROJECT_ROOT / "run.sh"
@@ -1228,6 +1528,8 @@ def _run_pipeline(scan_id: str, input_file: str, stages: str = "", mode: str = "
         env["INPUT_SUBDOMAINS_OVERRIDE"] = str(Path(input_file).relative_to(PROJECT_ROOT))
         if root_domains:
             env["ROOT_DOMAINS_OVERRIDE"] = root_domains
+        if cmdb_file:
+            env["CMDB_EXPORT_OVERRIDE"] = str(Path(cmdb_file).relative_to(PROJECT_ROOT))
 
         cmd = ["bash", str(run_sh)]
         if stages:
@@ -1584,7 +1886,14 @@ def _build_comparison(scan_id_a: str, scan_id_b: str, limit: int = 200) -> dict:
 @app.post("/api/scans/new", response_class=ORJSONResponse)
 async def create_scan(request: Request):
     body = await request.json()
-    subdomains_text = body.get("subdomains", "").strip()
+    subdomains_text = str(body.get("subdomains") or "").strip()
+    cmdb_text = str(body.get("cmdb_csv") or "")
+    for label, text in (("Targets list", subdomains_text), ("CMDB CSV", cmdb_text)):
+        if len(text.encode()) > _MAX_INPUT_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"{label} too large (max {_MAX_INPUT_BYTES // 1024 // 1024} MB)",
+            )
     notes = body.get("notes", "")
     stages = body.get("stages", "").strip()
     mode = body.get("mode", "recon").strip() or "recon"
@@ -1604,13 +1913,13 @@ async def create_scan(request: Request):
     if not subdomains_text:
         raise HTTPException(status_code=400, detail="No subdomains provided")
 
-    lines = [
-        line.strip().lower()
-        for line in subdomains_text.splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ]
+    lines, rejected = _parse_targets(subdomains_text)
     if not lines:
-        raise HTTPException(status_code=400, detail="No valid subdomains found")
+        raise HTTPException(
+            status_code=400,
+            detail="No valid targets found" + (f" (e.g. rejected: {', '.join(rejected[:3])})" if rejected else ""),
+        )
+    cmdb_csv, cmdb_rows = _normalize_cmdb_csv(cmdb_text) if cmdb_text.strip() else (None, None)
 
     current = _read_scan_state()
     if current.get("status") == "running":
@@ -1622,11 +1931,16 @@ async def create_scan(request: Request):
     scan_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
     input_file = INPUT_DIR / f"scan_{scan_id}.txt"
-    input_file.write_text("\n".join(sorted(set(lines))) + "\n")
+    input_file.write_text("\n".join(sorted(lines)) + "\n")
+    cmdb_file = ""
+    if cmdb_csv:
+        cmdb_file = str(INPUT_DIR / f"cmdb_{scan_id}.csv")
+        Path(cmdb_file).write_text(cmdb_csv)
 
     thread = threading.Thread(
         target=_run_pipeline,
-        args=(scan_id, str(input_file), stages, mode, ",".join(dict.fromkeys(root_domains))),
+        args=(scan_id, str(input_file), stages, mode, ",".join(dict.fromkeys(root_domains)),
+              cmdb_file, cmdb_rows),
         daemon=True,
     )
     thread.start()
@@ -1636,6 +1950,9 @@ async def create_scan(request: Request):
         "status": "started",
         "subdomain_count": len(lines),
         "input_file": str(input_file),
+        "rejected_count": len(rejected),
+        "rejected_sample": rejected[:10],
+        "cmdb_rows": cmdb_rows,
     }
 
 

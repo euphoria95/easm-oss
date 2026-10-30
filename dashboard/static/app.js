@@ -84,12 +84,15 @@ const SEVERITY_COLORS = {
 const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low', 'info'];
 
 const PIPELINE_STAGES = [
+    { id: 'subfinder',   name: 'Passive Subdomains',     tool: 'subfinder' },
     { id: 'ct',          name: 'CT Log Enrichment',      tool: 'crt.sh' },
     { id: 'dns',         name: 'DNS Resolution',        tool: 'dnsx' },
     { id: 'asn',         name: 'ASN Enrichment',         tool: 'pyasn' },
     { id: 'rdns',        name: 'Reverse DNS',            tool: 'dnsx' },
+    { id: 'cdn',         name: 'CDN/Cloud/WAF Check',    tool: 'cdncheck' },
     { id: 'ports',       name: 'Port Scanning',          tool: 'naabu' },
     { id: 'http',        name: 'HTTP Probing',           tool: 'httpx' },
+    { id: 'waf',         name: 'WAF Detection',          tool: 'waf-detect' },
     { id: 'tls',         name: 'TLS Analysis',           tool: 'tlsx' },
     { id: 'fingerprint', name: 'Fingerprinting',         tool: 'nerva' },
     { id: 'nuclei',      name: 'Vulnerability Scan',     tool: 'nuclei' },
@@ -98,6 +101,7 @@ const PIPELINE_STAGES = [
     { id: 'normalize',   name: 'Normalization',          tool: 'normalize.py', required: true },
     { id: 'load',        name: 'DuckDB Load',            tool: 'load_duckdb.py', required: true },
     { id: 'verify',      name: 'Takeover Verification',  tool: 'verify.py' },
+    { id: 'scope',       name: 'Tenable Scope Routing',  tool: 'cmdb_scope_export.py' },
 ];
 
 const GAP_LABELS = {
@@ -261,6 +265,7 @@ const ICONS = {
     bounty: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5"><circle cx="12" cy="8" r="6"/><path d="M15.477 12.89L17 22l-5-3-5 3 1.523-9.11"/></svg>',
     aimap: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5"><path d="M12 2a4 4 0 0 1 4 4c0 1.95-1.4 3.58-3.25 3.93"/><path d="M12 2a4 4 0 0 0-4 4c0 1.95 1.4 3.58 3.25 3.93"/><circle cx="12" cy="12" r="2"/><path d="M12 14v4"/><path d="M8 18h8"/><path d="M9 22h6"/><circle cx="5" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/><line x1="6.5" y1="12" x2="10" y2="12"/><line x1="14" y1="12" x2="17.5" y2="12"/></svg>',
     livecheck: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>',
+    tenable: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5"><circle cx="12" cy="5" r="2"/><circle cx="5" cy="19" r="2"/><circle cx="19" cy="19" r="2"/><path d="M12 7v4"/><path d="M12 11c-4 0-7 2-7 6"/><path d="M12 11c4 0 7 2 7 6"/></svg>',
     cloud: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg>',
 };
 
@@ -442,6 +447,7 @@ function renderSidebar() {
             { id: 'takeovers', label: 'Takeovers', icon: ICONS.takeovers },
             { id: 'bounty', label: 'Bug Bounty', icon: ICONS.bounty },
             { id: 'livecheck', label: 'Livecheck', icon: ICONS.livecheck },
+            { id: 'tenable', label: 'Tenable Scope', icon: ICONS.tenable },
         ]},
     ];
     return `
@@ -545,6 +551,7 @@ async function renderCurrentPage() {
             case 'cloud': await pageCloud(content); break;
             case 'bounty': await pageBounty(content); break;
             case 'livecheck': await pageLivecheck(content); break;
+            case 'tenable': await pageTenable(content); break;
             case 'archive': await pageArchive(content, state.pageParams.id); break;
             case 'compare': await pageCompare(content, state.pageParams.id, state.pageParams.id2); break;
             default: await pageOverview(content); break;
@@ -1149,6 +1156,7 @@ async function pageAssetDetail(el, fqdn) {
             <div class="card p-4">
                 <div class="text-xs text-slate-500 mb-1">CDN / ASN</div>
                 <div class="text-sm text-white">${esc(net.cdn || 'Direct')} &middot; ${esc(asn.org || 'N/A')}</div>
+                ${net.waf ? `<div class="text-xs text-slate-500 mt-1">WAF: <span class="text-accent">${esc(net.waf.provider)}</span> ${fmtPct((net.waf.confidence || 0) * 100)}</div>` : ''}
             </div>
             <div class="card p-4">
                 <div class="text-xs text-slate-500 mb-1">Open Ports</div>
@@ -2158,6 +2166,7 @@ function renderAssetPanelContent(asset) {
                 <div class="text-[10px] text-slate-500 uppercase tracking-wider mb-1">Network</div>
                 <div class="text-xs text-white">${esc(net.cdn || 'Direct')}</div>
                 <div class="text-[10px] text-slate-500 mt-0.5">${esc(asn.org || '—')}</div>
+                ${net.waf ? `<div class="text-[10px] text-slate-500 mt-0.5">WAF: <span class="text-accent">${esc(net.waf.provider)}</span></div>` : ''}
             </div>
         </div>
 
@@ -2354,7 +2363,8 @@ async function renderTechTab(el) {
 
 async function renderCDNTab(el) {
     const data = await api('/network/cdn');
-    const items = Array.isArray(data) ? data : [];
+    const items = Array.isArray(data) ? data : (data.summary || []);
+    const wafItems = data.waf || [];
 
     el.innerHTML = `
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
@@ -2388,6 +2398,28 @@ async function renderCDNTab(el) {
                 </div>
             </div>
         </div>
+        ${wafItems.length ? `
+        <div class="card overflow-hidden">
+            <div class="px-5 pt-4 pb-2 flex items-baseline justify-between">
+                <h3 class="text-sm font-semibold text-slate-300">WAF Providers</h3>
+                <span class="text-[10px] text-slate-500 font-mono">cdncheck · waf-detect</span>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="data-table">
+                    <thead><tr><th>WAF Provider</th><th>Assets</th><th>Avg confidence</th><th>Fingerprinted</th></tr></thead>
+                    <tbody>
+                        ${wafItems.map(w => `
+                            <tr>
+                                <td class="font-medium">${esc(w.waf_provider)}</td>
+                                <td>${fmt(w.count)}</td>
+                                <td>${fmtPct((w.avg_confidence || 0) * 100)}</td>
+                                <td>${fmt(w.fingerprinted)}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            </div>
+        </div>` : ''}
     `;
 
     if (items.length) {
@@ -2852,43 +2884,64 @@ async function pageScans(el) {
 
                 <!-- New Scan Form -->
                 <div class="card p-5">
-                    <div class="flex items-center justify-between mb-4">
+                    <div class="flex items-center justify-between mb-4 gap-2">
                         <h3 class="text-sm font-semibold text-slate-300">New Scan</h3>
-                        <span id="subdomain-count" class="subdomain-counter">0 subdomains</span>
+                        <div class="flex items-center gap-2 min-w-0">
+                            <span id="scan-targets-file" class="scan-file-chip hidden"></span>
+                            <span id="subdomain-count" class="subdomain-counter">0 targets</span>
+                        </div>
                     </div>
                     <textarea
                         id="scan-subdomains"
                         class="scan-textarea mb-3"
                         rows="12"
-                        placeholder="Enter subdomains, one per line&#10;&#10;example.com&#10;app.example.com&#10;api.example.com&#10;staging.example.org&#10;&#10;Lines starting with # are ignored"
+                        placeholder="Enter targets one per line, or drop a targets.txt / .csv here&#10;&#10;example.com&#10;app.example.com&#10;https://api.example.com/login&#10;203.0.113.0/28&#10;&#10;# starts a comment"
                         ${active ? 'disabled' : ''}
                     ></textarea>
                     <input id="scan-root-domains" type="text"
-                           placeholder="Root domains for CT enrichment — optional, comma-separated (e.g. example.com)"
+                           placeholder="Root domains for subfinder + CT enrichment — optional, comma-separated (e.g. example.com)"
                            class="w-full text-xs bg-[#0B100E] border border-slate-700 rounded px-2 py-1.5 mb-3 text-slate-300 placeholder-slate-600 focus:outline-none focus:border-accent"
                            ${active ? 'disabled' : ''} />
+                    <div class="scan-cmdb-row mb-3">
+                        <div class="flex items-center justify-between gap-2">
+                            <div class="min-w-0">
+                                <div class="text-xs text-slate-400">CMDB export <span class="text-slate-600">— optional CSV</span></div>
+                                <div id="scan-cmdb-status" class="text-[11px] text-slate-600 truncate">Not attached — falls back to data/input/cmdb_export.csv</div>
+                            </div>
+                            <div class="flex items-center gap-1.5 shrink-0">
+                                <input id="scan-cmdb-file" type="file" accept=".csv,text/csv" class="hidden" onchange="attachCmdbFile(this)" />
+                                <button onclick="document.getElementById('scan-cmdb-file').click()" class="btn-secondary text-xs py-1 px-2" ${active ? 'disabled' : ''}>
+                                    ${ICONS.upload}<span>Choose CSV</span>
+                                </button>
+                                <button id="scan-cmdb-clear" onclick="clearCmdbFile()" class="btn-secondary text-xs py-1 px-2 hidden" ${active ? 'disabled' : ''}>Clear</button>
+                            </div>
+                        </div>
+                        <p class="text-[10px] text-slate-600 mt-1">Used for CMDB matching, CMDB Livecheck and CMDB-only Tenable scope. Needs an <span class="font-mono">fqdn</span>, <span class="font-mono">hostname</span> or <span class="font-mono">name</span> column.</p>
+                        <p id="scan-cmdb-warn" class="text-[11px] text-yellow-400/80 mt-1 hidden">CMDB Livecheck validates CMDB records — attach an export unless data/input/cmdb_export.csv is in place.</p>
+                    </div>
                     <div class="flex items-center gap-3 mb-3">
                         <span class="text-xs text-slate-400 whitespace-nowrap">Mode:</span>
                         <label class="flex items-center gap-1.5 cursor-pointer">
-                            <input type="radio" name="scan-mode" value="recon" checked
+                            <input type="radio" name="scan-mode" value="recon" onchange="_updateCmdbHint()" checked
                                    class="accent-[#5FE8C6]" ${active ? 'disabled' : ''}>
                             <span class="text-xs text-slate-300">Recon</span>
                         </label>
                         <label class="flex items-center gap-1.5 cursor-pointer">
-                            <input type="radio" name="scan-mode" value="bounty"
+                            <input type="radio" name="scan-mode" value="bounty" onchange="_updateCmdbHint()"
                                    class="accent-[#5FE8C6]" ${active ? 'disabled' : ''}>
                             <span class="text-xs text-slate-300">Bug Bounty Prepare</span>
                         </label>
                         <label class="flex items-center gap-1.5 cursor-pointer">
-                            <input type="radio" name="scan-mode" value="livecheck"
+                            <input type="radio" name="scan-mode" value="livecheck" onchange="_updateCmdbHint()"
                                    class="accent-[#5FE8C6]" ${active ? 'disabled' : ''}>
                             <span class="text-xs text-slate-300">CMDB Livecheck</span>
                         </label>
                     </div>
                     <div class="flex items-center justify-between">
                         <div class="flex items-center gap-2">
-                            <button onclick="loadExampleSubdomains()" class="btn-secondary" ${active ? 'disabled' : ''}>
-                                Load from file
+                            <input id="scan-targets-input" type="file" accept=".txt,.csv,.lst,.list,text/plain,text/csv" class="hidden" onchange="uploadTargetsFile(this.files[0]); this.value = ''" />
+                            <button onclick="document.getElementById('scan-targets-input').click()" class="btn-secondary" ${active ? 'disabled' : ''}>
+                                ${ICONS.upload} Upload targets
                             </button>
                         </div>
                         <button id="btn-start-scan" onclick="startScan()" class="btn-primary" ${active ? 'disabled' : ''}>
@@ -2971,17 +3024,27 @@ async function pageScans(el) {
         </div>
     `;
 
-    // Subdomain counter
+    // Target counter + drag-and-drop upload
     const textarea = document.getElementById('scan-subdomains');
     const counter = document.getElementById('subdomain-count');
     if (textarea && counter) {
         const updateCount = () => {
-            const lines = textarea.value.split('\n').filter(l => l.trim() && !l.trim().startsWith('#'));
-            counter.textContent = `${lines.length} subdomain${lines.length !== 1 ? 's' : ''}`;
-            counter.classList.toggle('has-content', lines.length > 0);
+            const n = _countTargets(textarea.value);
+            counter.textContent = `${fmt(n)} target${n !== 1 ? 's' : ''}`;
+            counter.classList.toggle('has-content', n > 0);
         };
         textarea.addEventListener('input', updateCount);
+        if (!active) {
+            textarea.addEventListener('dragover', e => { e.preventDefault(); textarea.classList.add('scan-dropzone-active'); });
+            textarea.addEventListener('dragleave', () => textarea.classList.remove('scan-dropzone-active'));
+            textarea.addEventListener('drop', e => {
+                e.preventDefault();
+                textarea.classList.remove('scan-dropzone-active');
+                if (e.dataTransfer.files.length) uploadTargetsFile(e.dataTransfer.files[0]);
+            });
+        }
     }
+    _scanCmdb = null;
 
     // Poll if scan is running
     if (_scanPollTimer) clearInterval(_scanPollTimer);
@@ -3240,13 +3303,13 @@ window.startScan = async function() {
 
     const subdomains = textarea.value.trim();
     if (!subdomains) {
-        alert('Please enter at least one subdomain');
+        alert('Please enter or upload at least one target');
         return;
     }
 
-    const lines = subdomains.split('\n').filter(l => l.trim() && !l.trim().startsWith('#'));
-    if (lines.length === 0) {
-        alert('No valid subdomains found (lines starting with # are comments)');
+    const count = _countTargets(subdomains);
+    if (count === 0) {
+        alert('No targets found (# starts a comment)');
         return;
     }
 
@@ -3256,11 +3319,12 @@ window.startScan = async function() {
     const modeEl = document.querySelector('input[name="scan-mode"]:checked');
     const mode = modeEl ? modeEl.value : 'recon';
     const stageInfo = (stages ? `\nStages: ${stages}` : '\nAll pipeline stages will run.')
-        + (root_domains ? `\nCT enrichment for: ${root_domains}` : '');
+        + (root_domains ? `\nsubfinder + CT enrichment for: ${root_domains}` : '');
     const modeInfo = mode === 'bounty' ? '\nMode: Bug Bounty Prepare (expanded scanning)'
         : mode === 'livecheck' ? '\nMode: CMDB Livecheck (DNS-only scope validation)' : '';
+    const cmdbInfo = _scanCmdb ? `\nCMDB export: ${_scanCmdb.name} (${fmt(_scanCmdb.rows)} rows)` : '';
 
-    if (!confirm(`Start scan with ${lines.length} subdomain${lines.length !== 1 ? 's' : ''}?\n${stageInfo}${modeInfo}\n\nThis will archive the current scan data.`)) {
+    if (!confirm(`Start scan with ~${fmt(count)} target${count !== 1 ? 's' : ''}?\n${stageInfo}${modeInfo}${cmdbInfo}\n\nThis will archive the current scan data.`)) {
         return;
     }
 
@@ -3271,13 +3335,19 @@ window.startScan = async function() {
         const result = await fetch('/api/scans/new', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ subdomains, stages, mode, root_domains }),
+            body: JSON.stringify({ subdomains, stages, mode, root_domains, cmdb_csv: _scanCmdb ? _scanCmdb.text : '' }),
         });
         const data = await result.json();
 
         if (!result.ok) {
             throw new Error(data.detail || 'Failed to start scan');
         }
+        if (data.rejected_count) {
+            alert(`Scan started with ${fmt(data.subdomain_count)} targets.\n\n`
+                + `${fmt(data.rejected_count)} entr${data.rejected_count !== 1 ? 'ies were' : 'y was'} not a hostname, IP or CIDR and ${data.rejected_count !== 1 ? 'were' : 'was'} skipped, e.g.:\n`
+                + data.rejected_sample.slice(0, 5).join('\n'));
+        }
+        _scanCmdb = null;
 
         const el = document.getElementById('page-content');
         if (el) pageScans(el);
@@ -3288,29 +3358,88 @@ window.startScan = async function() {
     }
 };
 
-window.loadExampleSubdomains = async function() {
+const SCAN_INPUT_MAX_BYTES = 20 * 1024 * 1024;   // matches _MAX_INPUT_BYTES in app.py
+let _scanCmdb = null;   // { name, text, rows } — CMDB export attached to the next scan
+
+// Rough client-side count; the server does the real parsing (URLs → hosts, dedupe)
+function _countTargets(text) {
+    const seen = new Set();
+    text.split('\n').forEach(line => line.split('#')[0].split(/[,;\s]+/).forEach(t => {
+        t = t.trim().replace(/^["']|["']$/g, '').toLowerCase();
+        if (t) seen.add(t);
+    }));
+    return seen.size;
+}
+
+function _readTextFile(file) {
+    return new Promise((resolve, reject) => {
+        if (file.size > SCAN_INPUT_MAX_BYTES) {
+            reject(new Error(`${file.name} is larger than ${SCAN_INPUT_MAX_BYTES / 1024 / 1024} MB`));
+            return;
+        }
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || '').replace(/^﻿/, ''));
+        reader.onerror = () => reject(reader.error || new Error('Could not read file'));
+        reader.readAsText(file);
+    });
+}
+
+window.uploadTargetsFile = async function(file) {
     const textarea = document.getElementById('scan-subdomains');
-    if (!textarea) return;
-
+    const chip = document.getElementById('scan-targets-file');
+    if (!file || !textarea || textarea.disabled) return;
     try {
-        const response = await fetch('/api/scans/active');
-        if (response.ok) {
-            textarea.placeholder = 'Loading current subdomains file...';
-        }
-    } catch { /* ignore */ }
-
-    try {
-        const res = await fetch('/static/sample_subdomains.txt');
-        if (res.ok) {
-            textarea.value = await res.text();
-        } else {
-            textarea.value = '# Paste your subdomains here, one per line\n# Example:\nexample.com\nwww.example.com\napi.example.com\napp.example.com\nstaging.example.com\n';
-        }
-    } catch {
-        textarea.value = '# Paste your subdomains here, one per line\n# Example:\nexample.com\nwww.example.com\napi.example.com\napp.example.com\nstaging.example.com\n';
+        textarea.value = await _readTextFile(file);
+    } catch (e) {
+        alert('Upload failed: ' + e.message);
+        return;
     }
-
     textarea.dispatchEvent(new Event('input'));
+    if (chip) {
+        chip.textContent = file.name;
+        chip.title = `Loaded from ${file.name} — review or edit below before starting`;
+        chip.classList.remove('hidden');
+    }
+};
+
+window.attachCmdbFile = async function(input) {
+    const file = input.files && input.files[0];
+    input.value = '';
+    if (!file) return;
+    let text;
+    try {
+        text = await _readTextFile(file);
+    } catch (e) {
+        alert('CMDB upload failed: ' + e.message);
+        return;
+    }
+    const lines = text.split(/\r?\n/).filter(l => l.trim());
+    const header = (lines[0] || '').toLowerCase().split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+    if (!header.some(h => ['fqdn', 'hostname', 'name'].includes(h))) {
+        alert(`${file.name}: no fqdn / hostname / name column in the header row.\n\nFound: ${header.join(', ') || '(empty)'}`);
+        return;
+    }
+    _scanCmdb = { name: file.name, text, rows: Math.max(0, lines.length - 1) };
+    _updateCmdbHint();
+};
+
+window.clearCmdbFile = function() {
+    _scanCmdb = null;
+    _updateCmdbHint();
+};
+
+window._updateCmdbHint = function() {
+    const status = document.getElementById('scan-cmdb-status');
+    const clear = document.getElementById('scan-cmdb-clear');
+    const warn = document.getElementById('scan-cmdb-warn');
+    const mode = document.querySelector('input[name="scan-mode"]:checked');
+    if (status) {
+        status.innerHTML = _scanCmdb
+            ? `<span class="font-mono text-slate-300">${esc(_scanCmdb.name)}</span> · <span class="text-accent">${fmt(_scanCmdb.rows)} rows</span>`
+            : 'Not attached — falls back to data/input/cmdb_export.csv';
+    }
+    if (clear) clear.classList.toggle('hidden', !_scanCmdb);
+    if (warn) warn.classList.toggle('hidden', !!_scanCmdb || !mode || mode.value !== 'livecheck');
 };
 
 window.restoreArchive = async function(scanId) {
@@ -5205,6 +5334,485 @@ function _lcEmpty(title, desc) {
         </div>
     `;
 }
+
+// ---------------------------------------------------------------------------
+// Page: Tenable Scope (VM / WAS routing)
+// ---------------------------------------------------------------------------
+
+const TS_CATEGORIES = {
+    direct:         { label: 'Direct IP',           color: '#2FD9B0' },
+    owned_shared:   { label: 'Owned shared IP',     color: '#5FE8C6' },
+    non_http:       { label: 'Non-HTTP only',       color: '#A3E635' },
+    api:            { label: 'API / AI endpoint',   color: '#4D9DFF' },
+    cdn:            { label: 'Behind CDN',          color: '#a78bfa' },
+    waf:            { label: 'Behind WAF',          color: '#f97316' },
+    third_party:    { label: '3rd-party / hosting', color: '#F472B6' },
+    cloud_paas:     { label: 'Cloud PaaS',          color: '#FBBF24' },
+    static_or_dead: { label: 'Static / dead',       color: '#667A72' },
+    takeover:       { label: 'Takeover',            color: '#ef4444' },
+};
+
+const TS_REASONS = {
+    cdn: 'CDN edge', waf: 'WAF', third_party: '3rd-party', cloud_paas: 'Cloud PaaS',
+    takeover: 'Takeover', non_routable: 'Non-routable IP', ownership_unverified: 'Ownership unverified',
+    dead: 'Dead', no_open_ports: 'No open ports', redirect_only: 'Redirect only', parked: 'Parked',
+    not_in_cmdb: 'Not in CMDB', non_http_only: 'No HTTP service', default_page: 'Default server page',
+    no_app_content: 'No app content', cloud_storage: 'Cloud storage', static_hosting: 'Static hosting',
+    managed_service: 'Managed service', third_party_saas: '3rd-party SaaS',
+};
+
+const TS_VM_COLORS = { include: '#2FD9B0', review: '#eab308', exclude: '#47564F' };
+const TS_WAS_COLORS = { standard: '#2FD9B0', waf: '#f97316', api: '#4D9DFF', exclude: '#47564F' };
+
+const TS_TABS = [
+    { id: 'vm_include',   label: 'VM targets' },
+    { id: 'vm_exclude',   label: 'VM exclusions' },
+    { id: 'vm_review',    label: 'VM review' },
+    { id: 'was_standard', label: 'WAS standard' },
+    { id: 'was_waf',      label: 'WAS · WAF' },
+    { id: 'was_api',      label: 'WAS · API' },
+    { id: 'assets',       label: 'All assets' },
+];
+
+let tsState = { tab: 'vm_include', page: 1, q: '', category: '', vm: '', was: '', cmdb: '' };
+
+function tsCategoryBadge(cat) {
+    const c = TS_CATEGORIES[cat] || { label: cat || '-', color: '#667A72' };
+    return `<span class="ts-chip" style="--chip:${c.color}"><span class="ts-dot"></span>${esc(c.label)}</span>`;
+}
+
+function tsActionBadge(action, colors) {
+    const color = colors[action] || '#667A72';
+    return `<span class="ts-chip" style="--chip:${color}"><span class="ts-dot"></span>${esc(action || '-')}</span>`;
+}
+
+function tsReasonLabel(reason) {
+    const [kind, ...rest] = String(reason).split(':');
+    const label = TS_REASONS[kind] || kind;
+    const detail = rest.filter(Boolean).pop();
+    return detail ? `${label} · ${detail}` : label;
+}
+
+function tsReasons(list) {
+    if (!list || !list.length) return '<span class="text-slate-600">-</span>';
+    return list.map(r => `<span class="ts-reason">${esc(tsReasonLabel(r))}</span>`).join(' ');
+}
+
+function tsSpectrum(parts, total) {
+    const nonzero = parts.filter(p => p.value > 0);
+    return `
+        <div class="spectrum">
+            ${total ? nonzero.map(p => `<span style="flex-grow:${p.value};background:${p.color}" title="${esc(p.label)}: ${fmt(p.value)}"></span>`).join('') : ''}
+        </div>
+        <div class="spectrum-legend">
+            ${parts.map(p => `
+                <span class="item"><span class="dot" style="background:${p.color}"></span>${esc(p.label)} <span class="val">${fmt(p.value)}</span></span>
+            `).join('')}
+        </div>
+    `;
+}
+
+function tsModePair(key, value, cls = '', title = '') {
+    return `<span class="inline-flex items-baseline gap-2 whitespace-nowrap" ${title ? `title="${esc(title)}"` : ''}>
+        <span class="ts-mode-key">${esc(key)}</span><span class="ts-mode-val ${cls}">${esc(value)}</span></span>`;
+}
+
+function tsModeStrip(meta) {
+    if (!meta) {
+        return `<div class="ts-mode ts-mode-warn mb-4">Routing settings were not recorded for this run — re-run <code>./run.sh --stage scope</code>.</div>`;
+    }
+    const owned = [...(meta.owned_cidrs || []), ...(meta.owned_asns || []).map(a => `AS${a}`)];
+    const enforced = !!meta.require_owned;
+    return `
+        <div class="ts-mode ${enforced ? '' : 'ts-mode-warn'} mb-4">
+            <div class="flex flex-wrap items-center gap-x-6 gap-y-2">
+                ${tsModePair('Ownership', enforced ? 'enforced — unowned IPs go to review' : 'not enforced',
+                             enforced ? 'text-accent' : 'text-yellow-400')}
+                ${tsModePair('Owned ranges', owned.length
+                    ? owned.slice(0, 4).join(', ') + (owned.length > 4 ? ` +${owned.length - 4}` : '')
+                    : 'none declared', '', owned.join(', '))}
+                ${tsModePair('Scope', meta.cmdb_only ? 'CMDB-registered only' : 'all discovered assets')}
+                ${tsModePair('Thresholds', `CDN ≥ ${meta.cdn_min_confidence} · WAF ≥ ${meta.waf_min_confidence}`)}
+                ${tsModePair('SaaS → WAS', meta.was_include_saas ? 'yes' : 'no')}
+                <span class="ml-auto">${tsModePair('Routed', fmtDate(meta.routed_at))}</span>
+            </div>
+            ${enforced ? '' : `
+                <p class="text-xs text-slate-400 mt-2">
+                    IPs are routed on observed signals only (CDN, WAF, 3rd-party, PaaS, takeover). Confirm ownership of
+                    <span class="font-mono">VM targets</span> before importing them. Gate unknown IPs with
+                    <span class="font-mono">TENABLE_OWNED_CIDRS</span> / <span class="font-mono">TENABLE_OWNED_ASNS</span>
+                    and <span class="font-mono">TENABLE_VM_REQUIRE_OWNED=true</span>.
+                </p>`}
+        </div>
+    `;
+}
+
+function tsReasonBars(title, rows, unit) {
+    const byKind = {};
+    rows.forEach(r => {
+        const k = byKind[r.kind] || (byKind[r.kind] = { count: 0, detail: [] });
+        k.count += r.count;
+        k.detail.push(`${r.reason} (${r.count})`);
+    });
+    const kinds = Object.entries(byKind).sort((a, b) => b[1].count - a[1].count);
+    const max = kinds.length ? kinds[0][1].count : 1;
+    return `
+        <div>
+            <div class="eyebrow mb-3">${esc(title)}</div>
+            ${kinds.length ? kinds.map(([kind, k]) => `
+                <div class="ts-bar-row" title="${esc(k.detail.slice(0, 12).join('\n'))}">
+                    <span class="ts-bar-label">${esc(TS_REASONS[kind] || kind)}</span>
+                    <span class="ts-bar-track"><span style="width:${(k.count / max * 100).toFixed(1)}%"></span></span>
+                    <span class="ts-bar-val">${fmt(k.count)}</span>
+                </div>
+            `).join('') : `<p class="text-xs text-slate-600">No ${esc(unit)} excluded</p>`}
+        </div>
+    `;
+}
+
+async function pageTenable(el) {
+    let data;
+    try {
+        data = await api('/tenable-scope');
+    } catch (e) {
+        el.innerHTML = `
+            <div class="mb-6">
+                <h1 class="text-2xl font-bold text-white">Tenable Scope</h1>
+                <p class="text-sm text-slate-500 mt-1">Scanner routing — Tenable VM by IP, Tenable WAS by URL</p>
+            </div>
+            <div class="card p-10 text-center">
+                <div class="text-slate-600 mb-4 flex justify-center">${ICONS.tenable}</div>
+                <p class="text-slate-300 font-medium mb-2">No scope routing for the current scan</p>
+                <p class="text-sm text-slate-500 mb-4">Routing runs at the end of a recon scan. Re-route the loaded database without re-scanning:</p>
+                <code class="text-xs text-accent bg-slate-800 px-3 py-1 rounded">./run.sh --stage scope</code>
+            </div>
+        `;
+        return;
+    }
+
+    const vm = data.vm || {};
+    const vmCount = a => (vm[a] || {}).ips || 0;
+    const vmTotal = vmCount('include') + vmCount('review') + vmCount('exclude');
+    const was = data.was_urls || {};
+    const wasUrls = (was.standard || 0) + (was.waf || 0) + (was.api || 0);
+    const assets = data.assets || {};
+    const included = vm.include || {};
+
+    el.innerHTML = `
+        <div class="flex items-start justify-between gap-4 mb-5">
+            <div>
+                <h1 class="text-2xl font-bold text-white">Tenable Scope</h1>
+                <p class="text-sm text-slate-500 mt-1">
+                    ${fmt(assets.total)} assets routed${data.meta && data.meta.scan_id ? ` · scan <span class="font-mono">${esc(data.meta.scan_id)}</span>` : ''}
+                    · ${fmt(assets.in_cmdb)} in CMDB
+                </p>
+            </div>
+        </div>
+
+        ${tsModeStrip(data.meta)}
+
+        <div class="readout mb-6">
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                <div>
+                    <div class="eyebrow mb-2">Tenable VM · network, by IP</div>
+                    <div class="flex items-baseline gap-3 mb-3">
+                        <span class="kpi-value text-4xl">${fmt(vmCount('include'))}</span>
+                        <span class="text-sm text-slate-500">IPs to scan${included.fqdns ? ` · covering ${fmt(included.fqdns)} FQDNs` : ''}${included.shared_ips ? ` · ${fmt(included.shared_ips)} shared` : ''}</span>
+                    </div>
+                    ${tsSpectrum([
+                        { label: 'include', value: vmCount('include'), color: TS_VM_COLORS.include },
+                        { label: 'review', value: vmCount('review'), color: TS_VM_COLORS.review },
+                        { label: 'exclude', value: vmCount('exclude'), color: TS_VM_COLORS.exclude },
+                    ], vmTotal)}
+                </div>
+                <div>
+                    <div class="eyebrow mb-2">Tenable WAS · DAST, by URL</div>
+                    <div class="flex items-baseline gap-3 mb-3">
+                        <span class="kpi-value text-4xl">${fmt(wasUrls)}</span>
+                        <span class="text-sm text-slate-500">URLs from ${fmt(assets.was_included)} assets · ${fmt(assets.was_excluded)} assets not DAST targets</span>
+                    </div>
+                    ${tsSpectrum([
+                        { label: 'standard', value: was.standard || 0, color: TS_WAS_COLORS.standard },
+                        { label: 'waf allow-list', value: was.waf || 0, color: TS_WAS_COLORS.waf },
+                        { label: 'api', value: was.api || 0, color: TS_WAS_COLORS.api },
+                    ], wasUrls)}
+                </div>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_22rem] gap-4 mb-6">
+            <div class="card overflow-hidden">
+                <div class="px-5 py-3 border-b border-surface-border flex items-center justify-between">
+                    <h3 class="text-sm font-semibold text-slate-300">Routing matrix</h3>
+                    <span class="text-[10px] text-slate-600 font-mono">assets · click a row to list them</span>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="data-table w-full text-xs">
+                        <thead><tr>
+                            <th class="text-left">Category</th>
+                            <th class="text-right">Assets</th>
+                            <th class="text-right">VM incl</th>
+                            <th class="text-right">VM excl</th>
+                            <th class="text-right">WAS std</th>
+                            <th class="text-right">WAS waf</th>
+                            <th class="text-right">WAS api</th>
+                            <th class="text-right">WAS excl</th>
+                        </tr></thead>
+                        <tbody>
+                            ${(data.categories || []).map(c => `
+                                <tr class="clickable" onclick="tsFilterCategory('${esc(c.category)}')">
+                                    <td>${tsCategoryBadge(c.category)}</td>
+                                    <td class="text-right text-slate-200 font-semibold">${fmt(c.assets)}</td>
+                                    ${['vm_include', 'vm_exclude', 'was_standard', 'was_waf', 'was_api', 'was_exclude'].map(k =>
+                                        `<td class="text-right font-mono ${c[k] ? 'text-slate-300' : 'text-slate-700'}">${fmt(c[k])}</td>`).join('')}
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="card p-5 flex flex-col gap-6">
+                ${tsReasonBars('Why IPs stay out of VM', data.vm_reasons || [], 'IPs')}
+                ${tsReasonBars('Why assets are not DAST targets', data.was_reasons || [], 'assets')}
+            </div>
+        </div>
+
+        <div class="card p-4 mb-6">
+            <div class="flex flex-wrap items-center gap-2">
+                <span class="eyebrow mr-2">Import files</span>
+                ${[
+                    ['vm_include', 'VM include', vmCount('include')],
+                    ['vm_exclude', 'VM exclude', vmCount('exclude')],
+                    ['vm_review', 'VM review', vmCount('review')],
+                    ['was_standard', 'WAS standard', was.standard || 0],
+                    ['was_waf', 'WAS WAF', was.waf || 0],
+                    ['was_api', 'WAS API', was.api || 0],
+                ].map(([kind, label, n]) => `
+                    <button class="btn-secondary text-xs py-1 px-2" onclick="tsDownload('${kind}')" ${n ? '' : 'disabled'}>
+                        ${ICONS.download}<span>${label}</span><span class="font-mono text-slate-500">${fmt(n)}</span>
+                    </button>
+                `).join('')}
+                <span class="mx-1 h-5 border-l border-surface-border"></span>
+                <button class="btn-secondary text-xs py-1 px-2" onclick="tsDownload('assets')">${ICONS.download}<span>Per-asset CSV</span></button>
+                <button class="btn-secondary text-xs py-1 px-2" onclick="tsDownload('vm_targets')">${ICONS.download}<span>Per-IP CSV</span></button>
+                <span class="mx-1 h-5 border-l border-surface-border"></span>
+                <button class="btn-secondary text-xs py-1 px-2" onclick="tsDownload('xlsx')"
+                        title="Workbook: Summary, All, Tenable VM Candidates, Tenable WAS Candidates, Columns">
+                    ${ICONS.download}<span>XLSX workbook</span>
+                </button>
+            </div>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-1 mb-4 border-b border-surface-border pb-px">
+            ${TS_TABS.map(t => {
+                const n = t.id.startsWith('vm_') ? vmCount(t.id.slice(3))
+                        : t.id === 'assets' ? assets.total : was[t.id.slice(4)] || 0;
+                return `<button class="lc-tab ${tsState.tab === t.id ? 'active' : ''}" data-ts-tab="${t.id}" onclick="tsSwitchTab('${t.id}')">
+                    ${t.label} <span class="ml-1 text-[10px] text-slate-500 font-mono">${fmt(n)}</span></button>`;
+            }).join('')}
+        </div>
+        <div id="ts-filters" class="flex flex-wrap items-center gap-3 mb-4"></div>
+        <div id="ts-tab-content">${renderLoadingState()}</div>
+    `;
+
+    window._tsCategories = (data.categories || []).map(c => c.category);
+    tsRenderFilters();
+    await tsLoad();
+}
+
+function tsRenderFilters() {
+    const box = document.getElementById('ts-filters');
+    if (!box) return;
+    const isAssets = tsState.tab === 'assets';
+    const isWas = tsState.tab.startsWith('was_');
+    const opt = (v, label, cur) => `<option value="${v}" ${cur === v ? 'selected' : ''}>${esc(label)}</option>`;
+    box.innerHTML = `
+        <div class="relative flex-1 min-w-[240px] max-w-md">
+            <div class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500">${ICONS.search}</div>
+            <input type="text" id="ts-search" class="search-input" value="${esc(tsState.q)}"
+                   placeholder="${tsState.tab.startsWith('vm_') ? 'Search IP, FQDN or ASN…' : 'Search FQDN, URL or IP…'}">
+        </div>
+        ${isAssets || isWas ? `
+            <select class="search-input max-w-[200px]" onchange="tsSetFilter('category', this.value)">
+                ${opt('', 'All categories', tsState.category)}
+                ${(window._tsCategories || []).map(c => opt(c, (TS_CATEGORIES[c] || {}).label || c, tsState.category)).join('')}
+            </select>` : ''}
+        ${isAssets ? `
+            <select class="search-input max-w-[150px]" onchange="tsSetFilter('vm', this.value)">
+                ${opt('', 'VM: any', tsState.vm)}${opt('include', 'VM: include', tsState.vm)}${opt('exclude', 'VM: exclude', tsState.vm)}${opt('review', 'VM: review', tsState.vm)}
+            </select>
+            <select class="search-input max-w-[160px]" onchange="tsSetFilter('was', this.value)">
+                ${opt('', 'WAS: any', tsState.was)}${opt('standard', 'WAS: standard', tsState.was)}${opt('waf', 'WAS: waf', tsState.was)}${opt('api', 'WAS: api', tsState.was)}${opt('exclude', 'WAS: exclude', tsState.was)}
+            </select>
+            <select class="search-input max-w-[150px]" onchange="tsSetFilter('cmdb', this.value)">
+                ${opt('', 'CMDB: any', tsState.cmdb)}${opt('1', 'In CMDB', tsState.cmdb)}${opt('0', 'Not in CMDB', tsState.cmdb)}
+            </select>` : ''}
+    `;
+    document.getElementById('ts-search').addEventListener('input', debounce(e => {
+        tsState.q = e.target.value;
+        tsState.page = 1;
+        tsLoad();
+    }, 300));
+}
+
+async function tsLoad() {
+    const content = document.getElementById('ts-tab-content');
+    if (!content) return;
+    const s = tsState;
+    let data;
+    try {
+        data = await api('/tenable-scope/list', {
+            kind: s.tab, q: s.q, page: s.page, per_page: 50,
+            category: s.category, vm: s.vm, was: s.was, cmdb: s.cmdb,
+        });
+    } catch (e) {
+        content.innerHTML = renderErrorState(e.message);
+        return;
+    }
+    if (!data.items.length) {
+        content.innerHTML = _lcEmpty('Nothing here', s.q || s.category || s.vm || s.was || s.cmdb
+            ? 'No rows match the current filters.' : 'This list is empty for the current scan.');
+        return;
+    }
+    const table = s.tab.startsWith('vm_') ? tsVmTable(data.items, s.tab)
+                : s.tab === 'assets' ? tsAssetsTable(data.items) : tsWasTable(data.items, s.tab);
+    content.innerHTML = `
+        <div class="card overflow-hidden">
+            <div class="overflow-x-auto">${table}</div>
+            <div class="flex items-center justify-between">
+                <span class="text-[10px] text-slate-600 font-mono px-4">${fmt(data.total)} rows</span>
+                ${data.pages > 1 ? renderPagination(data.page, data.pages, 'ts') : ''}
+            </div>
+        </div>
+    `;
+}
+
+function tsFqdnLink(fqdn) {
+    return `<button class="font-mono text-slate-200 hover:text-accent text-left" onclick="openAssetPanel('${esc(fqdn)}')">${esc(fqdn)}</button>`;
+}
+
+function tsVmTable(items, tab) {
+    const excl = tab === 'vm_exclude';
+    return `
+        <table class="data-table w-full text-xs">
+            <thead><tr>
+                <th class="text-left">IP</th>
+                <th class="text-left">Primary FQDN</th>
+                <th class="text-right">FQDNs</th>
+                <th class="text-left">${excl ? 'Reasons' : 'Type'}</th>
+                <th class="text-left">Ports</th>
+                <th class="text-left">ASN org</th>
+                <th class="text-center">Owned</th>
+            </tr></thead>
+            <tbody>
+                ${items.map(r => `
+                    <tr>
+                        <td class="font-mono text-slate-200">${esc(r.target_ip)}</td>
+                        <td>${r.primary_fqdn && r.primary_fqdn !== r.target_ip ? tsFqdnLink(r.primary_fqdn) : '<span class="text-slate-600">-</span>'}</td>
+                        <td class="text-right font-mono text-slate-300" title="${esc((r.fqdns || []).join('\n'))}">${fmt(r.fqdn_count)}</td>
+                        <td>${excl ? tsReasons(r.reasons) : tsCategoryBadge(r.vm_category)}</td>
+                        <td class="font-mono text-slate-400" title="${esc((r.ports || []).join(', '))}">${esc((r.ports || []).slice(0, 8).join(', '))}${(r.ports || []).length > 8 ? ` +${r.ports.length - 8}` : ''}</td>
+                        <td class="text-slate-400 max-w-[220px] truncate" title="${esc(r.asn_org || '')}">${esc(r.asn_org || '-')}</td>
+                        <td class="text-center">${r.owned ? '<span class="text-accent">✓</span>' : '<span class="text-slate-600">-</span>'}</td>
+                    </tr>
+                `).join('')}
+            </tbody>
+        </table>
+    `;
+}
+
+function tsWasTable(items, tab) {
+    return `
+        <table class="data-table w-full text-xs">
+            <thead><tr>
+                <th class="text-left">Target URL</th>
+                <th class="text-left">FQDN</th>
+                <th class="text-left">Category</th>
+                <th class="text-left">${tab === 'was_api' ? 'Platforms' : 'WAF / CDN'}</th>
+                <th class="text-center">CMDB</th>
+            </tr></thead>
+            <tbody>
+                ${items.map(r => `
+                    <tr>
+                        <td class="font-mono text-slate-200">${esc(r.target_url)}</td>
+                        <td>${tsFqdnLink(r.fqdn)}</td>
+                        <td>${tsCategoryBadge(r.category)}</td>
+                        <td class="text-slate-400">${tab === 'was_api'
+                            ? esc((r.platforms || []).join(', ') || '-')
+                            : esc([r.waf_provider, r.cdn_provider].filter(Boolean).join(' / ') || '-')}</td>
+                        <td class="text-center">${r.in_cmdb ? '<span class="text-accent">✓</span>' : '<span class="text-slate-600">-</span>'}</td>
+                    </tr>
+                `).join('')}
+            </tbody>
+        </table>
+    `;
+}
+
+function tsAssetsTable(items) {
+    return `
+        <table class="data-table w-full text-xs">
+            <thead><tr>
+                <th class="text-left">FQDN</th>
+                <th class="text-left">Category</th>
+                <th class="text-left">VM</th>
+                <th class="text-left">WAS</th>
+                <th class="text-left">IPs</th>
+                <th class="text-center">CMDB</th>
+            </tr></thead>
+            <tbody>
+                ${items.map(r => `
+                    <tr>
+                        <td>${tsFqdnLink(r.fqdn)}</td>
+                        <td title="${esc((r.categories || []).join(', '))}">${tsCategoryBadge(r.category)}</td>
+                        <td>${tsActionBadge(r.vm_action, TS_VM_COLORS)} ${r.vm_action === 'include' ? '' : tsReasons(r.vm_reasons)}</td>
+                        <td>${r.was_action === 'include' ? tsActionBadge(r.was_profile, TS_WAS_COLORS) : `${tsActionBadge('exclude', TS_WAS_COLORS)} ${tsReasons(r.was_reasons)}`}</td>
+                        <td class="font-mono text-slate-400" title="${esc((r.ips || []).join('\n'))}">${esc((r.ips || []).slice(0, 2).join(', '))}${(r.ips || []).length > 2 ? ` +${r.ips.length - 2}` : ''}</td>
+                        <td class="text-center">${r.in_cmdb ? '<span class="text-accent">✓</span>' : '<span class="text-slate-600">-</span>'}</td>
+                    </tr>
+                `).join('')}
+            </tbody>
+        </table>
+    `;
+}
+
+window.tsSwitchTab = function(tab) {
+    tsState = { ...tsState, tab, page: 1, q: '', vm: '', was: '', cmdb: '',
+                category: tab === 'assets' || tab.startsWith('was_') ? tsState.category : '' };
+    document.querySelectorAll('[data-ts-tab]').forEach(b => b.classList.toggle('active', b.dataset.tsTab === tab));
+    tsRenderFilters();
+    tsLoad();
+};
+
+window.tsSetFilter = function(key, value) {
+    tsState[key] = value;
+    tsState.page = 1;
+    tsLoad();
+};
+
+window.tsFilterCategory = function(category) {
+    tsState.category = category;
+    tsSwitchTab('assets');
+    document.getElementById('ts-filters')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+};
+
+window.tsPage = function(p) {
+    tsState.page = p;
+    tsLoad();
+};
+
+window.tsDownload = async function(kind) {
+    try {
+        const res = await fetch(`/api/tenable-scope/export?kind=${encodeURIComponent(kind)}`);
+        if (!res.ok) { alert('Export failed'); return; }
+        const name = (res.headers.get('Content-Disposition') || '').match(/filename="([^"]+)"/);
+        const url = URL.createObjectURL(await res.blob());
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = name ? name[1] : `tenable_${kind}.${kind === 'xlsx' ? 'xlsx' : 'txt'}`;
+        a.click();
+        URL.revokeObjectURL(url);
+    } catch (e) { alert('Export error: ' + e.message); }
+};
 
 // ---------------------------------------------------------------------------
 // Helpers

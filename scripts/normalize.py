@@ -2,7 +2,8 @@
 """
 EASM Pipeline — Asset Normalizer
 
-Merges outputs from dnsx, naabu, httpx, tlsx, nerva, zgrab2, nuclei
+Merges outputs from dnsx, naabu, httpx, tlsx, nerva, zgrab2, nuclei,
+cdncheck, waf-detector (plus subfinder / crt.sh source tags)
 into a single unified asset record per FQDN, keyed by the data model
 defined in the EASM plan (§4).
 
@@ -22,6 +23,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import orjson
 
@@ -159,6 +161,9 @@ class AssetStore:
                     "asn": {"number": None, "org": None, "country": None},
                     "cdn": None,
                     "cdn_detection": None,
+                    "cdncheck": None,
+                    "waf": None,
+                    "waf_detector_cdn": None,
                     "shared_hosting": None,
                     "open_ports": [],
                 },
@@ -859,6 +864,105 @@ class AssetStore:
                 tagged += 1
         return tagged
 
+    # --- subfinder ---
+    def tag_subfinder_discovered(self, fqdns):
+        """Mark assets found by subfinder's passive sources with source 'subfinder'.
+
+        Tag-only, like tag_ct_discovered: names that never resolved stay out.
+        """
+        tagged = 0
+        for fqdn in fqdns:
+            asset = self.assets.get(fqdn.lower().strip())
+            if asset:
+                self._add_source(asset, "subfinder")
+                tagged += 1
+        return tagged
+
+    # --- cdncheck ---
+    def ingest_cdncheck(self, records):
+        """Ingest cdncheck -jsonl -resp output (one record per live host / IP)."""
+        for rec in records:
+            key = (rec.get("input") or "").lower().strip()
+            if not key:
+                continue
+            asset = self._ensure(key)
+            if not asset:
+                continue
+            self._add_source(asset, "cdncheck")
+            asset["network"]["cdncheck"] = {
+                "ip": rec.get("ip") or None,
+                "cdn": (rec.get("cdn_name") or None) if rec.get("cdn") else None,
+                "cloud": (rec.get("cloud_name") or None) if rec.get("cloud") else None,
+                "waf": (rec.get("waf_name") or None) if rec.get("waf") else None,
+            }
+            waf_name = asset["network"]["cdncheck"]["waf"]
+            if waf_name and not asset["network"].get("waf"):
+                asset["network"]["waf"] = {
+                    "detected": True,
+                    "provider": waf_name.lower(),
+                    "confidence": 0.6,
+                    "sources": ["cdncheck"],
+                    "url": None,
+                }
+                self._add_tag(asset, "waf")
+
+    # --- waf-detector ---
+    def ingest_waf(self, records):
+        """Ingest waf-detect --ndjson results (one record per HTTP origin).
+
+        Several origins (ports/schemes) can map to one host: the highest-
+        confidence verdict wins. An existing cdncheck-only verdict for the
+        same provider is upgraded rather than replaced.
+        """
+        for rec in records:
+            if rec.get("error"):
+                continue
+            url = rec.get("url") or ""
+            host = (urlsplit(url).hostname or "").lower()
+            if not host:
+                continue
+            asset = self._ensure(host)
+            if not asset:
+                continue
+            self._add_source(asset, "waf-detector")
+            network = asset["network"]
+
+            waf = rec.get("detected_waf") or {}
+            if waf.get("name"):
+                provider = str(waf["name"]).strip().lower()
+                confidence = float(waf.get("confidence") or 0)
+                current = network.get("waf")
+                verdict = {
+                    "detected": True,
+                    "provider": provider,
+                    "confidence": round(confidence, 2),
+                    "sources": ["waf-detector"],
+                    "url": url,
+                }
+                if not current:
+                    network["waf"] = verdict
+                elif current.get("provider") == provider:
+                    # Corroboration (cdncheck and/or another origin of this host)
+                    current["sources"] = sorted(set(current.get("sources", [])) | {"waf-detector"})
+                    if confidence >= (current.get("confidence") or 0):
+                        current["confidence"] = round(confidence, 2)
+                        current["url"] = url
+                elif ("waf-detector" not in current.get("sources", [])
+                      or confidence > (current.get("confidence") or 0)):
+                    # A fingerprinted verdict beats an IP-range-only one
+                    network["waf"] = verdict
+                self._add_tag(asset, "waf")
+
+            cdn = rec.get("detected_cdn") or {}
+            if cdn.get("name"):
+                confidence = float(cdn.get("confidence") or 0)
+                current = network.get("waf_detector_cdn")
+                if not current or confidence > (current.get("confidence") or 0):
+                    network["waf_detector_cdn"] = {
+                        "provider": str(cdn["name"]).strip(),
+                        "confidence": round(confidence, 2),
+                    }
+
     # --- Cloud Enumeration ---
     def ingest_cloud_enum(self, records):
         """Ingest cloud endpoint enumeration results from cloud_enum.py."""
@@ -1019,6 +1123,7 @@ class AssetStore:
         )
         cloud_assets = sum(1 for a in self.assets.values() if a["cloud"]["endpoints"])
         cloud_endpoints = sum(len(a["cloud"]["endpoints"]) for a in self.assets.values())
+        behind_waf = sum(1 for a in self.assets.values() if a["network"].get("waf"))
 
         return {
             "total_assets": total,
@@ -1035,6 +1140,7 @@ class AssetStore:
             "with_fingerprints": with_fingerprints,
             "cloud_assets": cloud_assets,
             "cloud_endpoints": cloud_endpoints,
+            "behind_waf": behind_waf,
         }
 
 
@@ -1228,6 +1334,9 @@ def main():
     parser.add_argument("--aimap", help="AIMAP AI agent discovery JSONL output")
     parser.add_argument("--cloud-enum", help="Cloud endpoint enumeration JSONL output")
     parser.add_argument("--ct", help="CT-log hostnames (one per line) from ct_enrich.py; tags matching assets with source 'crt.sh'")
+    parser.add_argument("--subfinder", help="subfinder in-scope hostnames (one per line); tags matching assets with source 'subfinder'")
+    parser.add_argument("--cdncheck", help="cdncheck JSONL output (CDN / cloud / WAF IP-range classification)")
+    parser.add_argument("--waf", help="waf-detect NDJSON output (passive WAF/CDN fingerprinting)")
     parser.add_argument("--cmdb", help="CMDB CSV export")
     parser.add_argument("--output", required=True, help="Output JSONL path")
     parser.add_argument("--scan-id", default=now_iso(), help="Scan identifier")
@@ -1290,6 +1399,18 @@ def main():
     if args.ct and Path(args.ct).is_file():
         ct_names = [l.strip() for l in Path(args.ct).read_text().splitlines() if l.strip()]
         print(f"Tagging CT-discovered hosts: {args.ct} ({store.tag_ct_discovered(ct_names)}/{len(ct_names)} matched assets)", file=sys.stderr)
+
+    if args.subfinder and Path(args.subfinder).is_file():
+        sf_names = [l.strip() for l in Path(args.subfinder).read_text().splitlines() if l.strip()]
+        print(f"Tagging subfinder-discovered hosts: {args.subfinder} ({store.tag_subfinder_discovered(sf_names)}/{len(sf_names)} matched assets)", file=sys.stderr)
+
+    if args.cdncheck:
+        print(f"Ingesting cdncheck: {args.cdncheck}", file=sys.stderr)
+        store.ingest_cdncheck(iter_jsonl(args.cdncheck))
+
+    if args.waf:
+        print(f"Ingesting waf-detector: {args.waf}", file=sys.stderr)
+        store.ingest_waf(iter_jsonl(args.waf))
 
     # CDN enrichment (multi-signal, runs after all data sources ingested)
     try:

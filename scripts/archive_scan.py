@@ -26,12 +26,16 @@ ARCHIVE_DIR_DEFAULT = "data/archives"
 
 INTERMEDIATE_FILES = [
     "targets.txt",
+    "subfinder.jsonl",
+    "subfinder_subdomains.txt",
     "ct_subdomains.txt",
     "dns.jsonl",
+    "cdncheck.jsonl",
     "live_hosts.txt",
     "ports.jsonl",
     "web_targets.txt",
     "httpx.jsonl",
+    "waf.jsonl",
     "tls.jsonl",
     "nerva.jsonl",
     "service_detection.jsonl",
@@ -39,6 +43,16 @@ INTERMEDIATE_FILES = [
     "assets.jsonl",
     "takeover_verifications.jsonl",
     "bounty_report.jsonl",
+    "tenable_scope.jsonl",
+    "tenable_vm_targets.jsonl",
+    "tenable_scope_meta.json",
+    "tenable_vm_include.txt",
+    "tenable_vm_exclude.txt",
+    "tenable_vm_review.txt",
+    "tenable_was_targets.txt",
+    "tenable_was_waf_targets.txt",
+    "tenable_was_api_targets.txt",
+    "tenable_scope.xlsx",
 ]
 
 

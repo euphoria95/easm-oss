@@ -33,6 +33,11 @@ aimap/
 .claude/
 .tokensave/
 
+# Upstream tool sources (built from remote repos inside Docker)
+subfinder/
+cdncheck/
+waf-detector/
+
 # Scratch / scan logs
 tmp/
 
@@ -50,6 +55,9 @@ venv/
 
 # Local config overrides
 config/pipeline.env.local
+
+# Subfinder API keys (copy config/subfinder-provider-config.example.yaml)
+config/subfinder-provider-config.yaml
 
 # Secrets/env files
 .env
